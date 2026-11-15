@@ -19,19 +19,19 @@ interface CommandSimulatorProps {
 }
 
 const CONTEXT_OPTIONS: { id: ChatContext; label: string }[] = [
-  { id: 'private', label: 'Private Inbox (DM)' },
-  { id: 'group_bot_admin', label: 'Group (Bot Admin)' },
-  { id: 'group_bot_non_admin', label: 'Group (Bot Non-Admin)' },
-  { id: 'self', label: 'Message to Self' },
+  { id: 'private', label: 'প্রাইভেট ইনবক্স (DM)' },
+  { id: 'group_bot_admin', label: 'গ্রুপ চ্যাট (বট অ্যাডমিন)' },
+  { id: 'group_bot_non_admin', label: 'গ্রুপ চ্যাট (বট সাধারণ সদস্য)' },
+  { id: 'self', label: 'নিজের নম্বরে মেসেজ' },
 ];
 
 const QUICK_COMMANDS = [
-  '.ai Give 3 tips for securing a WhatsApp group',
-  '.gemini Write a polite Bengali greeting',
+  '.ai একটি হোয়াটসঅ্যাপ গ্রুপ নিরাপদ রাখার ৩টি উপায় বলো',
+  '.gemini একটি সুন্দর বাংলা শুভেচ্ছা বার্তা লিখে দাও',
   '.antilink delete on',
-  'Join our channel https://t.me/example_channel',
+  'আমাদের চ্যানেলে জয়েন করুন https://t.me/example_channel',
   '.autoreply on',
-  'Assalamu Alaikum, bhai kemon achen?',
+  'আসসালামু আলাইকুম, ভাই কেমন আছেন?',
 ];
 
 export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorProps) {
@@ -43,7 +43,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
     {
       id: 'init-1',
       sender: 'system',
-      text: 'Simulator connected to real server-side @google/genai + command router. Select a chat context above and test .ai, .antilink delete on, or .autoreply on.',
+      text: 'সিমুলেটর সার্ভার-সাইড @google/genai এবং বট কমান্ড রাউটারের সাথে যুক্ত আছে। উপরের চ্যাট মোড বেছে নিয়ে .ai, .antilink delete on অথবা .autoreply on টেস্ট করুন।',
       timestamp: new Date().toLocaleTimeString(),
     },
   ]);
@@ -235,9 +235,9 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
 
         <div className="flex-1 p-5 space-y-3 overflow-y-auto bg-slate-50">
           {messages.length === 0 && (
-            <div className="h-full flex items-center justify-center text-sm text-slate-500">
-              Send a message below to test bot commands and protection rules.
-            </div>
+          <div className="h-full flex items-center justify-center text-sm text-slate-500">
+            বটের কমান্ড ও প্রোটেকশন নিয়ম টেস্ট করতে নিচে একটি মেসেজ পাঠান।
+          </div>
           )}
 
           {messages.map((m) => {
@@ -265,7 +265,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                 >
                   {m.deleted ? (
                     <div className="italic text-xs">
-                      This message was deleted by Anti-Link Protection ({m.text})
+                      অ্যান্টি-লিংক প্রোটেকশনের মাধ্যমে এই মেসেজটি ডিলিট করা হয়েছে ({m.text})
                     </div>
                   ) : (
                     <div>{m.text}</div>
@@ -275,7 +275,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                       isUser && !m.deleted ? 'text-emerald-100' : 'text-slate-400'
                     }`}
                   >
-                    <span>{m.rule || (isUser ? 'Incoming' : 'Bot Reply')}</span>
+                    <span>{m.rule || (isUser ? 'প্রেরিত মেসেজ' : 'বটের উত্তর')}</span>
                     <span>{m.timestamp}</span>
                   </div>
                 </div>
@@ -295,7 +295,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Type .ai <question>, .antilink delete on, .autoreply on, or any text..."
+            placeholder=".ai <প্রশ্ন>, .antilink delete on, .autoreply on অথবা যেকোনো মেসেজ লিখুন..."
             className="flex-1 px-4 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
           />
           <button
@@ -304,7 +304,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
             className="px-4 py-2.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Send className="w-4 h-4" />
-            {isSending ? 'Running...' : 'Send'}
+            {isSending ? 'পাঠানো হচ্ছে...' : 'পাঠান'}
           </button>
         </form>
       </section>

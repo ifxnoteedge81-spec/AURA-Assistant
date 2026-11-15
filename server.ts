@@ -958,23 +958,47 @@ async function bootstrap() {
     res.json({ files });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', botStatus, connectedUser: currentSocket?.user?.id || null });
+  });
+
+  const distDir = path.resolve('./dist');
+  const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+
+  if (process.env.NODE_ENV === 'production' && hasBuiltDist) {
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+  } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distDir = path.resolve('./dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[WaNexus] Control Plane & Bot Studio running on http://0.0.0.0:${PORT}`);
+
+    // Automatically resume an already-paired WhatsApp session on startup
+    const credsPath = path.join(AUTH_DIR, 'creds.json');
+    if (fs.existsSync(credsPath)) {
+      try {
+        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+        if (creds?.registered) {
+          pushLog('pairing', 'Baileys', 'Resuming existing WhatsApp session...', 'info');
+          startBaileysConnection().catch((err) => {
+            lastBotError = (err as Error).message;
+            botStatus = 'disconnected';
+            pushLog('pairing', 'Baileys', `Auto-resume failed: ${lastBotError}`, 'error');
+          });
+        }
+      } catch {
+        // ignore malformed creds.json
+      }
+    }
   });
 }
 

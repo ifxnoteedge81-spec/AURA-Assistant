@@ -565,11 +565,18 @@ async function startWhatsAppBot() {
 
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  logger.info({ version, isLatest }, 'Initialized Baileys WebSocket version.');
+
+  let socketVersion;
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    socketVersion = version;
+    logger.info({ version, isLatest }, 'Initialized Baileys WebSocket version.');
+  } catch (err) {
+    logger.warn({ err }, 'Could not fetch latest Baileys version; using built-in default.');
+  }
 
   const sock = makeWASocket({
-    version,
+    ...(socketVersion ? { version: socketVersion } : {}),
     logger: baileysLogger,
     printQRInTerminal: false, // Pairing Code mode instead of QR code
     browser: Browsers.ubuntu('Chrome'),
