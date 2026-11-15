@@ -3,7 +3,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { GoogleGenAI } from '@google/genai';
+import { ThinkingLevel } from '@google/genai';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -27,6 +27,7 @@ import {
   type DictionaryEntry,
   type InboxNoteRecord,
 } from './server/assistantEngine.ts';
+import { GeminiKeyPool } from './server/geminiKeyPool.ts';
 import {
   adminDeleteDocument,
   adminLoadCollection,
@@ -103,19 +104,9 @@ interface SimulatorRequest {
 }
 
 // ----------------------------------------------------------------------------
-// Server-Side Google Gen AI Initialization
+// Server-Side Google Gen AI Multi-Key Pool Initialization (#1-#5 Rotation)
 // ----------------------------------------------------------------------------
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const ai = geminiApiKey
-  ? new GoogleGenAI({
-      apiKey: geminiApiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    })
-  : null;
+const geminiPool = new GeminiKeyPool();
 
 const baileysLogger = pino({ level: 'silent' });
 
@@ -348,7 +339,7 @@ function enqueuePrivateReply(chatJid: string, task: () => Promise<void>) {
         releaseReplySlot();
       }
       // Natural pacing gap per conversation without blocking other contacts
-      await sleep(randomBetween(900, 1900));
+      await sleep(randomBetween(500, 1000));
     })
     .catch((err) => {
       pushLog('autoreply', 'Reply Queue', `Queue error: ${(err as Error).message}`, 'error');
@@ -490,21 +481,33 @@ function isParticipantAdmin(
 }
 
 async function askGemini(query: string): Promise<string> {
-  if (!ai) {
+  if (!geminiPool.hasKeys()) {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
 
-  const response = await withTimeout(
-    ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: query,
-      config: {
-        systemInstruction:
-          'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
-      },
-    }),
-    25_000,
-    'Gemini .ai command'
+  const { value: response } = await geminiPool.executeWithRotation(
+    (client) =>
+      withTimeout(
+        client.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: query,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            systemInstruction:
+              'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
+          },
+        }),
+        20_000,
+        'Gemini .ai command'
+      ),
+    (rot) => {
+      pushLog(
+        'gemini',
+        `Key #${rot.fromSlot}->#${rot.toSlot}`,
+        `Rotated Gemini key (${rot.fromSlot}/${rot.totalSlots} -> ${rot.toSlot}/${rot.totalSlots}): ${rot.reason.slice(0, 90)}`,
+        'info'
+      );
+    }
   );
 
   const text = response?.text?.trim();
@@ -533,7 +536,14 @@ async function runExecutiveAssistantTurn(params: {
   contactJid: string;
   contactName: string;
   incomingText: string;
-}): Promise<{ replyText: string; detectedDistrict: string; noteCreated: InboxNoteRecord | null }> {
+}): Promise<{
+  replyText: string;
+  detectedDistrict: string;
+  noteCreated: InboxNoteRecord | null;
+  usedFallback: boolean;
+  keySlotUsed?: number;
+  fallbackReason?: string;
+}> {
   const chatId = sanitizeId(params.contactJid);
   const memory = chatMemories[chatId] || null;
   const nowIso = new Date().toISOString();
@@ -543,10 +553,25 @@ async function runExecutiveAssistantTurn(params: {
   let noteSummary = '';
   let noteUrgency: 'normal' | 'important' = 'normal';
   let noteCreated: InboxNoteRecord | null = null;
+  let usedFallback = !botConfig.aiAssistantEnabled || !geminiPool.hasKeys();
+  let keySlotUsed: number | undefined;
+  let fallbackReason: string | undefined = !botConfig.aiAssistantEnabled
+    ? 'AI Brain OFF'
+    : !geminiPool.hasKeys()
+      ? 'No API key'
+      : undefined;
 
   try {
     const result = await generateExecutiveAssistantReply({
-      ai: botConfig.aiAssistantEnabled ? ai : null,
+      keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
+      onKeyRotate: (rot) => {
+        pushLog(
+          'gemini',
+          `Key #${rot.fromSlot}->#${rot.toSlot}`,
+          `Auto-rotated Gemini key (${rot.fromSlot}/${rot.totalSlots} -> ${rot.toSlot}/${rot.totalSlots}): ${rot.reason.slice(0, 90)}`,
+          'info'
+        );
+      },
       settings: botConfig,
       memory,
       incomingText: params.incomingText,
@@ -557,15 +582,20 @@ async function runExecutiveAssistantTurn(params: {
     detectedDistrict = result.detectedDistrict;
     noteSummary = result.noteSummary;
     noteUrgency = result.noteUrgency;
+    usedFallback = Boolean(result.usedFallback);
+    keySlotUsed = result.keySlotUsed;
   } catch (err) {
+    const errMsg = (err as Error).message;
+    usedFallback = true;
+    fallbackReason = errMsg.slice(0, 120);
     pushLog(
       'autoreply',
       params.contactName || params.contactJid,
-      `AI fallback triggered: ${(err as Error).message}`,
+      `AI fallback triggered: ${errMsg}`,
       'error'
     );
     const fallbackResult = await generateExecutiveAssistantReply({
-      ai: null,
+      keyPool: null,
       settings: botConfig,
       memory,
       incomingText: params.incomingText,
@@ -617,7 +647,7 @@ async function runExecutiveAssistantTurn(params: {
     });
   }
 
-  return { replyText, detectedDistrict, noteCreated };
+  return { replyText, detectedDistrict, noteCreated, usedFallback, keySlotUsed, fallbackReason };
 }
 
 // ----------------------------------------------------------------------------
@@ -866,7 +896,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     }
 
     const texts = existingBuffer ? existingBuffer.texts : [text];
-    const debounceMs = botConfig.humanTypingEnabled ? 2600 : 400;
+    const debounceMs = botConfig.humanTypingEnabled ? 1200 : 300;
 
     const timer = setTimeout(() => {
       const finalized = pendingDmBuffers.get(remoteJid);
@@ -899,19 +929,20 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
         try {
           if (botConfig.humanTypingEnabled) {
-            await sleep(randomBetween(1100, 2400));
+            await sleep(randomBetween(350, 850));
             await sock.readMessages([targetMsg.key]).catch(() => {});
           }
 
-          const { replyText, detectedDistrict } = await runExecutiveAssistantTurn({
-            contactJid: remoteJid,
-            contactName: finalized.contactName,
-            incomingText: combinedText,
-          });
+          const { replyText, detectedDistrict, usedFallback, keySlotUsed, fallbackReason } =
+            await runExecutiveAssistantTurn({
+              contactJid: remoteJid,
+              contactName: finalized.contactName,
+              incomingText: combinedText,
+            });
 
           if (botConfig.humanTypingEnabled) {
             await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-            const typingMs = Math.min(8500, Math.max(2200, replyText.length * 42 + randomBetween(400, 1200)));
+            const typingMs = Math.min(2800, Math.max(900, replyText.length * 16 + randomBetween(150, 450)));
             await sleep(typingMs);
             await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
           }
@@ -932,8 +963,10 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           pushLog(
             'autoreply',
             finalized.contactName,
-            `Replied (${botConfig.aiAssistantEnabled ? `AI · ${detectedDistrict}` : 'Static'})`,
-            'success'
+            usedFallback
+              ? `Static Fallback (${fallbackReason || 'Static Mode'})`
+              : `Replied (AI Key #${keySlotUsed || 1} · ${detectedDistrict})`,
+            usedFallback ? 'info' : 'success'
           );
         } finally {
           await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
@@ -1415,7 +1448,8 @@ async function bootstrap() {
       pairingPhone: currentPairingPhone,
       sessionExists,
       lastError: lastBotError,
-      geminiConfigured: Boolean(geminiApiKey),
+      geminiConfigured: geminiPool.hasKeys(),
+      geminiKeyPool: geminiPool.getStats(),
       firestoreAdminMode,
       config: botConfig,
       logs: eventLogs,
@@ -1902,23 +1936,28 @@ async function bootstrap() {
       // 3. Automated Private Inbox Assistant
       if (botConfig.autoreply) {
         if (chatType === 'private') {
-          const { replyText, detectedDistrict, noteCreated } = await runExecutiveAssistantTurn({
-            contactJid,
-            contactName,
-            incomingText: text,
-          });
+          const { replyText, detectedDistrict, noteCreated, usedFallback, keySlotUsed, fallbackReason } =
+            await runExecutiveAssistantTurn({
+              contactJid,
+              contactName,
+              incomingText: text,
+            });
           pushLog(
             'autoreply',
             'Simulator DM',
-            `Replied (${botConfig.aiAssistantEnabled ? `AI · ${detectedDistrict}` : 'Static'})`,
-            'success'
+            usedFallback
+              ? `Static Fallback (${fallbackReason || 'Static Mode'})`
+              : `Replied (AI Key #${keySlotUsed || 1} · ${detectedDistrict})`,
+            usedFallback ? 'info' : 'success'
           );
           res.json({
             deleted: false,
             reply: replyText,
             detectedDistrict,
             noteCreated,
-            ruleTriggered: botConfig.aiAssistantEnabled ? 'AI_EXECUTIVE_ASSISTANT' : 'STATIC_AUTOREPLY',
+            usedFallback,
+            keySlotUsed,
+            ruleTriggered: usedFallback ? 'STATIC_AUTOREPLY' : 'AI_EXECUTIVE_ASSISTANT',
             config: botConfig,
           });
           return;
@@ -2042,6 +2081,7 @@ async function bootstrap() {
       memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
       botStatus,
       connectedUser: currentSocket?.user?.id || null,
+      geminiKeyPool: geminiPool.getStats(),
       selfPing: {
         enabled: selfPingEnabled,
         intervalMs: SELF_PING_INTERVAL_MS,

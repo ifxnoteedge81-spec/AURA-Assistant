@@ -18,7 +18,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import pino from 'pino';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -47,9 +47,31 @@ const BENGALI_AUTOREPLY_TEXT =
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const baileysLogger = pino({ level: 'silent' });
 
-// Google Gen AI client initialization
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+// Google Gen AI multi-key pool initialization (#1-#5 sequential rotation)
+const geminiKeys = [];
+const seenGeminiKeys = new Set();
+for (let i = 1; i <= 10; i += 1) {
+  const k = process.env[`GEMINI_API_KEY_${i}`]?.trim();
+  if (k && k.length >= 15 && !seenGeminiKeys.has(k)) {
+    seenGeminiKeys.add(k);
+    geminiKeys.push(k);
+  }
+}
+if (process.env.GEMINI_API_KEY?.trim() && !seenGeminiKeys.has(process.env.GEMINI_API_KEY.trim())) {
+  seenGeminiKeys.add(process.env.GEMINI_API_KEY.trim());
+  geminiKeys.push(process.env.GEMINI_API_KEY.trim());
+}
+if (process.env.GEMINI_API_KEYS) {
+  for (const part of process.env.GEMINI_API_KEYS.split(/[\s,;]+/)) {
+    const k = part.trim();
+    if (k && k.length >= 15 && !seenGeminiKeys.has(k)) {
+      seenGeminiKeys.add(k);
+      geminiKeys.push(k);
+    }
+  }
+}
+const aiClients = geminiKeys.map((apiKey) => new GoogleGenAI({ apiKey }));
+let activeAiKeyIndex = 0;
 
 // ============================================================================
 // 2. PERSISTENT STATE (ANTI-LINK GROUPS & AUTO-REPLY TOGGLE)
@@ -261,21 +283,38 @@ async function resolvePairingPhoneNumber() {
  * @returns {Promise<string>}
  */
 async function askGemini(query) {
-  if (!ai) {
-    return '⚠️ Gemini AI is not configured. Please set the GEMINI_API_KEY environment variable.';
+  if (aiClients.length === 0) {
+    return '⚠️ Gemini AI is not configured. Please set GEMINI_API_KEY_1..5 or GEMINI_API_KEY.';
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: query,
-    config: {
-      systemInstruction:
-        'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
-    },
-  });
+  const total = aiClients.length;
+  const startIdx = activeAiKeyIndex % total;
+  let lastError = null;
 
-  const text = response?.text?.trim();
-  return text || 'I could not generate a response for that query. Please try rephrasing.';
+  for (let attempt = 0; attempt < total; attempt += 1) {
+    const idx = (startIdx + attempt) % total;
+    try {
+      const response = await aiClients[idx].models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: query,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          systemInstruction:
+            'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
+        },
+      });
+      activeAiKeyIndex = idx;
+      const text = response?.text?.trim();
+      return text || 'I could not generate a response for that query. Please try rephrasing.';
+    } catch (err) {
+      lastError = err;
+      activeAiKeyIndex = (idx + 1) % total;
+      logger.warn({ fromSlot: idx + 1, toSlot: activeAiKeyIndex + 1, err: err.message }, 'Rotating Gemini API key');
+    }
+  }
+
+  activeAiKeyIndex = 0;
+  throw lastError || new Error('All configured Gemini API keys failed.');
 }
 
 // ============================================================================
