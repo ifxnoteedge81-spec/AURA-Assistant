@@ -1,0 +1,262 @@
+import { useState } from 'react';
+import { Plus, Search, ShieldAlert, Trash2 } from 'lucide-react';
+import { BENGALI_AUTOREPLY_EXACT, type BotConfig } from '../types';
+
+interface ModerationRulesProps {
+  config: BotConfig;
+  onUpdateConfig: (patch: Partial<BotConfig>) => Promise<void>;
+}
+
+export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps) {
+  const [newGroupJid, setNewGroupJid] = useState('');
+  const [linkProbeText, setLinkProbeText] = useState('Check this out: https://youtube.com/watch?v=dQw4w9WgXcQ or t.me/mychannel');
+  const [probeResult, setProbeResult] = useState<{ hasLink: boolean; matches: string[] } | null>(null);
+  const [isTesting, setIsTesting] = useState(false);
+
+  const groupEntries = Object.entries(config.antilinkGroups);
+
+  async function handleAddGroup(e: React.FormEvent) {
+    e.preventDefault();
+    const cleaned = newGroupJid.trim();
+    if (!cleaned) return;
+    const formatted = cleaned.endsWith('@g.us') ? cleaned : `${cleaned}@g.us`;
+    await onUpdateConfig({
+      antilinkGroups: {
+        ...config.antilinkGroups,
+        [formatted]: true,
+      },
+    });
+    setNewGroupJid('');
+  }
+
+  async function handleToggleGroup(jid: string, enabled: boolean) {
+    await onUpdateConfig({
+      antilinkGroups: {
+        ...config.antilinkGroups,
+        [jid]: enabled,
+      },
+    });
+  }
+
+  async function handleRemoveGroup(jid: string) {
+    const next = { ...config.antilinkGroups };
+    delete next[jid];
+    await onUpdateConfig({ antilinkGroups: next });
+  }
+
+  async function handleTestLink(e: React.FormEvent) {
+    e.preventDefault();
+    setIsTesting(true);
+    try {
+      const res = await fetch('/api/antilink/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: linkProbeText }),
+      });
+      const data = await res.json();
+      setProbeResult(data);
+    } finally {
+      setIsTesting(false);
+    }
+  }
+
+  return (
+    <div className="space-y-8">
+      {/* Private Bengali Auto-Reply Assistant */}
+      <section className="bg-white border border-slate-200 rounded-xl p-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-200">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">
+              Private Inbox Auto-Reply Assistant
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Controlled via <span className="font-mono text-slate-800">.autoreply on</span> and <span className="font-mono text-slate-800">.autoreply off</span>. Triggers strictly for incoming private DMs.
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            <select
+              value={config.cooldownMs}
+              onChange={(e) => onUpdateConfig({ cooldownMs: Number(e.target.value) })}
+              className="px-3 py-2 text-xs font-medium bg-white border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+              aria-label="Cooldown interval"
+            >
+              <option value={0}>No Cooldown</option>
+              <option value={30000}>30s Cooldown</option>
+              <option value={60000}>60s Cooldown</option>
+              <option value={300000}>5m Cooldown</option>
+            </select>
+
+            <button
+              type="button"
+              onClick={() => onUpdateConfig({ autoreply: !config.autoreply })}
+              className={`px-4 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                config.autoreply
+                  ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {config.autoreply ? 'Auto-Reply: ON' : 'Auto-Reply: OFF'}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="lg:col-span-7">
+            <div className="text-xs font-medium text-slate-500">
+              Configured Bengali Reply Text
+            </div>
+            <div className="mt-2 p-4 rounded-lg border border-slate-200 bg-slate-50 text-sm leading-relaxed text-slate-900">
+              {BENGALI_AUTOREPLY_EXACT}
+            </div>
+          </div>
+
+          <div className="lg:col-span-5">
+            <div className="text-xs font-medium text-slate-500">
+              Delivery Safeguards
+            </div>
+            <ul className="mt-2 divide-y divide-slate-200 border border-slate-200 rounded-lg text-xs text-slate-700">
+              <li className="px-4 py-2.5 flex justify-between">
+                <span>Private DMs (@s.whatsapp.net / @lid)</span>
+                <span className="font-medium text-emerald-700">Allowed</span>
+              </li>
+              <li className="px-4 py-2.5 flex justify-between">
+                <span>Group Chats (@g.us)</span>
+                <span className="font-medium text-slate-500">Excluded</span>
+              </li>
+              <li className="px-4 py-2.5 flex justify-between">
+                <span>Own Messages &amp; Self-Chat</span>
+                <span className="font-medium text-slate-500">Excluded</span>
+              </li>
+              <li className="px-4 py-2.5 flex justify-between">
+                <span>Prefix Commands (.)</span>
+                <span className="font-medium text-slate-500">Excluded</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      {/* Group Anti-Link Protection */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="p-6 border-b border-slate-200">
+            <h2 className="text-lg font-semibold text-slate-900">
+              Group Anti-Link Delete Rules
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Groups enabled via <span className="font-mono text-slate-800">.antilink delete on</span> automatically remove messages containing links when the bot is group admin.
+            </p>
+
+            <form onSubmit={handleAddGroup} className="mt-4 flex gap-3">
+              <input
+                type="text"
+                value={newGroupJid}
+                onChange={(e) => setNewGroupJid(e.target.value)}
+                placeholder="Add Group JID (e.g. 120363041928374655@g.us)"
+                className="flex-1 px-3.5 py-2 text-sm font-mono bg-white border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+              />
+              <button
+                type="submit"
+                className="px-4 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                Add Group
+              </button>
+            </form>
+          </div>
+
+          {groupEntries.length === 0 ? (
+            <div className="p-8 text-center text-sm text-slate-500">
+              No groups configured. Run <span className="font-mono text-slate-800">.antilink delete on</span> inside any WhatsApp group or add a Group JID above.
+            </div>
+          ) : (
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
+                  <th className="py-2.5 px-6">Group JID</th>
+                  <th className="py-2.5 px-4">Protection Mode</th>
+                  <th className="py-2.5 px-6 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200 text-sm">
+                {groupEntries.map(([jid, enabled]) => (
+                  <tr key={jid} className="hover:bg-slate-50/70">
+                    <td className="py-3 px-6 font-mono text-xs text-slate-800">{jid}</td>
+                    <td className="py-3 px-4 text-xs font-medium">
+                      <span className={enabled ? 'text-emerald-700' : 'text-slate-500'}>
+                        {enabled ? 'Delete ON' : 'Delete OFF'}
+                      </span>
+                    </td>
+                    <td className="py-3 px-6 text-right">
+                      <div className="inline-flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleGroup(jid, !enabled)}
+                          className="px-2.5 py-1 text-xs font-medium border border-slate-200 rounded-md hover:bg-slate-100 text-slate-700 cursor-pointer"
+                        >
+                          {enabled ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveGroup(jid)}
+                          className="p-1.5 text-slate-400 hover:text-red-600 cursor-pointer"
+                          title="Remove group"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+
+        {/* Link Pattern Tester */}
+        <section className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-slate-700" />
+            <h3 className="text-base font-semibold text-slate-900">Link Detector Inspector</h3>
+          </div>
+          <p className="mt-1 text-xs text-slate-600">
+            Test any sample message against the regex engine used in <span className="font-mono text-slate-800">index.js</span> (<span className="font-mono">http://</span>, <span className="font-mono">https://</span>, <span className="font-mono">www.</span>, <span className="font-mono">t.me</span>, <span className="font-mono">youtube.com</span>, <span className="font-mono">facebook.com</span>).
+          </p>
+
+          <form onSubmit={handleTestLink} className="mt-4 space-y-3">
+            <textarea
+              rows={3}
+              value={linkProbeText}
+              onChange={(e) => setLinkProbeText(e.target.value)}
+              className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+            />
+            <button
+              type="submit"
+              disabled={isTesting}
+              className="px-4 py-2 text-xs font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 flex items-center gap-1.5 cursor-pointer"
+            >
+              <Search className="w-3.5 h-3.5" />
+              {isTesting ? 'Scanning...' : 'Scan Message for Links'}
+            </button>
+          </form>
+
+          {probeResult && (
+            <div className="mt-4 p-4 rounded-lg border border-slate-200 bg-slate-50 text-xs space-y-2">
+              <div className="font-medium text-slate-900">
+                Result:{' '}
+                <span className={probeResult.hasLink ? 'text-red-700' : 'text-emerald-700'}>
+                  {probeResult.hasLink ? 'Link Detected — Would Be Deleted' : 'Clean Message — Allowed'}
+                </span>
+              </div>
+              {probeResult.matches.length > 0 && (
+                <div className="font-mono text-slate-700 break-all">
+                  Matched: {probeResult.matches.join(', ')}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}

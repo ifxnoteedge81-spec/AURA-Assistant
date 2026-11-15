@@ -1,0 +1,21 @@
+{
+  "name": "gemini-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Production-ready WhatsApp bot powered by @whiskeysockets/baileys (Pairing Code auth) and Google Gemini AI (@google/genai)",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^3.3.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "dotenv": "^17.2.3",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

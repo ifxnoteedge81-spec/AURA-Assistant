@@ -1,0 +1,6 @@
+{
+  "name": "WaNexus — WhatsApp Gemini Bot Studio",
+  "description": "Production WhatsApp bot built with @whiskeysockets/baileys (8-digit pairing code), Google Gemini AI (@google/genai), group anti-link protection, and automated Bengali private inbox assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
