@@ -286,6 +286,16 @@ function normalizeForComparison(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 function pickNonRepeatingFallback(baseMessage: string, previousAssistantReplies: string[]): string {
   const prevSet = new Set(previousAssistantReplies.map(normalizeForComparison));
   if (!prevSet.has(normalizeForComparison(baseMessage))) {
@@ -409,15 +419,19 @@ export async function generateExecutiveAssistantReply(params: {
     required: ['replyText', 'detectedDistrict', 'noteSummary', 'noteUrgency'],
   };
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: promptContent,
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-      responseSchema,
-    },
-  });
+  const response = await withTimeout(
+    ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: promptContent,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema,
+      },
+    }),
+    25_000,
+    'Executive Assistant Gemini call'
+  );
 
   const rawJson = (response.text || '{}').trim();
   let parsed = JSON.parse(rawJson) as Partial<AssistantGenerationResult>;
@@ -426,15 +440,19 @@ export async function generateExecutiveAssistantReply(params: {
   const prevSet = new Set(recentAssistantReplies.map(normalizeForComparison));
   if (!replyText || prevSet.has(normalizeForComparison(replyText))) {
     // Re-prompt once if Gemini generated an exact duplicate
-    const retryResponse = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: `${promptContent}\n\nIMPORTANT: Your previous draft "${replyText}" was already sent earlier to this contact. Write a completely DIFFERENT, fresh, natural reply without reusing the same wording.`,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema,
-      },
-    });
+    const retryResponse = await withTimeout(
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `${promptContent}\n\nIMPORTANT: Your previous draft "${replyText}" was already sent earlier to this contact. Write a completely DIFFERENT, fresh, natural reply without reusing the same wording.`,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema,
+        },
+      }),
+      15_000,
+      'Executive Assistant retry call'
+    );
     try {
       const retryParsed = JSON.parse((retryResponse.text || '{}').trim()) as Partial<AssistantGenerationResult>;
       if (retryParsed.replyText?.trim() && !prevSet.has(normalizeForComparison(retryParsed.replyText))) {

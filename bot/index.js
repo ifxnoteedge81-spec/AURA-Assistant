@@ -688,12 +688,69 @@ async function startWhatsAppBot() {
 // 7. RENDER HTTP HEALTHCHECK SERVER & GLOBAL SAFETY GUARDS
 // ============================================================================
 
+let selfPingTimer = null;
+let selfPingWarmupTimer = null;
+let selfPingRetryTimer = null;
+let isSelfPingInFlight = false;
+
+const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
+const SELF_PING_URL = (
+  process.env.SELF_PING_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  'https://aura-assistant-8y1z.onrender.com'
+)
+  .trim()
+  .replace(/\/+$/, '');
+const SELF_PING_TARGET = process.env.SELF_PING_URL?.trim() || `${SELF_PING_URL}/health`;
+const SELF_PING_ENABLED =
+  process.env.ENABLE_SELF_PING !== 'false' &&
+  (process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.RENDER) ||
+    Boolean(process.env.RENDER_EXTERNAL_URL) ||
+    process.env.ENABLE_SELF_PING === 'true');
+
+async function executeSelfPing(isRetry = false) {
+  if (isShuttingDown || isSelfPingInFlight) return;
+  isSelfPingInFlight = true;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const resp = await fetch(SELF_PING_TARGET, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'AuraAssistant-KeepAlive/1.0',
+        'Cache-Control': 'no-store',
+      },
+    });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+  } catch (err) {
+    logger.warn({ err: err.message, url: SELF_PING_TARGET }, 'Self-ping failed');
+    if (!isRetry && !isShuttingDown && !selfPingRetryTimer) {
+      selfPingRetryTimer = setTimeout(() => {
+        selfPingRetryTimer = null;
+        void executeSelfPing(true);
+      }, 15_000);
+      selfPingRetryTimer.unref?.();
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    isSelfPingInFlight = false;
+  }
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    });
     res.end(
       JSON.stringify({
         status: 'ok',
+        uptimeSec: Math.round(process.uptime()),
         connected: Boolean(currentSocket?.user),
         autoreply: botConfig.autoreply,
         protectedGroups: Object.values(botConfig.antilinkGroups).filter(Boolean).length,
@@ -707,6 +764,19 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   logger.info({ port: PORT }, 'Healthcheck HTTP server listening.');
+  if (SELF_PING_ENABLED) {
+    logger.info({ url: SELF_PING_TARGET, intervalMinutes: 5 }, 'Self-Ping Keep-Alive active.');
+    selfPingWarmupTimer = setTimeout(() => {
+      selfPingWarmupTimer = null;
+      void executeSelfPing();
+    }, 15_000);
+    selfPingWarmupTimer.unref?.();
+
+    selfPingTimer = setInterval(() => {
+      void executeSelfPing();
+    }, SELF_PING_INTERVAL_MS);
+    selfPingTimer.unref?.();
+  }
 });
 
 // Prevent unhandled errors from crashing the bot process
@@ -721,13 +791,17 @@ process.on('unhandledRejection', (reason) => {
 function gracefulShutdown(signal) {
   logger.info({ signal }, 'Shutting down gracefully...');
   isShuttingDown = true;
+  if (selfPingTimer) clearInterval(selfPingTimer);
+  if (selfPingWarmupTimer) clearTimeout(selfPingWarmupTimer);
+  if (selfPingRetryTimer) clearTimeout(selfPingRetryTimer);
   try {
     currentSocket?.end(undefined);
   } catch {
     // ignore close errors
   }
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000);
+  const forceExit = setTimeout(() => process.exit(0), 3000);
+  forceExit.unref?.();
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));

@@ -129,8 +129,21 @@ export default function App() {
   useEffect(() => {
     if (!unlockedEmail) return;
     void fetchStatus();
-    const timer = setInterval(fetchStatus, 5000);
-    return () => clearInterval(timer);
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void fetchStatus();
+      }
+    }, 5000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchStatus();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [unlockedEmail, fetchStatus]);
 
   // Listen for Firebase Google Sign-In and hydrate cloud data -> server once unlocked

@@ -173,6 +173,24 @@ export function getClientIp(req: Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
 }
 
+export function pruneExpiredRateLimits() {
+  const now = Date.now();
+  for (const [ip, bucket] of rateLimitMap.entries()) {
+    if (bucket.lockedUntil > 0 && bucket.lockedUntil <= now) {
+      rateLimitMap.delete(ip);
+    }
+  }
+  if (rateLimitMap.size > 1000) {
+    const excess = rateLimitMap.size - 500;
+    let removed = 0;
+    for (const key of rateLimitMap.keys()) {
+      rateLimitMap.delete(key);
+      removed += 1;
+      if (removed >= excess) break;
+    }
+  }
+}
+
 export function checkRateLimit(ip: string): { allowed: boolean; retryAfterSec: number } {
   const bucket = rateLimitMap.get(ip);
   if (!bucket) return { allowed: true, retryAfterSec: 0 };
@@ -189,6 +207,9 @@ export function checkRateLimit(ip: string): { allowed: boolean; retryAfterSec: n
 }
 
 export function recordAuthFailure(ip: string): { locked: boolean; attemptsLeft: number } {
+  if (rateLimitMap.size > 500) {
+    pruneExpiredRateLimits();
+  }
   const existing = rateLimitMap.get(ip) || { failures: 0, lockedUntil: 0 };
   const failures = existing.failures + 1;
   if (failures >= 5) {

@@ -44,6 +44,7 @@ import {
   isPinConfigured,
   issuePreAuthToken,
   issueSessionToken,
+  pruneExpiredRateLimits,
   recordAuthFailure,
   requireOwnerAuth,
   setCustomDashboardPin,
@@ -238,9 +239,16 @@ interface PendingDmBuffer {
 }
 
 const pendingDmBuffers = new Map<string, PendingDmBuffer>();
-let replyQueueChain: Promise<void> = Promise.resolve();
+const chatReplyQueues = new Map<string, Promise<void>>();
+const MAX_CONCURRENT_REPLIES = 5;
+let activeReplyWorkers = 0;
+const replySlotWaiters: Array<() => void> = [];
+
 let dailyReplyDate = new Date().toISOString().slice(0, 10);
 let dailyReplyCount = 0;
+let isShuttingDown = false;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let credsBackupTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -248,6 +256,33 @@ function sleep(ms: number) {
 
 function randomBetween(minMs: number, maxMs: number): number {
   return minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function acquireReplySlot(): Promise<void> {
+  if (activeReplyWorkers < MAX_CONCURRENT_REPLIES) {
+    activeReplyWorkers += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    replySlotWaiters.push(resolve);
+  });
+  activeReplyWorkers += 1;
+}
+
+function releaseReplySlot() {
+  activeReplyWorkers = Math.max(0, activeReplyWorkers - 1);
+  const next = replySlotWaiters.shift();
+  if (next) next();
 }
 
 function getDailyReplyStats() {
@@ -281,16 +316,50 @@ function getActiveTakeovers() {
   return active;
 }
 
-function enqueuePrivateReply(task: () => Promise<void>) {
-  replyQueueChain = replyQueueChain
+function pruneRuntimeCaches() {
+  const now = Date.now();
+  for (const [jid, cached] of groupMetadataCache.entries()) {
+    if (cached.expiresAt <= now) {
+      groupMetadataCache.delete(jid);
+    }
+  }
+  for (const [jid, until] of ownerTakeoverUntil.entries()) {
+    if (until <= now) {
+      ownerTakeoverUntil.delete(jid);
+    }
+  }
+  for (const [jid, ts] of autoReplyCooldowns.entries()) {
+    if (now - ts > 60 * 60 * 1000) {
+      autoReplyCooldowns.delete(jid);
+    }
+  }
+  pruneExpiredRateLimits();
+}
+
+function enqueuePrivateReply(chatJid: string, task: () => Promise<void>) {
+  const prev = chatReplyQueues.get(chatJid) || Promise.resolve();
+  const next = prev
     .then(async () => {
-      await task();
-      // Natural pacing gap between replies across different contacts (Anti-Ban protection)
-      await sleep(randomBetween(1400, 2800));
+      if (isShuttingDown) return;
+      await acquireReplySlot();
+      try {
+        await task();
+      } finally {
+        releaseReplySlot();
+      }
+      // Natural pacing gap per conversation without blocking other contacts
+      await sleep(randomBetween(900, 1900));
     })
     .catch((err) => {
       pushLog('autoreply', 'Reply Queue', `Queue error: ${(err as Error).message}`, 'error');
+    })
+    .finally(() => {
+      if (chatReplyQueues.get(chatJid) === next) {
+        chatReplyQueues.delete(chatJid);
+      }
     });
+
+  chatReplyQueues.set(chatJid, next);
 }
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'awaiting_pairing' | 'connected';
@@ -425,14 +494,18 @@ async function askGemini(query: string): Promise<string> {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: query,
-    config: {
-      systemInstruction:
-        'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
-    },
-  });
+  const response = await withTimeout(
+    ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: query,
+      config: {
+        systemInstruction:
+          'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
+      },
+    }),
+    25_000,
+    'Gemini .ai command'
+  );
 
   const text = response?.text?.trim();
   return text || 'I could not generate a response for that query. Please try rephrasing.';
@@ -520,7 +593,7 @@ async function runExecutiveAssistantTurn(params: {
   chatMemories[chatId] = updatedMemory;
   persistMemories();
   void adminSaveDocument('chat_memories', chatId, {
-    ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+    ownerId: activeCloudOwnerId,
     ...updatedMemory,
   });
 
@@ -539,7 +612,7 @@ async function runExecutiveAssistantTurn(params: {
     if (inboxNotes.length > 200) inboxNotes.length = 200;
     persistNotes();
     void adminSaveDocument('inbox_notes', noteId, {
-      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      ownerId: activeCloudOwnerId,
       ...noteCreated,
     });
   }
@@ -803,7 +876,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       const combinedText = finalized.texts.join('\n').trim();
       const targetMsg = finalized.lastMsg;
 
-      enqueuePrivateReply(async () => {
+      enqueuePrivateReply(remoteJid, async () => {
         if (!botConfig.autoreply || currentSocket !== sock) return;
 
         // Re-check takeover pause in case owner started typing while buffered/queued
@@ -886,12 +959,27 @@ async function backupCredsToCloud() {
     if (!fs.existsSync(credsPath)) return;
     const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
     await adminSaveDocument('bot_sessions', 'primary', {
-      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      ownerId: activeCloudOwnerId,
       phoneNumber: currentPairingPhone || '',
       credsData,
     });
   } catch {
     // ignore backup failures
+  }
+}
+
+function scheduleCloudCredsBackup() {
+  if (credsBackupTimer) clearTimeout(credsBackupTimer);
+  credsBackupTimer = setTimeout(() => {
+    credsBackupTimer = null;
+    void backupCredsToCloud();
+  }, 6000);
+}
+
+function cancelReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 }
 
@@ -907,17 +995,23 @@ async function restoreCredsFromCloudIfMissing() {
 }
 
 async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCode: string | null }> {
+  if (isShuttingDown) {
+    throw new Error('Server is shutting down.');
+  }
+
   manualDisconnect = false;
   lastBotError = null;
   currentPairingCode = null;
+  cancelReconnectTimer();
 
   if (currentSocket) {
+    const staleSocket = currentSocket;
+    currentSocket = null;
     try {
-      currentSocket.end(undefined);
+      staleSocket.end(undefined);
     } catch {
       // ignore
     }
-    currentSocket = null;
   }
 
   await restoreCredsFromCloudIfMissing();
@@ -951,10 +1045,11 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
   currentSocket = sock;
   sock.ev.on('creds.update', async () => {
     await saveCreds();
-    await backupCredsToCloud();
+    scheduleCloudCredsBackup();
   });
 
   sock.ev.on('connection.update', async (update) => {
+    if (currentSocket !== sock || isShuttingDown) return;
     const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
@@ -972,7 +1067,7 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
         | undefined;
       const statusCode = errObj?.output?.statusCode ?? errObj?.statusCode;
 
-      if (manualDisconnect) {
+      if (manualDisconnect || isShuttingDown) {
         botStatus = 'disconnected';
         return;
       }
@@ -1006,8 +1101,10 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
 
       botStatus = 'connecting';
       const delayMs = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 30_000);
-      setTimeout(() => {
-        if (!manualDisconnect) {
+      cancelReconnectTimer();
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!manualDisconnect && !isShuttingDown) {
           startBaileysConnection(currentPairingPhone || undefined).catch((err) => {
             lastBotError = (err as Error).message;
             botStatus = 'disconnected';
@@ -1018,6 +1115,7 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (currentSocket !== sock || isShuttingDown) return;
     const nowSec = Math.floor(Date.now() / 1000);
     for (const msg of messages) {
       const rawTs = Number(msg.messageTimestamp || 0);
@@ -1038,7 +1136,7 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
     }
     currentPairingPhone = cleanNumber;
     await new Promise((resolve) => setTimeout(resolve, 2500));
-    if (currentSocket !== sock) {
+    if (currentSocket !== sock || isShuttingDown) {
       throw new Error('Socket superseded before pairing code was issued.');
     }
     const rawCode = await sock.requestPairingCode(cleanNumber);
@@ -1098,7 +1196,8 @@ async function hydrateFromCloudAdmin() {
 // Express Server & API Routes
 // ----------------------------------------------------------------------------
 async function bootstrap() {
-  await hydrateFromCloudAdmin();
+  // Start cloud hydration immediately without blocking HTTP server port binding
+  const hydrationPromise = hydrateFromCloudAdmin();
 
   const app = express();
   app.use(express.json({ limit: '5mb' }));
@@ -1354,13 +1453,15 @@ async function bootstrap() {
   app.post('/api/bot/disconnect', (_req, res) => {
     manualDisconnect = true;
     currentPairingCode = null;
+    cancelReconnectTimer();
     if (currentSocket) {
+      const sockToClose = currentSocket;
+      currentSocket = null;
       try {
-        currentSocket.end(undefined);
+        sockToClose.end(undefined);
       } catch {
         // ignore
       }
-      currentSocket = null;
     }
     botStatus = 'disconnected';
     pushLog('system', 'Operator', 'Bot socket disconnected manually.', 'info');
@@ -1372,13 +1473,15 @@ async function bootstrap() {
     currentPairingCode = null;
     currentPairingPhone = null;
     lastBotError = null;
+    cancelReconnectTimer();
     if (currentSocket) {
+      const sockToClose = currentSocket;
+      currentSocket = null;
       try {
-        currentSocket.end(undefined);
+        sockToClose.end(undefined);
       } catch {
         // ignore
       }
-      currentSocket = null;
     }
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     void adminDeleteDocument('bot_sessions', 'primary');
@@ -1458,7 +1561,7 @@ async function bootstrap() {
     dictionaryEntries.unshift(entry);
     persistDictionary();
     void adminSaveDocument('dictionary_entries', entry.id, {
-      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      ownerId: activeCloudOwnerId,
       ...entry,
     });
     pushLog('system', 'Dictionary', `Added term "${entry.term}" (${entry.district})`, 'success');
@@ -1488,7 +1591,7 @@ async function bootstrap() {
       persistDictionary();
       for (const entry of added.slice(0, 50)) {
         void adminSaveDocument('dictionary_entries', entry.id, {
-          ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+          ownerId: activeCloudOwnerId,
           ...entry,
         });
       }
@@ -1554,7 +1657,7 @@ async function bootstrap() {
     const updated = inboxNotes.find((n) => n.id === id);
     if (updated) {
       void adminSaveDocument('inbox_notes', id, {
-        ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+        ownerId: activeCloudOwnerId,
         ...updated,
       });
     }
@@ -1869,8 +1972,89 @@ async function bootstrap() {
     res.json({ files });
   });
 
+  // Self-Ping Keep-Alive State (prevents Render Free tier 15m inactivity sleep)
+  const SELF_PING_INTERVAL_MS = 5 * 60 * 1000; // Exactly 5 minutes
+  const selfPingExplicitUrl = process.env.SELF_PING_URL?.trim();
+  const selfPingBaseUrl = (
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.APP_URL ||
+    'https://aura-assistant-8y1z.onrender.com'
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  const selfPingTargetUrl = selfPingExplicitUrl || `${selfPingBaseUrl}/health`;
+  const selfPingEnabled =
+    process.env.ENABLE_SELF_PING !== 'false' &&
+    (process.env.NODE_ENV === 'production' ||
+      Boolean(process.env.RENDER) ||
+      Boolean(process.env.RENDER_EXTERNAL_URL) ||
+      process.env.ENABLE_SELF_PING === 'true');
+
+  let lastSelfPingAt: string | null = null;
+  let lastSelfPingOk: boolean | null = null;
+  let isSelfPingInFlight = false;
+  let selfPingTimer: ReturnType<typeof setInterval> | null = null;
+  let selfPingWarmupTimer: ReturnType<typeof setTimeout> | null = null;
+  let selfPingRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function executeSelfPing(isRetry = false) {
+    if (isShuttingDown || isSelfPingInFlight) return;
+    isSelfPingInFlight = true;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12_000);
+    try {
+      const resp = await fetch(selfPingTargetUrl, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'AuraAssistant-KeepAlive/1.0',
+          'Cache-Control': 'no-store',
+        },
+      });
+      lastSelfPingAt = new Date().toISOString();
+      lastSelfPingOk = resp.ok;
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      lastSelfPingAt = new Date().toISOString();
+      lastSelfPingOk = false;
+      console.warn(`[KeepAlive] Self-ping failed (${selfPingTargetUrl}): ${(err as Error).message}`);
+      // Schedule one quick retry after 15s so a transient hiccup never leaves a 10m gap
+      if (!isRetry && !isShuttingDown && !selfPingRetryTimer) {
+        selfPingRetryTimer = setTimeout(() => {
+          selfPingRetryTimer = null;
+          void executeSelfPing(true);
+        }, 15_000);
+        selfPingRetryTimer.unref?.();
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      isSelfPingInFlight = false;
+    }
+  }
+
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', botStatus, connectedUser: currentSocket?.user?.id || null });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      status: 'ok',
+      uptimeSec: Math.round(process.uptime()),
+      memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+      botStatus,
+      connectedUser: currentSocket?.user?.id || null,
+      selfPing: {
+        enabled: selfPingEnabled,
+        intervalMs: SELF_PING_INTERVAL_MS,
+        targetUrl: selfPingTargetUrl,
+        lastPingAt: lastSelfPingAt,
+        lastPingOk: lastSelfPingOk,
+      },
+    });
+  });
+
+  app.head('/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).end();
   });
 
   const distDir = path.resolve('./dist');
@@ -1890,12 +2074,34 @@ async function bootstrap() {
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const cleanupTimer = setInterval(pruneRuntimeCaches, 10 * 60 * 1000);
+  cleanupTimer.unref?.();
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[WaNexus] Control Plane & Bot Studio running on http://0.0.0.0:${PORT}`);
 
-    // Automatically resume an already-paired WhatsApp session on startup
-    restoreCredsFromCloudIfMissing()
+    // Start 5-minute Keep-Alive Self-Ping on Render / Production so instance stays awake 24/7
+    if (selfPingEnabled) {
+      console.log(
+        `[KeepAlive] Self-Ping enabled: pinging ${selfPingTargetUrl} every ${SELF_PING_INTERVAL_MS / 60000} minutes.`
+      );
+      selfPingWarmupTimer = setTimeout(() => {
+        selfPingWarmupTimer = null;
+        void executeSelfPing();
+      }, 15_000);
+      selfPingWarmupTimer.unref?.();
+
+      selfPingTimer = setInterval(() => {
+        void executeSelfPing();
+      }, SELF_PING_INTERVAL_MS);
+      selfPingTimer.unref?.();
+    }
+
+    // Wait briefly for cloud hydration without blocking HTTP server startup, then auto-resume WhatsApp
+    Promise.race([hydrationPromise, sleep(4000)])
+      .then(() => restoreCredsFromCloudIfMissing())
       .then(() => {
+        if (isShuttingDown) return;
         const credsPath = path.join(AUTH_DIR, 'creds.json');
         if (fs.existsSync(credsPath)) {
           try {
@@ -1915,6 +2121,40 @@ async function bootstrap() {
       })
       .catch(() => {});
   });
+
+  function gracefulShutdown(signal: string) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[WaNexus] Received ${signal}, shutting down cleanly...`);
+
+    cancelReconnectTimer();
+    if (credsBackupTimer) clearTimeout(credsBackupTimer);
+    if (selfPingTimer) clearInterval(selfPingTimer);
+    if (selfPingWarmupTimer) clearTimeout(selfPingWarmupTimer);
+    if (selfPingRetryTimer) clearTimeout(selfPingRetryTimer);
+    clearInterval(cleanupTimer);
+
+    for (const pending of pendingDmBuffers.values()) {
+      clearTimeout(pending.timer);
+    }
+    pendingDmBuffers.clear();
+
+    if (currentSocket) {
+      try {
+        currentSocket.end(undefined);
+      } catch {
+        // ignore close errors
+      }
+      currentSocket = null;
+    }
+
+    httpServer.close(() => process.exit(0));
+    const forceExit = setTimeout(() => process.exit(0), 3000);
+    forceExit.unref?.();
+  }
+
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 }
 
 bootstrap().catch((err) => {
