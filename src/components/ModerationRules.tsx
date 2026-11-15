@@ -18,6 +18,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
   const [linkProbeText, setLinkProbeText] = useState('Check this out: https://youtube.com/watch?v=dQw4w9WgXcQ or t.me/mychannel');
   const [probeResult, setProbeResult] = useState<{ hasLink: boolean; matches: string[] } | null>(null);
   const [isTesting, setIsTesting] = useState(false);
+  const [ruleError, setRuleError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isEditingReply) {
@@ -27,14 +28,27 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
   const groupEntries = Object.entries(config.antilinkGroups);
 
+  async function safeUpdate(patch: Partial<BotConfig>): Promise<boolean> {
+    setRuleError(null);
+    try {
+      await onUpdateConfig(patch);
+      return true;
+    } catch (err) {
+      setRuleError((err as Error).message || 'Could not save rule changes.');
+      return false;
+    }
+  }
+
   async function handleSaveReply(e: React.FormEvent) {
     e.preventDefault();
     const cleaned = replyDraft.trim();
     if (!cleaned) return;
     setIsSavingReply(true);
     try {
-      await onUpdateConfig({ autoreplyMessage: cleaned });
-      setIsEditingReply(false);
+      const ok = await safeUpdate({ autoreplyMessage: cleaned });
+      if (ok) {
+        setIsEditingReply(false);
+      }
     } finally {
       setIsSavingReply(false);
     }
@@ -43,9 +57,11 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
   async function handleResetReply() {
     setIsSavingReply(true);
     try {
-      await onUpdateConfig({ autoreplyMessage: BENGALI_AUTOREPLY_EXACT });
-      setReplyDraft(BENGALI_AUTOREPLY_EXACT);
-      setIsEditingReply(false);
+      const ok = await safeUpdate({ autoreplyMessage: BENGALI_AUTOREPLY_EXACT });
+      if (ok) {
+        setReplyDraft(BENGALI_AUTOREPLY_EXACT);
+        setIsEditingReply(false);
+      }
     } finally {
       setIsSavingReply(false);
     }
@@ -56,17 +72,19 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
     const cleaned = newGroupJid.trim();
     if (!cleaned) return;
     const formatted = cleaned.endsWith('@g.us') ? cleaned : `${cleaned}@g.us`;
-    await onUpdateConfig({
+    const ok = await safeUpdate({
       antilinkGroups: {
         ...config.antilinkGroups,
         [formatted]: true,
       },
     });
-    setNewGroupJid('');
+    if (ok) {
+      setNewGroupJid('');
+    }
   }
 
   async function handleToggleGroup(jid: string, enabled: boolean) {
-    await onUpdateConfig({
+    await safeUpdate({
       antilinkGroups: {
         ...config.antilinkGroups,
         [jid]: enabled,
@@ -77,11 +95,12 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
   async function handleRemoveGroup(jid: string) {
     const next = { ...config.antilinkGroups };
     delete next[jid];
-    await onUpdateConfig({ antilinkGroups: next });
+    await safeUpdate({ antilinkGroups: next });
   }
 
   async function handleTestLink(e: React.FormEvent) {
     e.preventDefault();
+    setRuleError(null);
     setIsTesting(true);
     try {
       const res = await authFetch('/api/antilink/test', {
@@ -90,7 +109,13 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
         body: JSON.stringify({ text: linkProbeText }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        setRuleError(data.error || 'Could not test message links.');
+        return;
+      }
       setProbeResult(data);
+    } catch (err) {
+      setRuleError((err as Error).message || 'Could not test message links.');
     } finally {
       setIsTesting(false);
     }
@@ -98,6 +123,11 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
   return (
     <div className="space-y-8">
+      {ruleError && (
+        <div className="p-3.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">
+          {ruleError}
+        </div>
+      )}
       {/* Private Bengali Auto-Reply Assistant */}
       <section className="bg-white border border-slate-200 rounded-xl p-6">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-200">
@@ -112,7 +142,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
           <div className="flex items-center gap-3 shrink-0">
             <select
               value={config.cooldownMs}
-              onChange={(e) => onUpdateConfig({ cooldownMs: Number(e.target.value) })}
+              onChange={(e) => void safeUpdate({ cooldownMs: Number(e.target.value) })}
               className="px-3 py-2 text-xs font-medium bg-white border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
               aria-label="Cooldown interval"
             >
@@ -124,7 +154,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
             <button
               type="button"
-              onClick={() => onUpdateConfig({ autoreply: !config.autoreply })}
+              onClick={() => void safeUpdate({ autoreply: !config.autoreply })}
               className={`px-4 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 config.autoreply
                   ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'

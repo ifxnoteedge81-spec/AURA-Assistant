@@ -113,12 +113,12 @@ export async function saveCloudSettings(uid: string, config: BotConfig) {
   const path = 'bot_settings/primary';
   try {
     const ref = doc(db, 'bot_settings', 'primary');
-    let exists = false;
+    let hasCreatedAt = false;
     try {
       const snap = await getDocFromServer(ref);
-      exists = snap.exists();
+      hasCreatedAt = snap.exists() && Boolean(snap.data()?.createdAt);
     } catch {
-      exists = false;
+      hasCreatedAt = false;
     }
 
     const payload: Record<string, unknown> = {
@@ -141,7 +141,7 @@ export async function saveCloudSettings(uid: string, config: BotConfig) {
       updatedAt: serverTimestamp(),
     };
 
-    if (!exists) {
+    if (!hasCreatedAt) {
       payload.createdAt = serverTimestamp();
     }
     await setDoc(ref, payload, { merge: true });
@@ -182,6 +182,14 @@ export async function deleteCloudDictionaryEntry(id: string) {
   }
 }
 
+function toIsoString(ts: unknown): string {
+  if (ts && typeof (ts as { toDate?: () => Date }).toDate === 'function') {
+    return (ts as { toDate: () => Date }).toDate().toISOString();
+  }
+  if (typeof ts === 'string' && ts) return ts;
+  return new Date().toISOString();
+}
+
 export async function fetchAllCloudData(uid: string): Promise<{
   settings: Partial<BotConfig> | null;
   dictionary: DictionaryEntry[];
@@ -199,6 +207,15 @@ export async function fetchAllCloudData(uid: string): Promise<{
     );
     if (!settingsSnap.empty) {
       settings = settingsSnap.docs[0].data() as Partial<BotConfig>;
+    } else {
+      try {
+        const primarySnap = await getDocFromServer(doc(db, 'bot_settings', 'primary'));
+        if (primarySnap.exists()) {
+          settings = primarySnap.data() as Partial<BotConfig>;
+        }
+      } catch {
+        // non-admin or offline
+      }
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, 'bot_settings');
@@ -236,7 +253,7 @@ export async function fetchAllCloudData(uid: string): Promise<{
         detectedDistrict: String(data.detectedDistrict || 'Standard'),
         lastSummary: String(data.lastSummary || ''),
         turns: Array.isArray(data.turns) ? data.turns : [],
-        updatedAt: new Date().toISOString(),
+        updatedAt: toIsoString(data.updatedAt),
       });
     });
   } catch (error) {
@@ -256,7 +273,7 @@ export async function fetchAllCloudData(uid: string): Promise<{
         summary: String(data.summary || ''),
         urgency: data.urgency === 'important' ? 'important' : 'normal',
         resolved: Boolean(data.resolved),
-        createdAt: new Date().toISOString(),
+        createdAt: toIsoString(data.createdAt),
       });
     });
   } catch (error) {

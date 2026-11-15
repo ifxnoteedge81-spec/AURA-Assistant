@@ -33,6 +33,11 @@ const TONE_OPTIONS: { id: AssistantTone; label: string; desc: string }[] = [
   },
 ];
 
+function formatPauseLabel(ms: number): string {
+  if (ms <= 0) return 'No auto-pause';
+  return `${Math.round(ms / 60000)} minutes`;
+}
+
 export function AssistantBrainPanel({
   config,
   onUpdateConfig,
@@ -48,8 +53,13 @@ export function AssistantBrainPanel({
   const [assistantTone, setAssistantTone] = useState<AssistantTone>(config.assistantTone);
   const [takeoverPauseMs, setTakeoverPauseMs] = useState(config.takeoverPauseMs);
   const [aiEnabled, setAiEnabled] = useState(config.aiAssistantEnabled);
+
+  const isDirtyRef = useRef(false);
+  const [hasUnsavedText, setHasUnsavedText] = useState(false);
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [profileSavedToast, setProfileSavedToast] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [quickSaveNote, setQuickSaveNote] = useState<string | null>(null);
 
   // Dictionary State
   const [entries, setEntries] = useState<DictionaryEntry[]>([]);
@@ -60,27 +70,52 @@ export function AssistantBrainPanel({
   const [district, setDistrict] = useState('Dhaka');
   const [language, setLanguage] = useState<DictionaryEntry['language']>('bn_dialect');
   const [replyStyleHint, setReplyStyleHint] = useState('');
+  const [isAddingWord, setIsAddingWord] = useState(false);
+  const [isLoadingStarter, setIsLoadingStarter] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Only sync text fields from server polls when user has NOT made unsaved edits
   useEffect(() => {
-    setOwnerName(config.ownerName);
-    setOwnerProfession(config.ownerProfession);
-    setOwnerLocation(config.ownerLocation);
-    setOwnerBio(config.ownerBio);
-    setOwnerBoundaries(config.ownerBoundaries);
-    setFirstGreeting(config.firstGreetingTemplate);
     setAssistantTone(config.assistantTone);
     setTakeoverPauseMs(config.takeoverPauseMs);
     setAiEnabled(config.aiAssistantEnabled);
+    if (!isDirtyRef.current) {
+      setOwnerName(config.ownerName);
+      setOwnerProfession(config.ownerProfession);
+      setOwnerLocation(config.ownerLocation);
+      setOwnerBio(config.ownerBio);
+      setOwnerBoundaries(config.ownerBoundaries);
+      setFirstGreeting(config.firstGreetingTemplate);
+    }
   }, [config]);
 
+  function markTextDirty() {
+    isDirtyRef.current = true;
+    setHasUnsavedText(true);
+    setProfileError(null);
+  }
+
+  function showQuickNote(msg: string) {
+    setQuickSaveNote(msg);
+    setTimeout(() => {
+      setQuickSaveNote((curr) => (curr === msg ? null : curr));
+    }, 2800);
+  }
+
   async function loadDictionary() {
-    const res = await authFetch('/api/dictionary');
-    if (res.ok) {
-      const data = await res.json();
-      setEntries(data.entries || []);
+    try {
+      const res = await authFetch('/api/dictionary');
+      if (res.ok) {
+        const data = await res.json();
+        setEntries(data.entries || []);
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        setUploadError(errData.error || 'Could not load dictionary entries.');
+      }
+    } catch (err) {
+      setUploadError((err as Error).message);
     }
   }
 
@@ -88,9 +123,50 @@ export function AssistantBrainPanel({
     void loadDictionary();
   }, []);
 
+  async function handleToggleAiBrain() {
+    const nextVal = !aiEnabled;
+    const prevVal = aiEnabled;
+    setAiEnabled(nextVal);
+    setProfileError(null);
+    try {
+      await onUpdateConfig({ aiAssistantEnabled: nextVal });
+      showQuickNote(nextVal ? 'AI Brain turned ON and saved.' : 'Switched to Static Fallback and saved.');
+    } catch (err) {
+      setAiEnabled(prevVal);
+      setProfileError((err as Error).message || 'Failed to toggle AI Brain.');
+    }
+  }
+
+  async function handleChangeTakeoverPause(nextMs: number) {
+    const prevMs = takeoverPauseMs;
+    setTakeoverPauseMs(nextMs);
+    setProfileError(null);
+    try {
+      await onUpdateConfig({ takeoverPauseMs: nextMs });
+      showQuickNote(`Takeover pause saved: ${formatPauseLabel(nextMs)}`);
+    } catch (err) {
+      setTakeoverPauseMs(prevMs);
+      setProfileError((err as Error).message || 'Failed to save Human Takeover pause duration.');
+    }
+  }
+
+  async function handleSelectTone(tone: AssistantTone) {
+    const prevTone = assistantTone;
+    setAssistantTone(tone);
+    setProfileError(null);
+    try {
+      await onUpdateConfig({ assistantTone: tone });
+      showQuickNote('Assistant tone saved.');
+    } catch (err) {
+      setAssistantTone(prevTone);
+      setProfileError((err as Error).message || 'Failed to save tone.');
+    }
+  }
+
   async function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
     setIsSavingProfile(true);
+    setProfileError(null);
     try {
       await onUpdateConfig({
         aiAssistantEnabled: aiEnabled,
@@ -103,8 +179,12 @@ export function AssistantBrainPanel({
         assistantTone,
         takeoverPauseMs,
       });
+      isDirtyRef.current = false;
+      setHasUnsavedText(false);
       setProfileSavedToast(true);
-      setTimeout(() => setProfileSavedToast(false), 2000);
+      setTimeout(() => setProfileSavedToast(false), 2500);
+    } catch (err) {
+      setProfileError((err as Error).message || 'Failed to save persona configuration.');
     } finally {
       setIsSavingProfile(false);
     }
@@ -112,32 +192,67 @@ export function AssistantBrainPanel({
 
   async function handleAddWord(e: React.FormEvent) {
     e.preventDefault();
-    if (!term.trim() || !meaning.trim()) return;
-    const res = await authFetch('/api/dictionary', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ term, meaning, district, language, replyStyleHint }),
-    });
-    const data = await res.json();
-    if (res.ok) {
+    setUploadError(null);
+    setUploadStatus(null);
+    if (!term.trim() || !meaning.trim()) {
+      setUploadError('Please enter both Word / Dialect phrase and Meaning before clicking Add Entry.');
+      return;
+    }
+
+    setIsAddingWord(true);
+    try {
+      const res = await authFetch('/api/dictionary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ term, meaning, district, language, replyStyleHint }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setUploadError(data.error || 'Failed to add dictionary entry.');
+        return;
+      }
       setEntries(data.entries || []);
       if (data.entry && onSyncDictionaryEntry) {
-        await onSyncDictionaryEntry(data.entry);
+        await onSyncDictionaryEntry(data.entry).catch(() => {});
       }
       setTerm('');
       setMeaning('');
       setReplyStyleHint('');
+      setUploadStatus(`Added "${data.entry?.term || term}" to ${district} dictionary.`);
+    } catch (err) {
+      setUploadError((err as Error).message);
+    } finally {
+      setIsAddingWord(false);
     }
   }
 
   async function handleLoadStarter() {
     setUploadError(null);
-    const res = await authFetch('/api/dictionary/starter', { method: 'POST' });
-    const data = await res.json();
-    if (res.ok) {
+    setUploadStatus(null);
+    setIsLoadingStarter(true);
+    try {
+      const res = await authFetch('/api/dictionary/starter', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setUploadError(data.error || 'Failed to load starter dialect pack.');
+        return;
+      }
       setEntries(data.entries || []);
-      setUploadStatus(`Loaded ${data.importedCount} regional dialect & Bangla-English starter phrases.`);
+      if (Array.isArray(data.added) && onSyncDictionaryEntry) {
+        for (const item of data.added) {
+          await onSyncDictionaryEntry(item).catch(() => {});
+        }
+      }
+      setUploadStatus(
+        data.importedCount > 0
+          ? `Loaded ${data.importedCount} regional dialect & Bangla-English starter phrases.`
+          : 'All starter dialect phrases are already in your dictionary.'
+      );
       setTimeout(() => setUploadStatus(null), 4000);
+    } catch (err) {
+      setUploadError((err as Error).message);
+    } finally {
+      setIsLoadingStarter(false);
     }
   }
 
@@ -154,7 +269,7 @@ export function AssistantBrainPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, fileName: file.name }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setUploadError(data.error || 'Import failed.');
         return;
@@ -162,7 +277,7 @@ export function AssistantBrainPanel({
       setEntries(data.entries || []);
       if (Array.isArray(data.added) && onSyncDictionaryEntry) {
         for (const item of data.added.slice(0, 30)) {
-          await onSyncDictionaryEntry(item);
+          await onSyncDictionaryEntry(item).catch(() => {});
         }
       }
       setUploadStatus(`Imported ${data.importedCount} dictionary entries from ${file.name}.`);
@@ -174,13 +289,20 @@ export function AssistantBrainPanel({
   }
 
   async function handleDeleteEntry(id: string) {
-    const res = await authFetch(`/api/dictionary/${id}`, { method: 'DELETE' });
-    if (res.ok) {
-      const data = await res.json();
+    setUploadError(null);
+    try {
+      const res = await authFetch(`/api/dictionary/${id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setUploadError(data.error || 'Failed to delete dictionary entry.');
+        return;
+      }
       setEntries(data.entries || []);
       if (onDeleteDictionaryEntry) {
-        await onDeleteDictionaryEntry(id);
+        await onDeleteDictionaryEntry(id).catch(() => {});
       }
+    } catch (err) {
+      setUploadError((err as Error).message);
     }
   }
 
@@ -214,7 +336,7 @@ export function AssistantBrainPanel({
           <div className="flex items-center gap-3 shrink-0">
             <button
               type="button"
-              onClick={() => setAiEnabled(!aiEnabled)}
+              onClick={handleToggleAiBrain}
               className={`px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer ${
                 aiEnabled
                   ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
@@ -230,10 +352,23 @@ export function AssistantBrainPanel({
               className="px-4 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
             >
               {profileSavedToast ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : null}
-              {isSavingProfile ? 'Saving...' : profileSavedToast ? 'Saved to Cloud' : 'Save Persona'}
+              {isSavingProfile ? 'Saving...' : profileSavedToast ? 'Saved!' : 'Save Persona'}
             </button>
           </div>
         </div>
+
+        {profileError && (
+          <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
+            {profileError}
+          </div>
+        )}
+
+        {quickSaveNote && (
+          <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5">
+            <Check className="w-3.5 h-3.5 shrink-0" />
+            <span>{quickSaveNote}</span>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
@@ -241,7 +376,10 @@ export function AssistantBrainPanel({
             <input
               type="text"
               value={ownerName}
-              onChange={(e) => setOwnerName(e.target.value)}
+              onChange={(e) => {
+                setOwnerName(e.target.value);
+                markTextDirty();
+              }}
               placeholder="e.g. Sir / Afnan"
               className="mt-1.5 w-full px-3.5 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
             />
@@ -251,7 +389,10 @@ export function AssistantBrainPanel({
             <input
               type="text"
               value={ownerProfession}
-              onChange={(e) => setOwnerProfession(e.target.value)}
+              onChange={(e) => {
+                setOwnerProfession(e.target.value);
+                markTextDirty();
+              }}
               placeholder="e.g. Software Engineer & Entrepreneur"
               className="mt-1.5 w-full px-3.5 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
             />
@@ -261,7 +402,10 @@ export function AssistantBrainPanel({
             <input
               type="text"
               value={ownerLocation}
-              onChange={(e) => setOwnerLocation(e.target.value)}
+              onChange={(e) => {
+                setOwnerLocation(e.target.value);
+                markTextDirty();
+              }}
               placeholder="e.g. Dhaka, Bangladesh"
               className="mt-1.5 w-full px-3.5 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
             />
@@ -276,7 +420,10 @@ export function AssistantBrainPanel({
             <textarea
               rows={4}
               value={ownerBio}
-              onChange={(e) => setOwnerBio(e.target.value)}
+              onChange={(e) => {
+                setOwnerBio(e.target.value);
+                markTextDirty();
+              }}
               className="mt-1.5 w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
               placeholder="Write what you do, your strengths, and how people can reach you..."
             />
@@ -289,7 +436,10 @@ export function AssistantBrainPanel({
             <textarea
               rows={4}
               value={ownerBoundaries}
-              onChange={(e) => setOwnerBoundaries(e.target.value)}
+              onChange={(e) => {
+                setOwnerBoundaries(e.target.value);
+                markTextDirty();
+              }}
               className="mt-1.5 w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
               placeholder="e.g. Sir does not arrange flat/room rentals or lend money..."
             />
@@ -304,18 +454,21 @@ export function AssistantBrainPanel({
             <textarea
               rows={2}
               value={firstGreeting}
-              onChange={(e) => setFirstGreeting(e.target.value)}
+              onChange={(e) => {
+                setFirstGreeting(e.target.value);
+                markTextDirty();
+              }}
               className="mt-1.5 w-full px-3.5 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
             />
           </div>
 
           <div className="lg:col-span-5">
             <label className="block text-xs font-medium text-slate-600">
-              Smart Human Takeover Pause (When you reply manually from phone)
+              Smart Human Takeover Pause (Auto-saves when changed)
             </label>
             <select
               value={takeoverPauseMs}
-              onChange={(e) => setTakeoverPauseMs(Number(e.target.value))}
+              onChange={(e) => void handleChangeTakeoverPause(Number(e.target.value))}
               className="mt-1.5 w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
             >
               <option value={900000}>Pause AI for 15 minutes</option>
@@ -324,17 +477,20 @@ export function AssistantBrainPanel({
               <option value={3600000}>Pause AI for 60 minutes</option>
               <option value={0}>No auto-pause</option>
             </select>
+            <div className="mt-1 text-[11px] text-slate-500">
+              Active setting: <span className="font-medium text-slate-800">{formatPauseLabel(config.takeoverPauseMs)}</span>
+            </div>
           </div>
         </div>
 
         <div>
-          <div className="text-xs font-medium text-slate-600 mb-2">Assistant Personality &amp; Banter Tone</div>
+          <div className="text-xs font-medium text-slate-600 mb-2">Assistant Personality &amp; Banter Tone (Auto-saves when clicked)</div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             {TONE_OPTIONS.map((opt) => (
               <button
                 key={opt.id}
                 type="button"
-                onClick={() => setAssistantTone(opt.id)}
+                onClick={() => void handleSelectTone(opt.id)}
                 className={`p-3.5 text-left rounded-lg border transition-colors cursor-pointer ${
                   assistantTone === opt.id
                     ? 'border-emerald-600 bg-emerald-50/70'
@@ -346,6 +502,23 @@ export function AssistantBrainPanel({
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Bottom Save Bar (convenient on mobile) */}
+        <div className="pt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
+          <div className="text-xs text-slate-500">
+            {hasUnsavedText
+              ? 'You have unsaved text edits in Bio, Name, Boundaries, or Greeting.'
+              : 'All persona & bio changes are up to date.'}
+          </div>
+          <button
+            type="submit"
+            disabled={isSavingProfile}
+            className="px-4 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+          >
+            {profileSavedToast ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : null}
+            {isSavingProfile ? 'Saving...' : profileSavedToast ? 'Saved!' : 'Save Persona'}
+          </button>
         </div>
       </form>
 
@@ -366,9 +539,10 @@ export function AssistantBrainPanel({
             <button
               type="button"
               onClick={handleLoadStarter}
-              className="px-3.5 py-2 text-xs font-medium bg-white text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+              disabled={isLoadingStarter}
+              className="px-3.5 py-2 text-xs font-medium bg-white text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
             >
-              Load Starter Dialect Pack
+              {isLoadingStarter ? 'Loading...' : 'Load Starter Dialect Pack'}
             </button>
             <input
               ref={fileInputRef}
@@ -421,19 +595,30 @@ export function AssistantBrainPanel({
             placeholder="District (e.g. Chattogram)"
             className="md:col-span-2 px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg"
           />
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value as DictionaryEntry['language'])}
+            className="md:col-span-2 px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-700"
+            aria-label="Language tag for new entry"
+          >
+            <option value="bn_dialect">Regional Dialect</option>
+            <option value="bn_en">Bangla-English</option>
+            <option value="en_slang">English / Slang</option>
+          </select>
           <input
             type="text"
             value={replyStyleHint}
             onChange={(e) => setReplyStyleHint(e.target.value)}
             placeholder="Optional reply hint / banter style"
-            className="md:col-span-2 px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg"
+            className="md:col-span-10 px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg"
           />
           <button
             type="submit"
-            className="md:col-span-2 px-3 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
+            disabled={isAddingWord}
+            className="md:col-span-2 px-3 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-3.5 h-3.5" />
-            Add Entry
+            {isAddingWord ? 'Adding...' : 'Add Entry'}
           </button>
         </form>
 
@@ -462,16 +647,6 @@ export function AssistantBrainPanel({
                   {d}
                 </option>
               ))}
-            </select>
-            <select
-              value={language}
-              onChange={(e) => setLanguage(e.target.value as DictionaryEntry['language'])}
-              className="px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-700"
-              aria-label="Default language tag for new entries"
-            >
-              <option value="bn_dialect">Tag: Regional Dialect</option>
-              <option value="bn_en">Tag: Bangla-English</option>
-              <option value="en_slang">Tag: English / Slang</option>
             </select>
           </div>
         </div>

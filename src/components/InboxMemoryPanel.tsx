@@ -7,16 +7,22 @@ export function InboxMemoryPanel() {
   const [memories, setMemories] = useState<ChatMemoryRecord[]>([]);
   const [notes, setNotes] = useState<InboxNoteRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [inboxError, setInboxError] = useState<string | null>(null);
 
   async function fetchInboxData() {
     setLoading(true);
+    setInboxError(null);
     try {
       const res = await authFetch('/api/assistant/inbox');
-      if (res.ok) {
-        const data = await res.json();
-        setMemories(data.memories || []);
-        setNotes(data.notes || []);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setInboxError(data.error || 'Could not load inbox notes & memories.');
+        return;
       }
+      setMemories(data.memories || []);
+      setNotes(data.notes || []);
+    } catch (err) {
+      setInboxError((err as Error).message || 'Could not load inbox notes & memories.');
     } finally {
       setLoading(false);
     }
@@ -27,30 +33,57 @@ export function InboxMemoryPanel() {
   }, []);
 
   async function handleToggleNote(id: string) {
-    const res = await authFetch(`/api/notes/${id}/toggle`, { method: 'POST' });
-    if (res.ok) {
-      const data = await res.json();
+    setInboxError(null);
+    try {
+      const res = await authFetch(`/api/notes/${id}/toggle`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setInboxError(data.error || 'Could not update note status.');
+        return;
+      }
       setNotes(data.notes || []);
+    } catch (err) {
+      setInboxError((err as Error).message || 'Could not update note status.');
     }
   }
 
   async function handleDeleteNote(id: string) {
-    const res = await authFetch(`/api/notes/${id}`, { method: 'DELETE' });
-    if (res.ok) {
-      const data = await res.json();
+    setInboxError(null);
+    try {
+      const res = await authFetch(`/api/notes/${id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setInboxError(data.error || 'Could not delete note.');
+        return;
+      }
       setNotes(data.notes || []);
+    } catch (err) {
+      setInboxError((err as Error).message || 'Could not delete note.');
     }
   }
 
   async function handleClearMemory(chatId: string) {
-    const res = await authFetch(`/api/memories/${chatId}`, { method: 'DELETE' });
-    if (res.ok) {
+    setInboxError(null);
+    try {
+      const res = await authFetch(`/api/memories/${chatId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setInboxError(data.error || 'Could not clear chat memory.');
+        return;
+      }
       setMemories((prev) => prev.filter((m) => m.chatId !== chatId));
+    } catch (err) {
+      setInboxError((err as Error).message || 'Could not clear chat memory.');
     }
   }
 
   return (
     <div className="space-y-8">
+      {inboxError && (
+        <div className="p-3.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">
+          {inboxError}
+        </div>
+      )}
       {/* Notes for Sir */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">

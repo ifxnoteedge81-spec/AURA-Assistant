@@ -30,17 +30,34 @@ export function SecurityAntiBanPanel({
   const [pinMsg, setPinMsg] = useState<string | null>(null);
   const [pinErr, setPinErr] = useState<string | null>(null);
   const [savingPin, setSavingPin] = useState(false);
+  const [engineErr, setEngineErr] = useState<string | null>(null);
+  const [engineMsg, setEngineMsg] = useState<string | null>(null);
 
   const loadStats = useCallback(async () => {
-    const res = await authFetch('/api/security/stats');
-    if (res.ok) {
-      setStats((await res.json()) as SecurityStatsResponse);
+    try {
+      const res = await authFetch('/api/security/stats');
+      if (res.ok) {
+        setStats((await res.json()) as SecurityStatsResponse);
+      }
+    } catch {
+      // ignore transient poll error
     }
   }, []);
 
   useEffect(() => {
     void loadStats();
   }, [loadStats]);
+
+  async function safeUpdateConfig(patch: Partial<BotConfig>, label: string) {
+    setEngineErr(null);
+    setEngineMsg(null);
+    try {
+      await onUpdateConfig(patch);
+      setEngineMsg(label);
+    } catch (err) {
+      setEngineErr((err as Error).message || 'Could not update Anti-Ban settings.');
+    }
+  }
 
   async function handleSavePin(e: React.FormEvent) {
     e.preventDefault();
@@ -53,7 +70,7 @@ export function SecurityAntiBanPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'set', pin: newPin }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setPinErr(data.error || 'Could not update PIN.');
         return;
@@ -61,6 +78,8 @@ export function SecurityAntiBanPanel({
       setNewPin('');
       setPinMsg('2FA Security PIN saved. Future logins will require this PIN.');
       await loadStats();
+    } catch (err) {
+      setPinErr((err as Error).message || 'Could not update PIN.');
     } finally {
       setSavingPin(false);
     }
@@ -69,24 +88,41 @@ export function SecurityAntiBanPanel({
   async function handleRemovePin() {
     setPinErr(null);
     setPinMsg(null);
-    const res = await authFetch('/api/security/pin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'clear' }),
-    });
-    if (res.ok) {
+    try {
+      const res = await authFetch('/api/security/pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'clear' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPinErr(data.error || 'Could not remove custom PIN.');
+        return;
+      }
       setPinMsg('Custom Security PIN cleared.');
       await loadStats();
+    } catch (err) {
+      setPinErr((err as Error).message || 'Could not remove custom PIN.');
     }
   }
 
   async function handleResumeTakeover(jid?: string) {
-    await authFetch('/api/security/resume-takeover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jid: jid || '' }),
-    });
-    await loadStats();
+    setEngineErr(null);
+    try {
+      const res = await authFetch('/api/security/resume-takeover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid: jid || '' }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setEngineErr(data.error || 'Could not resume AI takeover.');
+        return;
+      }
+      await loadStats();
+    } catch (err) {
+      setEngineErr((err as Error).message || 'Could not resume AI takeover.');
+    }
   }
 
   const dailyCount = stats?.dailyReplyStats.count ?? 0;
@@ -224,7 +260,12 @@ export function SecurityAntiBanPanel({
             </div>
             <button
               type="button"
-              onClick={() => onUpdateConfig({ humanTypingEnabled: !config.humanTypingEnabled })}
+              onClick={() =>
+                void safeUpdateConfig(
+                  { humanTypingEnabled: !config.humanTypingEnabled },
+                  !config.humanTypingEnabled ? 'Human typing simulation enabled.' : 'Human typing simulation disabled.'
+                )
+              }
               className={`px-3.5 py-2 text-xs font-medium rounded-lg border whitespace-nowrap shrink-0 cursor-pointer ${
                 config.humanTypingEnabled
                   ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
@@ -244,7 +285,10 @@ export function SecurityAntiBanPanel({
             </div>
             <select
               value={config.dailyReplyLimit}
-              onChange={(e) => onUpdateConfig({ dailyReplyLimit: Number(e.target.value) })}
+              onChange={(e) => {
+                const limit = Number(e.target.value);
+                void safeUpdateConfig({ dailyReplyLimit: limit }, `Daily safe reply limit updated to ${limit}.`);
+              }}
               className="px-3 py-2 text-xs font-medium bg-white border border-slate-200 rounded-lg text-slate-700"
             >
               <option value={50}>50 replies / day (Ultra Safe)</option>
@@ -254,6 +298,16 @@ export function SecurityAntiBanPanel({
               <option value={350}>350 replies / day (High Volume)</option>
             </select>
           </div>
+
+          {engineErr && (
+            <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">{engineErr}</div>
+          )}
+          {engineMsg && (
+            <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5">
+              <Check className="w-3.5 h-3.5 shrink-0" />
+              <span>{engineMsg}</span>
+            </div>
+          )}
 
           <ul className="pt-3 border-t border-slate-200 space-y-2 text-xs text-slate-700">
             <li className="flex justify-between">

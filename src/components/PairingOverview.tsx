@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Check,
   Copy,
@@ -35,6 +35,12 @@ export function PairingOverview({
   const [isPairing, setIsPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+
+  useEffect(() => {
+    if (!phoneInput && botState.pairingPhone) {
+      setPhoneInput(botState.pairingPhone);
+    }
+  }, [botState.pairingPhone]);
 
   const activeGroupCount = Object.values(botState.config.antilinkGroups).filter(Boolean).length;
 
@@ -107,7 +113,14 @@ export function PairingOverview({
             </span>
             <button
               type="button"
-              onClick={() => onToggleAutoreply(!botState.config.autoreply)}
+              onClick={async () => {
+                setPairError(null);
+                try {
+                  await onToggleAutoreply(!botState.config.autoreply);
+                } catch (err) {
+                  setPairError((err as Error).message || 'Could not update auto-reply setting.');
+                }
+              }}
               className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 botState.config.autoreply
                   ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'

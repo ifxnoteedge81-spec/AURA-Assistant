@@ -142,15 +142,15 @@ service cloud.firestore {
         && isValidId(settingId)
         && isValidBotSettings(incoming())
         && isOwnerResource()
-        && incoming().ownerId == existing().ownerId
-        && incoming().createdAt == existing().createdAt
+        && (incoming().ownerId == existing().ownerId || (existing().ownerId == 'server_admin' && isAdmin()))
+        && (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt)
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'autoreply', 'aiAssistantEnabled', 'autoreplyMessage',
+          'ownerId', 'autoreply', 'aiAssistantEnabled', 'autoreplyMessage',
           'firstGreetingTemplate', 'ownerName', 'ownerProfession',
           'ownerLocation', 'ownerBio', 'ownerBoundaries', 'assistantTone',
           'cooldownMs', 'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
-          'antilinkGroups', 'updatedAt'
+          'antilinkGroups', 'createdAt', 'updatedAt'
         ]);
       allow delete: if isValidId(settingId) && isOwnerResource();
     }

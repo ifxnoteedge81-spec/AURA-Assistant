@@ -113,7 +113,13 @@ export default function App() {
       const res = await authFetch('/api/bot/status');
       if (res.ok) {
         const data = (await res.json()) as BotStatusResponse;
-        setBotState(data);
+        setBotState((prev) => ({
+          ...data,
+          config:
+            JSON.stringify(prev.config) === JSON.stringify(data.config)
+              ? prev.config
+              : data.config,
+        }));
       }
     } catch {
       // keep existing state on transient errors
@@ -143,7 +149,7 @@ export default function App() {
             await authFetch('/api/cloud/sync', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(cloudData),
+              body: JSON.stringify({ ownerId: user.uid, ...cloudData }),
             });
             await fetchStatus();
             setCloudStatusMsg('Firestore synced');
@@ -200,11 +206,15 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    if (res.ok) {
-      const data = await res.json();
-      if (firebaseUser && data.config) {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to save configuration to bot server.');
+    }
+    if (data.config) {
+      setBotState((prev) => ({ ...prev, config: data.config as BotConfig }));
+      if (firebaseUser) {
         try {
-          await saveCloudSettings(firebaseUser.uid, data.config);
+          await saveCloudSettings(firebaseUser.uid, data.config as BotConfig);
           setCloudStatusMsg('Saved to Firestore');
         } catch (err) {
           setCloudStatusMsg((err as Error).message.slice(0, 80));

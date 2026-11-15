@@ -202,11 +202,12 @@ let botConfig: BotConfig = normalizeConfig(loadJsonFile<Partial<BotConfig>>(CONF
 let dictionaryEntries: DictionaryEntry[] = loadJsonFile<DictionaryEntry[]>(DICTIONARY_FILE, []);
 let chatMemories: Record<string, ChatMemoryRecord> = loadJsonFile<Record<string, ChatMemoryRecord>>(MEMORIES_FILE, {});
 let inboxNotes: InboxNoteRecord[] = loadJsonFile<InboxNoteRecord[]>(NOTES_FILE, []);
+let activeCloudOwnerId: string = process.env.FIREBASE_OWNER_UID || 'server_admin';
 
 function persistConfig() {
   saveJsonFile(CONFIG_FILE, botConfig);
   void adminSaveDocument('bot_settings', 'primary', {
-    ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+    ownerId: activeCloudOwnerId,
     ...botConfig,
   });
 }
@@ -740,6 +741,14 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         );
         return;
       }
+      await sendTrackedMessage(
+        sock,
+        remoteJid,
+        {
+          text: `🤖 *Private Auto-Reply Status:* ${botConfig.autoreply ? 'ON' : 'OFF'}\nUsage: *${PREFIX}autoreply on* | *${PREFIX}autoreply off*`,
+        },
+        { quoted: msg }
+      );
       return;
     }
 
@@ -1050,8 +1059,11 @@ async function hydrateFromCloudAdmin() {
   const { db, mode } = getAdminFirestore();
   if (!db) return;
   try {
-    const cloudSettings = await adminLoadDocument<Partial<BotConfig>>('bot_settings', 'primary');
+    const cloudSettings = await adminLoadDocument<Partial<BotConfig> & { ownerId?: string }>('bot_settings', 'primary');
     if (cloudSettings) {
+      if (cloudSettings.ownerId && cloudSettings.ownerId !== 'server_admin') {
+        activeCloudOwnerId = cloudSettings.ownerId;
+      }
       botConfig = normalizeConfig(cloudSettings);
       saveJsonFile(CONFIG_FILE, botConfig);
     }
@@ -1385,7 +1397,10 @@ async function bootstrap() {
 
   // Cloud Sync endpoint used by browser-authenticated Firestore client
   app.post('/api/cloud/sync', (req, res) => {
-    const { settings, dictionary, memories, notes } = req.body || {};
+    const { ownerId, settings, dictionary, memories, notes } = req.body || {};
+    if (typeof ownerId === 'string' && ownerId.trim()) {
+      activeCloudOwnerId = ownerId.trim();
+    }
     if (settings && typeof settings === 'object') {
       botConfig = normalizeConfig({ ...botConfig, ...settings });
       saveJsonFile(CONFIG_FILE, botConfig);
@@ -1494,8 +1509,14 @@ async function bootstrap() {
     );
     dictionaryEntries = [...fresh, ...dictionaryEntries];
     persistDictionary();
+    for (const entry of fresh) {
+      void adminSaveDocument('dictionary_entries', entry.id, {
+        ownerId: activeCloudOwnerId,
+        ...entry,
+      });
+    }
     pushLog('system', 'Dictionary', `Loaded ${fresh.length} starter 64-district entries.`, 'success');
-    res.json({ importedCount: fresh.length, entries: dictionaryEntries });
+    res.json({ importedCount: fresh.length, added: fresh, entries: dictionaryEntries });
   });
 
   app.delete('/api/dictionary/:id', (req, res) => {
@@ -1726,6 +1747,12 @@ async function bootstrap() {
             });
             return;
           }
+          res.json({
+            deleted: false,
+            reply: `🤖 *Private Auto-Reply Status:* ${botConfig.autoreply ? 'ON' : 'OFF'}\nUsage: *${PREFIX}autoreply on* | *${PREFIX}autoreply off*`,
+            ruleTriggered: 'AUTOREPLY_STATUS',
+            config: botConfig,
+          });
           return;
         }
 
