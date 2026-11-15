@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, MessageSquareText, RefreshCw, Trash2 } from 'lucide-react';
+import { CheckCircle2, History, MessageSquareText, RefreshCw, Trash2 } from 'lucide-react';
 import { authFetch } from '../lib/api';
-import type { ChatMemoryRecord, InboxNoteRecord } from '../types';
+import type { ChatMemoryRecord, ChatTurn, InboxNoteRecord } from '../types';
 
 export function InboxMemoryPanel() {
   const [memories, setMemories] = useState<ChatMemoryRecord[]>([]);
   const [notes, setNotes] = useState<InboxNoteRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [inboxError, setInboxError] = useState<string | null>(null);
+  const [expandedArchives, setExpandedArchives] = useState<Record<string, ChatTurn[]>>({});
+  const [loadingArchiveId, setLoadingArchiveId] = useState<string | null>(null);
 
   async function fetchInboxData() {
     setLoading(true);
@@ -72,8 +74,42 @@ export function InboxMemoryPanel() {
         return;
       }
       setMemories((prev) => prev.filter((m) => m.chatId !== chatId));
+      setExpandedArchives((prev) => {
+        const copy = { ...prev };
+        delete copy[chatId];
+        return copy;
+      });
     } catch (err) {
       setInboxError((err as Error).message || 'Could not clear chat memory.');
+    }
+  }
+
+  async function handleToggleFullArchive(chatId: string) {
+    if (expandedArchives[chatId]) {
+      setExpandedArchives((prev) => {
+        const copy = { ...prev };
+        delete copy[chatId];
+        return copy;
+      });
+      return;
+    }
+    setLoadingArchiveId(chatId);
+    setInboxError(null);
+    try {
+      const res = await authFetch(`/api/memories/${chatId}/archive`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setInboxError(data.error || 'Could not load archived chat history.');
+        return;
+      }
+      setExpandedArchives((prev) => ({
+        ...prev,
+        [chatId]: Array.isArray(data.turns) ? data.turns : [],
+      }));
+    } catch (err) {
+      setInboxError((err as Error).message || 'Could not load archived chat history.');
+    } finally {
+      setLoadingArchiveId(null);
     }
   }
 
@@ -183,18 +219,44 @@ export function InboxMemoryPanel() {
                     <span className="font-mono">{mem.contactJid}</span>
                     <span aria-hidden="true">&middot;</span>
                     <span>Dialect: {mem.detectedDistrict || 'Standard'}</span>
+                    <span aria-hidden="true">&middot;</span>
+                    <span className="font-mono text-emerald-700">
+                      {mem.archiveCount || mem.turns.length} msgs archived
+                    </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleClearMemory(mem.chatId)}
-                    className="px-3 py-1 text-xs font-medium text-red-700 border border-slate-200 rounded-lg hover:bg-red-50 cursor-pointer whitespace-nowrap"
-                  >
-                    Clear Memory
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFullArchive(mem.chatId)}
+                      disabled={loadingArchiveId === mem.chatId}
+                      className="px-3 py-1 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      {loadingArchiveId === mem.chatId
+                        ? 'Loading...'
+                        : expandedArchives[mem.chatId]
+                          ? 'Show Recent (20)'
+                          : 'View Full Archive'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleClearMemory(mem.chatId)}
+                      className="px-3 py-1 text-xs font-medium text-red-700 border border-slate-200 rounded-lg hover:bg-red-50 cursor-pointer whitespace-nowrap"
+                    >
+                      Clear Memory
+                    </button>
+                  </div>
                 </div>
 
+                {mem.lastSummary && (
+                  <div className="bg-emerald-50/60 border border-emerald-200/80 rounded-lg px-3.5 py-2.5 text-xs text-slate-700 leading-relaxed">
+                    <span className="font-semibold text-emerald-800 mr-1.5">Deep Inbox &amp; Mood Summary:</span>
+                    <span>{mem.lastSummary}</span>
+                  </div>
+                )}
+
                 <div className="space-y-2 bg-slate-50 border border-slate-200 rounded-lg p-3.5 max-h-60 overflow-y-auto">
-                  {mem.turns.map((turn, idx) => (
+                  {(expandedArchives[mem.chatId] || mem.turns).map((turn, idx) => (
                     <div key={idx} className="text-xs leading-relaxed">
                       <span className={`font-semibold ${turn.role === 'assistant' ? 'text-emerald-700' : 'text-slate-900'}`}>
                         {turn.role === 'assistant' ? 'Assistant: ' : 'Contact: '}

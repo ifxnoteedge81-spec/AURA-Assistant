@@ -129,3 +129,60 @@ export async function adminDeleteDocument(collectionName: string, docId: string)
     return false;
   }
 }
+
+export async function adminSaveSubDocument(
+  collectionName: string,
+  docId: string,
+  subCollectionName: string,
+  subDocId: string,
+  data: Record<string, unknown>
+): Promise<boolean> {
+  const { db } = getAdminFirestore();
+  if (!db) return false;
+  try {
+    await db
+      .collection(collectionName)
+      .doc(docId)
+      .collection(subCollectionName)
+      .doc(subDocId)
+      .set(
+        {
+          ...data,
+          createdAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    return true;
+  } catch (err) {
+    console.warn(
+      `[Firestore Admin] Failed saving ${collectionName}/${docId}/${subCollectionName}/${subDocId}:`,
+      (err as Error).message
+    );
+    return false;
+  }
+}
+
+export async function adminLoadSubCollection<T>(
+  collectionName: string,
+  docId: string,
+  subCollectionName: string,
+  maxItems = 500
+): Promise<Array<T & { id: string }>> {
+  const { db } = getAdminFirestore();
+  if (!db) return [];
+  try {
+    const snap = await db
+      .collection(collectionName)
+      .doc(docId)
+      .collection(subCollectionName)
+      .limit(maxItems)
+      .get();
+    return snap.docs.map((d) => ({ id: d.id, ...(d.data() as T) }));
+  } catch (err) {
+    console.warn(
+      `[Firestore Admin] Failed reading ${collectionName}/${docId}/${subCollectionName}:`,
+      (err as Error).message
+    );
+    return [];
+  }
+}

@@ -57,6 +57,11 @@
           "maxLength": 4000,
           "description": "Explicit tasks or topics Sir does not handle (e.g., flat rentals, loans)."
         },
+        "strictLogicRules": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "Strict reasoning, debate, emotion matching, full inbox continuity, and time-lapse rules."
+        },
         "assistantTone": {
           "type": "string",
           "enum": ["witty_flirty", "warm_polite", "executive_formal", "sharp_shut_down"],
@@ -81,6 +86,27 @@
         "antilinkGroups": {
           "type": "object",
           "description": "Map of WhatsApp group JIDs to boolean anti-link enforcement state."
+        },
+        "groupAiEnabled": {
+          "type": "boolean",
+          "description": "Master switch for Smart Group AI Clone participation."
+        },
+        "groupAiMode": {
+          "type": "string",
+          "enum": ["smart_blend", "mention_only", "active_chat"],
+          "description": "Group AI participation behavior mode."
+        },
+        "groupReactionEnabled": {
+          "type": "boolean",
+          "description": "Allows AI clone to send emoji reactions to group messages."
+        },
+        "groupCooldownMs": {
+          "type": "number",
+          "description": "Minimum cooldown in milliseconds between AI text replies in the same group."
+        },
+        "groupAiGroups": {
+          "type": "object",
+          "description": "Map of WhatsApp group JIDs to boolean Group AI Clone enabled state."
         },
         "createdAt": {
           "type": "string",
@@ -207,6 +233,51 @@
         "updatedAt"
       ]
     },
+    "ChatArchiveMessage": {
+      "title": "ChatArchiveMessage",
+      "description": "Immutable archived message turn under a contact memory document for unlimited long-term recall.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "chatId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant"]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "timestamp": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "chatId",
+        "role",
+        "text",
+        "timestamp",
+        "createdAt"
+      ]
+    },
     "InboxNote": {
       "title": "InboxNote",
       "description": "Important message or follow-up note left for Sir by a contact while Sir was unavailable.",
@@ -312,6 +383,12 @@
         "$ref": "#/entities/ChatMemory"
       },
       "description": "Stores bounded conversation history per private WhatsApp contact."
+    },
+    "/chat_memories/{chatId}/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/ChatArchiveMessage"
+      },
+      "description": "Stores unlimited archived conversation turns per contact for long-term AI recall."
     },
     "/inbox_notes/{noteId}": {
       "schema": {

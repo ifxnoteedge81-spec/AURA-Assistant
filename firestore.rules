@@ -48,9 +48,10 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'autoreply', 'aiAssistantEnabled', 'autoreplyMessage',
           'firstGreetingTemplate', 'ownerName', 'ownerProfession', 'ownerLocation',
-          'ownerBio', 'ownerBoundaries', 'assistantTone', 'cooldownMs',
+          'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone', 'cooldownMs',
           'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
-          'antilinkGroups', 'createdAt', 'updatedAt'
+          'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
+          'groupCooldownMs', 'groupAiGroups', 'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128
         && data.autoreply is bool
@@ -62,12 +63,18 @@ service cloud.firestore {
         && (!('ownerLocation' in data) || (data.ownerLocation is string && data.ownerLocation.size() <= 200))
         && (!('ownerBio' in data) || (data.ownerBio is string && data.ownerBio.size() <= 4000))
         && (!('ownerBoundaries' in data) || (data.ownerBoundaries is string && data.ownerBoundaries.size() <= 4000))
+        && (!('strictLogicRules' in data) || (data.strictLogicRules is string && data.strictLogicRules.size() <= 4000))
         && data.assistantTone in ['witty_flirty', 'warm_polite', 'executive_formal', 'sharp_shut_down']
         && data.cooldownMs is number && data.cooldownMs >= 0 && data.cooldownMs <= 86400000
         && data.takeoverPauseMs is number && data.takeoverPauseMs >= 0 && data.takeoverPauseMs <= 86400000
         && (!('humanTypingEnabled' in data) || data.humanTypingEnabled is bool)
         && (!('dailyReplyLimit' in data) || (data.dailyReplyLimit is number && data.dailyReplyLimit >= 1 && data.dailyReplyLimit <= 2000))
         && (!('antilinkGroups' in data) || (data.antilinkGroups is map && data.antilinkGroups.size() <= 200))
+        && (!('groupAiEnabled' in data) || data.groupAiEnabled is bool)
+        && (!('groupAiMode' in data) || (data.groupAiMode in ['smart_blend', 'mention_only', 'active_chat']))
+        && (!('groupReactionEnabled' in data) || data.groupReactionEnabled is bool)
+        && (!('groupCooldownMs' in data) || (data.groupCooldownMs is number && data.groupCooldownMs >= 0 && data.groupCooldownMs <= 3600000))
+        && (!('groupAiGroups' in data) || (data.groupAiGroups is map && data.groupAiGroups.size() <= 200))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -97,6 +104,17 @@ service cloud.firestore {
         && (data.turns.size() == 0 || data.turns[0] is map)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
+    }
+
+    function isValidChatArchiveMessage(data) {
+      return data.keys().hasAll(['ownerId', 'chatId', 'role', 'text', 'timestamp', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'chatId', 'role', 'text', 'timestamp', 'createdAt'])
+        && data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128
+        && data.chatId is string && isValidId(data.chatId)
+        && data.role in ['user', 'assistant']
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 4000
+        && data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 64
+        && data.createdAt is timestamp;
     }
 
     function isValidInboxNote(data) {
@@ -148,9 +166,10 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'ownerId', 'autoreply', 'aiAssistantEnabled', 'autoreplyMessage',
           'firstGreetingTemplate', 'ownerName', 'ownerProfession',
-          'ownerLocation', 'ownerBio', 'ownerBoundaries', 'assistantTone',
+          'ownerLocation', 'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone',
           'cooldownMs', 'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
-          'antilinkGroups', 'createdAt', 'updatedAt'
+          'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
+          'groupCooldownMs', 'groupAiGroups', 'createdAt', 'updatedAt'
         ]);
       allow delete: if isValidId(settingId) && isOwnerResource();
     }
@@ -195,6 +214,29 @@ service cloud.firestore {
           'contactName', 'detectedDistrict', 'lastSummary', 'turns', 'updatedAt'
         ]);
       allow delete: if isValidId(chatId) && isOwnerResource();
+
+      match /messages/{messageId} {
+        allow get: if isValidId(chatId)
+          && isValidId(messageId)
+          && isOwnerResource()
+          && (
+            get(/databases/$(database)/documents/chat_memories/$(chatId)).data.ownerId == request.auth.uid ||
+            isAdmin()
+          );
+        allow list: if isSignedIn() && (existing().ownerId == request.auth.uid || isAdmin());
+        allow create: if isSignedIn()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && isValidChatArchiveMessage(incoming())
+          && incoming().chatId == chatId
+          && incoming().createdAt == request.time
+          && (
+            get(/databases/$(database)/documents/chat_memories/$(chatId)).data.ownerId == request.auth.uid ||
+            isAdmin()
+          );
+        allow update: if false;
+        allow delete: if isValidId(chatId) && isValidId(messageId) && isOwnerResource();
+      }
     }
 
     match /inbox_notes/{noteId} {

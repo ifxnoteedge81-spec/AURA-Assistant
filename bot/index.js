@@ -290,7 +290,7 @@ async function askGemini(query) {
   const total = aiClients.length;
   const startIdx = activeAiKeyIndex % total;
   let lastError = null;
-  const deadline = Date.now() + 9_000;
+  const deadline = Date.now() + 12_000;
 
   for (let attempt = 0; attempt < total; attempt += 1) {
     if (attempt > 0 && Date.now() >= deadline) break;
@@ -298,15 +298,15 @@ async function askGemini(query) {
     try {
       const response = await Promise.race([
         aiClients[idx].models.generateContent({
-          model: 'gemini-3.1-flash-lite',
+          model: 'gemini-4-hydrogen',
           contents: query,
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             systemInstruction:
               'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
           },
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout after 5000ms')), 5_000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout after 8000ms')), 8_000)),
       ]);
       activeAiKeyIndex = idx;
       const text = response?.text?.trim();

@@ -132,12 +132,18 @@ export async function saveCloudSettings(uid: string, config: BotConfig) {
       ownerLocation: config.ownerLocation,
       ownerBio: config.ownerBio,
       ownerBoundaries: config.ownerBoundaries,
+      strictLogicRules: config.strictLogicRules || '',
       assistantTone: config.assistantTone,
       cooldownMs: config.cooldownMs,
       takeoverPauseMs: config.takeoverPauseMs,
       humanTypingEnabled: config.humanTypingEnabled,
       dailyReplyLimit: config.dailyReplyLimit,
       antilinkGroups: config.antilinkGroups,
+      groupAiEnabled: Boolean(config.groupAiEnabled),
+      groupAiMode: config.groupAiMode || 'smart_blend',
+      groupReactionEnabled: config.groupReactionEnabled !== false,
+      groupCooldownMs: typeof config.groupCooldownMs === 'number' ? config.groupCooldownMs : 6000,
+      groupAiGroups: config.groupAiGroups || {},
       updatedAt: serverTimestamp(),
     };
 

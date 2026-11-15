@@ -86,12 +86,18 @@ export function PairingOverview({
         </div>
 
         <div className="p-5">
-          <div className="text-xs font-medium text-slate-500">Gemini AI Engine</div>
+          <div className="text-xs font-medium text-slate-500">Dual-AI Engine</div>
           <div className="mt-1.5 text-lg font-semibold text-slate-900">
-            {botState.geminiConfigured ? 'Ready' : 'API Key Missing'}
+            {botState.geminiConfigured && botState.openRouterConfigured
+              ? 'Ready (Dual-AI)'
+              : botState.geminiConfigured || botState.openRouterConfigured
+                ? 'Ready'
+                : 'API Key Missing'}
           </div>
-          <div className="mt-1 text-xs text-slate-500 font-mono">
-            .ai &middot; .gemini (gemini-3.1-flash-lite)
+          <div className="mt-1 text-xs text-slate-500 font-mono truncate">
+            {botState.openRouterConfigured
+              ? 'Gemini 5-Key + OpenRouter Reader'
+              : '.ai · .gemini (gemini-4-hydrogen)'}
           </div>
         </div>
 

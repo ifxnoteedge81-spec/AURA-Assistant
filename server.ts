@@ -18,23 +18,60 @@ import {
   DEFAULT_FIRST_GREETING,
   DEFAULT_OWNER_BIO,
   DEFAULT_OWNER_BOUNDARIES,
+  DEFAULT_STRICT_LOGIC_RULES,
   STARTER_REGIONAL_DICTIONARY,
   generateExecutiveAssistantReply,
+  generateGroupCloneAction,
   parseUploadedDictionary,
   sanitizeId,
   type AssistantTone,
   type ChatMemoryRecord,
+  type ChatTurn,
   type DictionaryEntry,
+  type GroupAiMode,
+  type GroupCloneResult,
   type InboxNoteRecord,
 } from './server/assistantEngine.ts';
 import { GeminiKeyPool } from './server/geminiKeyPool.ts';
+import { OpenRouterReader } from './server/openRouterReader.ts';
+import {
+  appendArchiveTurn,
+  clearArchiveTurns,
+  getArchiveCount,
+  getArchiveTurns,
+  recallRelevantOlderTurns,
+  syncArchiveTurns,
+} from './server/memoryArchive.ts';
 import {
   adminDeleteDocument,
   adminLoadCollection,
   adminLoadDocument,
   adminSaveDocument,
+  adminSaveSubDocument,
   getAdminFirestore,
 } from './server/firestoreAdmin.ts';
+import {
+  getPostgresStatus,
+  isPostgresConfigured,
+  pgClosePool,
+  pgDeleteChatMemory,
+  pgDeleteDictionaryEntry,
+  pgDeleteNote,
+  pgDeleteSessionBackup,
+  pgGetChatArchive,
+  pgLoadDictionary,
+  pgLoadNotes,
+  pgLoadRecentMemories,
+  pgLoadSessionBackup,
+  pgLoadSettings,
+  pgLogAiUsage,
+  pgRecallOlderMessages,
+  pgSaveChatMemory,
+  pgSaveDictionaryEntries,
+  pgSaveNote,
+  pgSaveSessionBackup,
+  pgSaveSettings,
+} from './server/postgresStore.ts';
 import {
   OWNER_EMAIL,
   checkRateLimit,
@@ -77,12 +114,18 @@ interface BotConfig {
   ownerLocation: string;
   ownerBio: string;
   ownerBoundaries: string;
+  strictLogicRules: string;
   assistantTone: AssistantTone;
   cooldownMs: number;
   takeoverPauseMs: number;
   humanTypingEnabled: boolean;
   dailyReplyLimit: number;
   antilinkGroups: Record<string, boolean>;
+  groupAiEnabled: boolean;
+  groupAiMode: GroupAiMode;
+  groupReactionEnabled: boolean;
+  groupCooldownMs: number;
+  groupAiGroups: Record<string, boolean>;
 }
 
 interface BotLogEntry {
@@ -104,9 +147,10 @@ interface SimulatorRequest {
 }
 
 // ----------------------------------------------------------------------------
-// Server-Side Google Gen AI Multi-Key Pool Initialization (#1-#5 Rotation)
+// Server-Side Dual-AI Engines: 5-Key Gemini Responder + OpenRouter Reader
 // ----------------------------------------------------------------------------
 const geminiPool = new GeminiKeyPool();
+const openRouterReader = new OpenRouterReader();
 
 const baileysLogger = pino({ level: 'silent' });
 
@@ -124,12 +168,18 @@ function defaultConfig(): BotConfig {
     ownerLocation: 'Dhaka, Bangladesh',
     ownerBio: DEFAULT_OWNER_BIO,
     ownerBoundaries: DEFAULT_OWNER_BOUNDARIES,
+    strictLogicRules: DEFAULT_STRICT_LOGIC_RULES,
     assistantTone: 'witty_flirty',
     cooldownMs: 0,
     takeoverPauseMs: 30 * 60 * 1000,
     humanTypingEnabled: true,
     dailyReplyLimit: 120,
     antilinkGroups: { '120363041928374655@g.us': true },
+    groupAiEnabled: false,
+    groupAiMode: 'smart_blend',
+    groupReactionEnabled: true,
+    groupCooldownMs: 6000,
+    groupAiGroups: {},
   };
 }
 
@@ -178,6 +228,10 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
     ownerLocation: typeof raw.ownerLocation === 'string' ? raw.ownerLocation : base.ownerLocation,
     ownerBio: typeof raw.ownerBio === 'string' ? raw.ownerBio : base.ownerBio,
     ownerBoundaries: typeof raw.ownerBoundaries === 'string' ? raw.ownerBoundaries : base.ownerBoundaries,
+    strictLogicRules:
+      typeof raw.strictLogicRules === 'string' && raw.strictLogicRules.trim()
+        ? raw.strictLogicRules
+        : base.strictLogicRules,
     assistantTone: validTones.includes(raw.assistantTone as AssistantTone)
       ? (raw.assistantTone as AssistantTone)
       : base.assistantTone,
@@ -193,6 +247,25 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
       raw.antilinkGroups && typeof raw.antilinkGroups === 'object'
         ? raw.antilinkGroups
         : base.antilinkGroups,
+    groupAiEnabled: typeof raw.groupAiEnabled === 'boolean' ? raw.groupAiEnabled : base.groupAiEnabled,
+    groupAiMode:
+      raw.groupAiMode === 'smart_blend' ||
+      raw.groupAiMode === 'mention_only' ||
+      raw.groupAiMode === 'active_chat'
+        ? raw.groupAiMode
+        : base.groupAiMode,
+    groupReactionEnabled:
+      typeof raw.groupReactionEnabled === 'boolean'
+        ? raw.groupReactionEnabled
+        : base.groupReactionEnabled,
+    groupCooldownMs:
+      typeof raw.groupCooldownMs === 'number' && raw.groupCooldownMs >= 0
+        ? Math.min(3_600_000, raw.groupCooldownMs)
+        : base.groupCooldownMs,
+    groupAiGroups:
+      raw.groupAiGroups && typeof raw.groupAiGroups === 'object'
+        ? raw.groupAiGroups
+        : base.groupAiGroups,
   };
 }
 
@@ -208,6 +281,7 @@ function persistConfig() {
     ownerId: activeCloudOwnerId,
     ...botConfig,
   });
+  void pgSaveSettings(activeCloudOwnerId, botConfig as unknown as Record<string, unknown>);
 }
 
 function persistDictionary() {
@@ -227,6 +301,8 @@ const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt:
 const autoReplyCooldowns = new Map<string, number>();
 const ownerTakeoverUntil = new Map<string, number>();
 const botSentMessageIds = new Set<string>();
+const summaryRefreshInFlight = new Set<string>();
+const lastSummaryRefreshAt = new Map<string, number>();
 
 const chatReplyQueues = new Map<string, Promise<void>>();
 const MAX_CONCURRENT_REPLIES = 8;
@@ -316,6 +392,11 @@ function pruneRuntimeCaches() {
   for (const [jid, ts] of autoReplyCooldowns.entries()) {
     if (now - ts > 60 * 60 * 1000) {
       autoReplyCooldowns.delete(jid);
+    }
+  }
+  for (const [chatId, ts] of lastSummaryRefreshAt.entries()) {
+    if (now - ts > 60 * 60 * 1000) {
+      lastSummaryRefreshAt.delete(chatId);
     }
   }
   pruneExpiredRateLimits();
@@ -481,15 +562,15 @@ async function askGemini(query: string): Promise<string> {
     (client) =>
       withTimeout(
         client.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
+          model: 'gemini-4-hydrogen',
           contents: query,
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             systemInstruction:
               'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
           },
         }),
-        5_000,
+        8_000,
         'Gemini .ai command'
       ),
     (rot) => {
@@ -500,7 +581,7 @@ async function askGemini(query: string): Promise<string> {
         'info'
       );
     },
-    { maxTotalMs: 9_000 }
+    { maxTotalMs: 12_000 }
   );
 
   const text = response?.text?.trim();
@@ -525,6 +606,198 @@ async function sendTrackedMessage(
   return sent;
 }
 
+function scheduleBackgroundSummaryRefresh(chatId: string) {
+  if (!botConfig.aiAssistantEnabled || !openRouterReader.hasKeys() || isShuttingDown) return;
+  const mem = chatMemories[chatId];
+  if (!mem || mem.turns.length < 2) return;
+
+  const now = Date.now();
+  const lastRun = lastSummaryRefreshAt.get(chatId) || 0;
+  if (summaryRefreshInFlight.has(chatId) || now - lastRun < 12_000) return;
+
+  summaryRefreshInFlight.add(chatId);
+  lastSummaryRefreshAt.set(chatId, now);
+
+  void openRouterReader
+    .summarizeInboxMemory({
+      contactName: mem.contactName,
+      existingSummary: mem.lastSummary || '',
+      turns: mem.turns,
+      ownerName: botConfig.ownerName,
+    })
+    .then((newSummary) => {
+      if (!newSummary) return;
+      const latest = chatMemories[chatId];
+      if (!latest) return;
+      latest.lastSummary = newSummary;
+      latest.updatedAt = new Date().toISOString();
+      persistMemories();
+      void adminSaveDocument('chat_memories', chatId, {
+        ownerId: activeCloudOwnerId,
+        ...latest,
+      });
+      void pgSaveChatMemory(activeCloudOwnerId, latest, []);
+    })
+    .catch((err) => {
+      pushLog('cloud', 'OpenRouter Reader', `Background summary skipped: ${(err as Error).message.slice(0, 80)}`, 'info');
+    })
+    .finally(() => {
+      summaryRefreshInFlight.delete(chatId);
+    });
+}
+
+function archiveTurnToCloud(chatId: string, turn: ChatTurn) {
+  const added = appendArchiveTurn(chatId, turn);
+  if (!added) return;
+  const msgId = sanitizeId(`msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+  void adminSaveSubDocument('chat_memories', chatId, 'messages', msgId, {
+    ownerId: activeCloudOwnerId,
+    chatId,
+    role: turn.role,
+    text: turn.text.slice(0, 4000),
+    timestamp: turn.timestamp,
+  });
+}
+
+function recordOwnerManualTurn(remoteJid: string, text: string, pushName?: string | null) {
+  const chatId = sanitizeId(remoteJid);
+  const existing = chatMemories[chatId];
+  const nowIso = new Date().toISOString();
+  const taggedText = `[Sir (নিজে)]: ${text}`;
+  const lastTurn = existing?.turns?.[existing.turns.length - 1];
+  if (lastTurn && lastTurn.text === taggedText && Date.now() - Date.parse(lastTurn.timestamp) < 10_000) {
+    return;
+  }
+
+  const ownerTurn: ChatTurn = { role: 'assistant', text: taggedText, timestamp: nowIso };
+  const nextTurns = [...(existing?.turns || []), ownerTurn].slice(-20);
+
+  const updatedMemory: ChatMemoryRecord = {
+    chatId,
+    contactJid: remoteJid,
+    contactName: existing?.contactName || pushName || extractDigits(remoteJid) || 'Contact',
+    detectedDistrict: existing?.detectedDistrict || 'Standard',
+    lastSummary: existing?.lastSummary || '',
+    turns: nextTurns,
+    updatedAt: nowIso,
+  };
+  chatMemories[chatId] = updatedMemory;
+  persistMemories();
+  void adminSaveDocument('chat_memories', chatId, {
+    ownerId: activeCloudOwnerId,
+    ...updatedMemory,
+  });
+  void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, [ownerTurn]);
+  archiveTurnToCloud(chatId, ownerTurn);
+  scheduleBackgroundSummaryRefresh(chatId);
+}
+
+function toTimestampIso(rawTs: unknown): string {
+  if (typeof rawTs === 'number' && rawTs > 0) {
+    const ms = rawTs < 1_000_000_000_000 ? rawTs * 1000 : rawTs;
+    return new Date(ms).toISOString();
+  }
+  if (rawTs && typeof (rawTs as { toNumber?: () => number }).toNumber === 'function') {
+    const num = (rawTs as { toNumber: () => number }).toNumber();
+    if (num > 0) return new Date(num < 1_000_000_000_000 ? num * 1000 : num).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function ingestHistoryMessages(messages: WAMessage[]) {
+  if (!Array.isArray(messages) || messages.length === 0) return;
+
+  const grouped = new Map<
+    string,
+    { contactJid: string; contactName: string; items: Array<{ role: 'user' | 'assistant'; text: string; timestamp: string }> }
+  >();
+
+  for (const msg of messages) {
+    const remoteJid = msg.key?.remoteJid;
+    if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter') || isJidGroup(remoteJid)) {
+      continue;
+    }
+    const isPrivate = remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid');
+    if (!isPrivate) continue;
+
+    const text = extractMessageText(msg.message);
+    if (!text || text.startsWith(PREFIX)) continue;
+
+    const chatId = sanitizeId(remoteJid);
+    const bucket = grouped.get(chatId) || {
+      contactJid: remoteJid,
+      contactName: msg.pushName || extractDigits(remoteJid) || 'Contact',
+      items: [],
+    };
+    if (msg.pushName && !msg.key.fromMe) {
+      bucket.contactName = msg.pushName;
+    }
+    bucket.items.push({
+      role: msg.key.fromMe ? 'assistant' : 'user',
+      text: msg.key.fromMe ? `[Sir (নিজে)]: ${text}` : text,
+      timestamp: toTimestampIso(msg.messageTimestamp),
+    });
+    grouped.set(chatId, bucket);
+  }
+
+  if (grouped.size === 0) return;
+
+  let changedCount = 0;
+  const touchedChatIds: string[] = [];
+
+  for (const [chatId, bucket] of grouped.entries()) {
+    const existing = chatMemories[chatId];
+    const combined = [...(existing?.turns || []), ...bucket.items];
+    const seen = new Set<string>();
+    const deduped = combined
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+      .filter((t) => {
+        const key = `${t.role}|${t.text.trim()}|${t.timestamp.slice(0, 16)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(-20);
+
+    if (deduped.length === 0) continue;
+
+    const latestTs = deduped[deduped.length - 1].timestamp;
+    const newlyArchived = syncArchiveTurns(chatId, combined);
+    chatMemories[chatId] = {
+      chatId,
+      contactJid: bucket.contactJid,
+      contactName: existing?.contactName || bucket.contactName,
+      detectedDistrict: existing?.detectedDistrict || 'Standard',
+      lastSummary: existing?.lastSummary || '',
+      turns: deduped,
+      updatedAt: latestTs,
+    };
+    for (const item of newlyArchived.slice(-20)) {
+      const msgId = sanitizeId(`hist_${Date.parse(item.timestamp) || Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+      void adminSaveSubDocument('chat_memories', chatId, 'messages', msgId, {
+        ownerId: activeCloudOwnerId,
+        chatId,
+        role: item.role,
+        text: item.text.slice(0, 4000),
+        timestamp: item.timestamp,
+      });
+    }
+    if (newlyArchived.length > 0) {
+      void pgSaveChatMemory(activeCloudOwnerId, chatMemories[chatId], newlyArchived);
+    }
+    changedCount += 1;
+    touchedChatIds.push(chatId);
+  }
+
+  if (changedCount > 0) {
+    persistMemories();
+    pushLog('cloud', 'Inbox Sync', `Synced recent inbox history for ${changedCount} private chat(s).`, 'success');
+    for (const chatId of touchedChatIds.slice(0, 5)) {
+      scheduleBackgroundSummaryRefresh(chatId);
+    }
+  }
+}
+
 async function runExecutiveAssistantTurn(params: {
   contactJid: string;
   contactName: string;
@@ -534,6 +807,7 @@ async function runExecutiveAssistantTurn(params: {
   detectedDistrict: string;
   noteCreated: InboxNoteRecord | null;
   usedFallback: boolean;
+  providerUsed: 'gemini' | 'openrouter' | 'offline_emotion';
   keySlotUsed?: number;
   fallbackReason?: string;
 }> {
@@ -546,17 +820,30 @@ async function runExecutiveAssistantTurn(params: {
   let noteSummary = '';
   let noteUrgency: 'normal' | 'important' = 'normal';
   let noteCreated: InboxNoteRecord | null = null;
-  let usedFallback = !botConfig.aiAssistantEnabled || !geminiPool.hasKeys();
+  let usedFallback =
+    !botConfig.aiAssistantEnabled || (!geminiPool.hasKeys() && !openRouterReader.hasKeys());
+  let providerUsed: 'gemini' | 'openrouter' | 'offline_emotion' = 'gemini';
   let keySlotUsed: number | undefined;
   let fallbackReason: string | undefined = !botConfig.aiAssistantEnabled
     ? 'AI Brain OFF'
-    : !geminiPool.hasKeys()
+    : !geminiPool.hasKeys() && !openRouterReader.hasKeys()
       ? 'No API key'
       : undefined;
+
+  const turnStartedAt = Date.now();
+  let archivedMatches = recallRelevantOlderTurns(chatId, params.incomingText, memory?.turns || []);
+  if (archivedMatches.length === 0 && isPostgresConfigured()) {
+    archivedMatches = await withTimeout(
+      pgRecallOlderMessages(chatId, params.incomingText, memory?.turns || []),
+      500,
+      'Postgres archive recall'
+    ).catch(() => []);
+  }
 
   try {
     const result = await generateExecutiveAssistantReply({
       keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
+      openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
       onKeyRotate: (rot) => {
         pushLog(
           'gemini',
@@ -567,6 +854,7 @@ async function runExecutiveAssistantTurn(params: {
       },
       settings: botConfig,
       memory,
+      archivedMatches,
       incomingText: params.incomingText,
       contactName: params.contactName,
       dictionaryEntries,
@@ -576,10 +864,12 @@ async function runExecutiveAssistantTurn(params: {
     noteSummary = result.noteSummary;
     noteUrgency = result.noteUrgency;
     usedFallback = Boolean(result.usedFallback);
+    providerUsed = result.providerUsed || (usedFallback ? 'offline_emotion' : 'gemini');
     keySlotUsed = result.keySlotUsed;
   } catch (err) {
     const errMsg = (err as Error).message;
     usedFallback = true;
+    providerUsed = 'offline_emotion';
     fallbackReason = errMsg.slice(0, 120);
     pushLog(
       'autoreply',
@@ -589,27 +879,29 @@ async function runExecutiveAssistantTurn(params: {
     );
     const fallbackResult = await generateExecutiveAssistantReply({
       keyPool: null,
+      openRouterReader: null,
       settings: botConfig,
       memory,
+      archivedMatches,
       incomingText: params.incomingText,
       contactName: params.contactName,
       dictionaryEntries,
     });
     replyText = fallbackResult.replyText;
+    providerUsed = fallbackResult.providerUsed || 'offline_emotion';
   }
 
-  const nextTurns = [
-    ...(memory?.turns || []),
-    { role: 'user' as const, text: params.incomingText, timestamp: nowIso },
-    { role: 'assistant' as const, text: replyText, timestamp: nowIso },
-  ].slice(-16);
+  const turnLatencyMs = Date.now() - turnStartedAt;
+  const userTurn: ChatTurn = { role: 'user', text: params.incomingText, timestamp: nowIso };
+  const assistantTurn: ChatTurn = { role: 'assistant', text: replyText, timestamp: nowIso };
+  const nextTurns = [...(memory?.turns || []), userTurn, assistantTurn].slice(-20);
 
   const updatedMemory: ChatMemoryRecord = {
     chatId,
     contactJid: params.contactJid,
     contactName: params.contactName,
     detectedDistrict,
-    lastSummary: noteSummary || memory?.lastSummary || params.incomingText.slice(0, 120),
+    lastSummary: memory?.lastSummary || noteSummary || params.incomingText.slice(0, 120),
     turns: nextTurns,
     updatedAt: nowIso,
   };
@@ -619,6 +911,23 @@ async function runExecutiveAssistantTurn(params: {
     ownerId: activeCloudOwnerId,
     ...updatedMemory,
   });
+  void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, [
+    userTurn,
+    { ...assistantTurn, providerUsed, latencyMs: turnLatencyMs },
+  ]);
+  void pgLogAiUsage({
+    chatId,
+    providerUsed,
+    keySlot: keySlotUsed,
+    latencyMs: turnLatencyMs,
+  });
+
+  // Archive unlimited turns locally + to Firestore sub-collection for long-term recall
+  archiveTurnToCloud(chatId, userTurn);
+  archiveTurnToCloud(chatId, assistantTurn);
+
+  // Trigger OpenRouter silent background inbox reader without adding any latency to reply
+  scheduleBackgroundSummaryRefresh(chatId);
 
   if (noteSummary) {
     const noteId = sanitizeId(`note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
@@ -638,9 +947,212 @@ async function runExecutiveAssistantTurn(params: {
       ownerId: activeCloudOwnerId,
       ...noteCreated,
     });
+    void pgSaveNote(activeCloudOwnerId, noteCreated);
   }
 
-  return { replyText, detectedDistrict, noteCreated, usedFallback, keySlotUsed, fallbackReason };
+  return {
+    replyText,
+    detectedDistrict,
+    noteCreated,
+    usedFallback,
+    providerUsed,
+    keySlotUsed,
+    fallbackReason,
+  };
+}
+
+function isDirectlyAddressedInGroup(
+  msg: WAMessage,
+  sock: WASocket,
+  text: string,
+  ownerName: string
+): boolean {
+  const botDigits = extractDigits(sock.user?.id);
+  const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
+  const unwrapped =
+    msg.message?.ephemeralMessage?.message ||
+    msg.message?.viewOnceMessage?.message ||
+    msg.message?.viewOnceMessageV2?.message ||
+    msg.message;
+  const ctx = unwrapped?.extendedTextMessage?.contextInfo;
+
+  if (ctx?.mentionedJid && Array.isArray(ctx.mentionedJid)) {
+    for (const jid of ctx.mentionedJid) {
+      const d = extractDigits(jid);
+      if (d && (d === botDigits || d === botLidDigits)) {
+        return true;
+      }
+    }
+  }
+
+  if (ctx?.quotedMessage && ctx?.participant) {
+    const quotedParticipantDigits = extractDigits(ctx.participant);
+    if (
+      quotedParticipantDigits &&
+      (quotedParticipantDigits === botDigits || quotedParticipantDigits === botLidDigits)
+    ) {
+      return true;
+    }
+  }
+
+  const lower = text.toLowerCase();
+  if (botDigits && lower.includes(`@${botDigits}`)) return true;
+
+  const cleanOwner = ownerName.trim().toLowerCase();
+  if (cleanOwner.length >= 3 && cleanOwner !== 'sir') {
+    const escaped = cleanOwner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`(^|\\s|@)${escaped}(\\s|[?!.,]|$)`, 'i').test(text)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function runGroupCloneTurn(params: {
+  groupJid: string;
+  groupName: string;
+  senderName: string;
+  incomingText: string;
+  isDirectlyAddressed: boolean;
+  canTextReply: boolean;
+  observeOnly?: boolean;
+}): Promise<GroupCloneResult> {
+  const chatId = sanitizeId(params.groupJid);
+  const memory = chatMemories[chatId] || null;
+  const nowIso = new Date().toISOString();
+  const speakerText = `[${params.senderName}]: ${params.incomingText}`;
+  const incomingTurn: ChatTurn = { role: 'user', text: speakerText, timestamp: nowIso };
+
+  if (params.observeOnly) {
+    const nextTurns = [...(memory?.turns || []), incomingTurn].slice(-20);
+    const updatedMemory: ChatMemoryRecord = {
+      chatId,
+      contactJid: params.groupJid,
+      contactName: params.groupName || memory?.contactName || 'WhatsApp Group',
+      detectedDistrict: memory?.detectedDistrict || 'Standard',
+      lastSummary: memory?.lastSummary || '',
+      turns: nextTurns,
+      updatedAt: nowIso,
+    };
+    chatMemories[chatId] = updatedMemory;
+    persistMemories();
+    void adminSaveDocument('chat_memories', chatId, {
+      ownerId: activeCloudOwnerId,
+      ...updatedMemory,
+    });
+    void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, [incomingTurn]);
+    archiveTurnToCloud(chatId, incomingTurn);
+    scheduleBackgroundSummaryRefresh(chatId);
+    return {
+      action: 'silent',
+      replyText: '',
+      reactionEmoji: '',
+      shouldQuote: false,
+      detectedDistrict: updatedMemory.detectedDistrict,
+      reason: 'Observed silently',
+      providerUsed: 'offline_emotion',
+    };
+  }
+
+  const turnStartedAt = Date.now();
+  let archivedMatches = recallRelevantOlderTurns(chatId, params.incomingText, memory?.turns || []);
+  if (archivedMatches.length === 0 && isPostgresConfigured()) {
+    archivedMatches = await withTimeout(
+      pgRecallOlderMessages(chatId, params.incomingText, memory?.turns || []),
+      500,
+      'Postgres group recall'
+    ).catch(() => []);
+  }
+
+  let result: GroupCloneResult;
+  try {
+    result = await generateGroupCloneAction({
+      keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
+      openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
+      onKeyRotate: (rot) => {
+        pushLog(
+          'gemini',
+          `Key #${rot.fromSlot}->#${rot.toSlot}`,
+          `Auto-rotated Gemini key (${rot.fromSlot}/${rot.totalSlots} -> ${rot.toSlot}/${rot.totalSlots}): ${rot.reason.slice(0, 90)}`,
+          'info'
+        );
+      },
+      settings: botConfig,
+      memory,
+      archivedMatches,
+      groupName: params.groupName,
+      senderName: params.senderName,
+      incomingText: params.incomingText,
+      isDirectlyAddressed: params.isDirectlyAddressed,
+      canTextReply: params.canTextReply,
+      dictionaryEntries,
+    });
+  } catch (err) {
+    pushLog('autoreply', params.groupName, `Group clone fallback: ${(err as Error).message}`, 'error');
+    result = await generateGroupCloneAction({
+      keyPool: null,
+      openRouterReader: null,
+      settings: botConfig,
+      memory,
+      archivedMatches,
+      groupName: params.groupName,
+      senderName: params.senderName,
+      incomingText: params.incomingText,
+      isDirectlyAddressed: params.isDirectlyAddressed,
+      canTextReply: params.canTextReply,
+      dictionaryEntries,
+    });
+  }
+
+  const turnLatencyMs = Date.now() - turnStartedAt;
+  const didSendText =
+    (result.action === 'reply' || result.action === 'reply_and_react') && Boolean(result.replyText);
+
+  const turnsToPersist: Array<ChatTurn & { providerUsed?: string; latencyMs?: number }> = [incomingTurn];
+  const nextTurnsList = [...(memory?.turns || []), incomingTurn];
+
+  if (didSendText) {
+    const replyTurn: ChatTurn = {
+      role: 'assistant',
+      text: result.replyText,
+      timestamp: new Date().toISOString(),
+    };
+    nextTurnsList.push(replyTurn);
+    turnsToPersist.push({
+      ...replyTurn,
+      providerUsed: result.providerUsed || 'gemini',
+      latencyMs: turnLatencyMs,
+    });
+    archiveTurnToCloud(chatId, replyTurn);
+    void pgLogAiUsage({
+      chatId,
+      providerUsed: result.providerUsed || 'gemini',
+      keySlot: result.keySlotUsed,
+      latencyMs: turnLatencyMs,
+    });
+  }
+
+  const updatedMemory: ChatMemoryRecord = {
+    chatId,
+    contactJid: params.groupJid,
+    contactName: params.groupName || memory?.contactName || 'WhatsApp Group',
+    detectedDistrict: result.detectedDistrict || memory?.detectedDistrict || 'Standard',
+    lastSummary: memory?.lastSummary || `${params.senderName}: ${params.incomingText.slice(0, 100)}`,
+    turns: nextTurnsList.slice(-20),
+    updatedAt: nowIso,
+  };
+  chatMemories[chatId] = updatedMemory;
+  persistMemories();
+  void adminSaveDocument('chat_memories', chatId, {
+    ownerId: activeCloudOwnerId,
+    ...updatedMemory,
+  });
+  void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, turnsToPersist);
+  archiveTurnToCloud(chatId, incomingTurn);
+  scheduleBackgroundSummaryRefresh(chatId);
+
+  return result;
 }
 
 // ----------------------------------------------------------------------------
@@ -657,17 +1169,23 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   const text = extractMessageText(msg.message);
   const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
 
-  // Detect manual human owner reply in a private chat -> pause AI assistant temporarily
-  if (!isGroup && !remoteJid.endsWith('@g.us') && msg.key.fromMe) {
+  // Detect manual human owner reply (in DM OR Group) -> save to memory & pause AI temporarily
+  if (msg.key.fromMe) {
     const msgId = msg.key.id;
     const isCommand = text.startsWith(PREFIX);
     if (msgId && !botSentMessageIds.has(msgId) && !isCommand && text) {
+      let chatDisplayName = msg.pushName;
+      if (isGroup) {
+        const meta = await getCachedGroupMetadata(sock, remoteJid).catch(() => null);
+        if (meta?.subject) chatDisplayName = meta.subject;
+      }
+      recordOwnerManualTurn(remoteJid, text, chatDisplayName);
       if (botConfig.takeoverPauseMs > 0) {
         ownerTakeoverUntil.set(remoteJid, Date.now() + botConfig.takeoverPauseMs);
         pushLog(
           'autoreply',
-          extractDigits(remoteJid) || remoteJid,
-          `Owner typed manually; AI paused for ${Math.round(botConfig.takeoverPauseMs / 60000)}m.`,
+          chatDisplayName || extractDigits(remoteJid) || remoteJid,
+          `Owner typed manually${isGroup ? ' in group' : ''}; AI paused for ${Math.round(botConfig.takeoverPauseMs / 60000)}m.`,
           'info'
         );
       }
@@ -842,13 +1360,217 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       return;
     }
 
+    if (command === 'groupai') {
+      if (!isGroup) {
+        await sendTrackedMessage(
+          sock,
+          remoteJid,
+          { text: '⚠️ The *.groupai* command can only be used inside WhatsApp groups.' },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      const metadata = await getCachedGroupMetadata(sock, remoteJid);
+      const senderIsAdmin = isParticipantAdmin(metadata, senderJid) || isOwnerOrSelf(msg, sock);
+      if (!senderIsAdmin) {
+        await sendTrackedMessage(
+          sock,
+          remoteJid,
+          { text: '⛔ Only the bot owner or group admins can configure Group AI Clone.' },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      const sub = argsText.toLowerCase().trim();
+      if (sub === 'on') {
+        botConfig.groupAiEnabled = true;
+        botConfig.groupAiGroups[remoteJid] = true;
+        persistConfig();
+        pushLog('autoreply', metadata.subject || remoteJid, 'Enabled .groupai on', 'success');
+        await sendTrackedMessage(
+          sock,
+          remoteJid,
+          { text: `✅ *Group AI Clone is now ON* for *${metadata.subject || 'this group'}* (${botConfig.groupAiMode}).` },
+          { quoted: msg }
+        );
+        return;
+      }
+      if (sub === 'off') {
+        botConfig.groupAiGroups[remoteJid] = false;
+        persistConfig();
+        pushLog('autoreply', metadata.subject || remoteJid, 'Disabled .groupai off', 'info');
+        await sendTrackedMessage(
+          sock,
+          remoteJid,
+          { text: '🛑 *Group AI Clone is now OFF* for this group.' },
+          { quoted: msg }
+        );
+        return;
+      }
+      if (sub === 'mode smart' || sub === 'smart') {
+        botConfig.groupAiMode = 'smart_blend';
+        persistConfig();
+        await sendTrackedMessage(sock, remoteJid, { text: '🎭 Group AI mode set to *smart_blend* (observe, react, banter, debate & flirt naturally).' }, { quoted: msg });
+        return;
+      }
+      if (sub === 'mode mention' || sub === 'mention') {
+        botConfig.groupAiMode = 'mention_only';
+        persistConfig();
+        await sendTrackedMessage(sock, remoteJid, { text: '🏷️ Group AI mode set to *mention_only* (observes all messages, replies when tagged/replied).' }, { quoted: msg });
+        return;
+      }
+      if (sub === 'mode active' || sub === 'active') {
+        botConfig.groupAiMode = 'active_chat';
+        persistConfig();
+        await sendTrackedMessage(sock, remoteJid, { text: '⚡ Group AI mode set to *active_chat* (lively participation).' }, { quoted: msg });
+        return;
+      }
+
+      const isEnabledHere = botConfig.groupAiEnabled && botConfig.groupAiGroups[remoteJid] === true;
+      await sendTrackedMessage(
+        sock,
+        remoteJid,
+        {
+          text: `🎭 *Group AI Clone Status:* ${isEnabledHere ? 'ON' : 'OFF'} (Mode: *${botConfig.groupAiMode}*)\nUsage: *${PREFIX}groupai on* | *${PREFIX}groupai off* | *${PREFIX}groupai mode smart|mention|active*`,
+        },
+        { quoted: msg }
+      );
+      return;
+    }
+
     if (command === 'ping') {
       await sendTrackedMessage(sock, remoteJid, { text: '🏓 Pong! Bot is online and active.' }, { quoted: msg });
     }
     return;
   }
 
-  // 3. Automated Private Inbox Assistant (STRICTLY Private DMs Only — NEVER Groups)
+  // 3A. Smart Group AI Clone ("আমার কপি" — Observe, React, Debate, Roast, Flirt in Enabled Groups)
+  if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[remoteJid] === true) {
+    if (msg.key.fromMe || !text) return;
+
+    const botDigits = extractDigits(sock.user?.id);
+    const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
+    const senderDigits = extractDigits(senderJid);
+    if ((botDigits && senderDigits === botDigits) || (botLidDigits && senderDigits === botLidDigits)) {
+      return;
+    }
+
+    const senderName = msg.pushName || senderDigits || 'Member';
+    const isDirectlyAddressed = isDirectlyAddressedInGroup(msg, sock, text, botConfig.ownerName);
+
+    enqueuePrivateReply(remoteJid, async () => {
+      if (!botConfig.groupAiEnabled || botConfig.groupAiGroups[remoteJid] !== true || currentSocket !== sock) {
+        return;
+      }
+
+      const metadata = await getCachedGroupMetadata(sock, remoteJid).catch(() => null);
+      const groupName = metadata?.subject || extractDigits(remoteJid) || 'Group Chat';
+
+      const pausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
+      if (Date.now() < pausedUntil) {
+        await runGroupCloneTurn({
+          groupJid: remoteJid,
+          groupName,
+          senderName,
+          incomingText: text,
+          isDirectlyAddressed,
+          canTextReply: false,
+          observeOnly: true,
+        });
+        return;
+      }
+
+      const daily = getDailyReplyStats();
+      if (daily.count >= daily.limit) {
+        await runGroupCloneTurn({
+          groupJid: remoteJid,
+          groupName,
+          senderName,
+          incomingText: text,
+          isDirectlyAddressed,
+          canTextReply: false,
+          observeOnly: true,
+        });
+        return;
+      }
+
+      const lastGroupSent = autoReplyCooldowns.get(remoteJid) || 0;
+      const canTextReply = Date.now() - lastGroupSent >= (botConfig.groupCooldownMs ?? 6000);
+
+      const startedAt = Date.now();
+      const decision = await runGroupCloneTurn({
+        groupJid: remoteJid,
+        groupName,
+        senderName,
+        incomingText: text,
+        isDirectlyAddressed,
+        canTextReply,
+      });
+
+      if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
+
+      // Send WhatsApp Emoji Reaction if selected
+      if (
+        (decision.action === 'react' || decision.action === 'reply_and_react') &&
+        botConfig.groupReactionEnabled &&
+        decision.reactionEmoji
+      ) {
+        await sock
+          .sendMessage(remoteJid, { react: { text: decision.reactionEmoji, key: msg.key } })
+          .catch(() => {});
+      }
+
+      // Send Group Clone Reply if selected
+      if ((decision.action === 'reply' || decision.action === 'reply_and_react') && decision.replyText) {
+        if (botConfig.humanTypingEnabled) {
+          void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+        }
+        try {
+          if (botConfig.groupCooldownMs > 0) {
+            autoReplyCooldowns.set(remoteJid, Date.now());
+          }
+          const quoteOrMention = decision.shouldQuote ? { quoted: msg } : undefined;
+          await sendTrackedMessage(
+            sock,
+            remoteJid,
+            { text: decision.replyText },
+            quoteOrMention
+          );
+          dailyReplyCount += 1;
+          const elapsedMs = Date.now() - startedAt;
+          pushLog(
+            'autoreply',
+            `${groupName} · ${senderName}`,
+            `Group Clone (${decision.action}${decision.reactionEmoji ? ` ${decision.reactionEmoji}` : ''} · ${decision.providerUsed || 'gemini'} · ${elapsedMs}ms)`,
+            'success'
+          );
+        } finally {
+          if (botConfig.humanTypingEnabled) {
+            void sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+          }
+        }
+      } else if (decision.action === 'react' && decision.reactionEmoji) {
+        pushLog(
+          'autoreply',
+          `${groupName} · ${senderName}`,
+          `Group Reaction ${decision.reactionEmoji} (${decision.reason})`,
+          'info'
+        );
+      } else {
+        pushLog(
+          'autoreply',
+          `${groupName} · ${senderName}`,
+          `Group Observed Silently (${decision.reason})`,
+          'info'
+        );
+      }
+    });
+    return;
+  }
+
+  // 3B. Automated Private Inbox Assistant (Private DMs Only)
   if (botConfig.autoreply) {
     const isPrivateChat =
       !isGroup &&
@@ -903,12 +1625,18 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
       try {
         const startedAt = Date.now();
-        const { replyText, detectedDistrict, usedFallback, keySlotUsed, fallbackReason } =
-          await runExecutiveAssistantTurn({
-            contactJid: remoteJid,
-            contactName,
-            incomingText: text,
-          });
+        const {
+          replyText,
+          detectedDistrict,
+          usedFallback,
+          providerUsed,
+          keySlotUsed,
+          fallbackReason,
+        } = await runExecutiveAssistantTurn({
+          contactJid: remoteJid,
+          contactName,
+          incomingText: text,
+        });
 
         if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
 
@@ -922,14 +1650,13 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
         const elapsedMs = Date.now() - startedAt;
         dailyReplyCount += 1;
-        pushLog(
-          'autoreply',
-          contactName,
-          usedFallback
-            ? `Static Fallback (${fallbackReason || 'Static Mode'} · ${elapsedMs}ms)`
-            : `Instant AI Key #${keySlotUsed || 1} (${detectedDistrict} · ${elapsedMs}ms)`,
-          usedFallback ? 'info' : 'success'
-        );
+        const summaryLabel =
+          providerUsed === 'openrouter'
+            ? `OpenRouter Failover (${detectedDistrict} · ${elapsedMs}ms)`
+            : usedFallback || providerUsed === 'offline_emotion'
+              ? `Offline Emotion Engine (${fallbackReason || 'Static/Offline'} · ${elapsedMs}ms)`
+              : `Gemini Key #${keySlotUsed || 1} (${detectedDistrict} · ${elapsedMs}ms)`;
+        pushLog('autoreply', contactName, summaryLabel, usedFallback ? 'info' : 'success');
       } finally {
         if (botConfig.humanTypingEnabled) {
           void sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
@@ -952,6 +1679,37 @@ async function backupCredsToCloud() {
       phoneNumber: currentPairingPhone || '',
       credsData,
     });
+    await pgSaveSessionBackup('primary', activeCloudOwnerId, currentPairingPhone || '', credsData);
+
+    // Also back up essential Signal / app-state sync keys (bounded safely under 450KB)
+    const files = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.json') && f !== 'creds.json');
+    const keyBundle: Record<string, unknown> = {};
+    let totalBytes = 0;
+    for (const fileName of files) {
+      if (
+        !fileName.startsWith('app-state-sync-') &&
+        !fileName.startsWith('session-') &&
+        !fileName.startsWith('sender-key-')
+      ) {
+        continue;
+      }
+      const raw = fs.readFileSync(path.join(AUTH_DIR, fileName), 'utf8');
+      if (totalBytes + raw.length > 420_000) break;
+      try {
+        keyBundle[fileName] = JSON.parse(raw);
+        totalBytes += raw.length;
+      } catch {
+        // ignore malformed file
+      }
+    }
+    if (Object.keys(keyBundle).length > 0) {
+      await adminSaveDocument('bot_sessions', 'keys_backup', {
+        ownerId: activeCloudOwnerId,
+        phoneNumber: currentPairingPhone || '',
+        credsData: keyBundle,
+      });
+      await pgSaveSessionBackup('keys_backup', activeCloudOwnerId, currentPairingPhone || '', keyBundle);
+    }
   } catch {
     // ignore backup failures
   }
@@ -975,11 +1733,21 @@ function cancelReconnectTimer() {
 async function restoreCredsFromCloudIfMissing() {
   const credsPath = path.join(AUTH_DIR, 'creds.json');
   if (fs.existsSync(credsPath)) return;
-  const docData = await adminLoadDocument<{ credsData?: Record<string, unknown> }>('bot_sessions', 'primary');
-  if (docData?.credsData) {
+  const firestoreDoc = await adminLoadDocument<{ credsData?: Record<string, unknown> }>('bot_sessions', 'primary');
+  const credsData = firestoreDoc?.credsData || (await pgLoadSessionBackup('primary'));
+  if (credsData) {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
-    fs.writeFileSync(credsPath, JSON.stringify(docData.credsData, null, 2), 'utf8');
-    pushLog('cloud', 'Firestore', 'Restored WhatsApp session credentials from Firestore backup.', 'success');
+    fs.writeFileSync(credsPath, JSON.stringify(credsData, null, 2), 'utf8');
+
+    const keysDoc = await adminLoadDocument<{ credsData?: Record<string, unknown> }>('bot_sessions', 'keys_backup');
+    const keysBundle = keysDoc?.credsData || (await pgLoadSessionBackup('keys_backup'));
+    if (keysBundle && typeof keysBundle === 'object') {
+      for (const [fileName, content] of Object.entries(keysBundle)) {
+        if (!fileName.endsWith('.json') || fileName.includes('/') || fileName.includes('..')) continue;
+        fs.writeFileSync(path.join(AUTH_DIR, fileName), JSON.stringify(content), 'utf8');
+      }
+    }
+    pushLog('cloud', 'Cloud/PG', 'Restored WhatsApp session credentials & sync keys from database backup.', 'success');
   }
 }
 
@@ -1103,6 +1871,15 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
     }
   });
 
+  sock.ev.on('messaging-history.set', ({ messages }) => {
+    if (currentSocket !== sock || isShuttingDown) return;
+    try {
+      ingestHistoryMessages(messages);
+    } catch (err) {
+      pushLog('cloud', 'Inbox Sync', `History ingest warning: ${(err as Error).message}`, 'info');
+    }
+  });
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (currentSocket !== sock || isShuttingDown) return;
     const nowSec = Math.floor(Date.now() / 1000);
@@ -1143,6 +1920,45 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
 // Hydrate from Server-Side Admin Firestore on Boot (if configured)
 // ----------------------------------------------------------------------------
 async function hydrateFromCloudAdmin() {
+  // 1. Hydrate from External PostgreSQL (if DATABASE_URL is configured)
+  if (isPostgresConfigured()) {
+    try {
+      const pgSettings = await pgLoadSettings();
+      if (pgSettings?.config) {
+        if (pgSettings.ownerId && pgSettings.ownerId !== 'server_admin') {
+          activeCloudOwnerId = pgSettings.ownerId;
+        }
+        botConfig = normalizeConfig(pgSettings.config as Partial<BotConfig>);
+        saveJsonFile(CONFIG_FILE, botConfig);
+      }
+
+      const pgDict = await pgLoadDictionary();
+      if (pgDict.length > 0) {
+        dictionaryEntries = pgDict;
+        persistDictionary();
+      }
+
+      const pgMems = await pgLoadRecentMemories();
+      if (pgMems.length > 0) {
+        for (const mem of pgMems) {
+          chatMemories[mem.chatId] = mem;
+          syncArchiveTurns(mem.chatId, mem.turns);
+        }
+        persistMemories();
+      }
+
+      const pgNotes = await pgLoadNotes();
+      if (pgNotes.length > 0) {
+        inboxNotes = pgNotes;
+        persistNotes();
+      }
+      pushLog('cloud', 'PostgreSQL', 'Hydrated persistent state from PostgreSQL.', 'success');
+    } catch (err) {
+      pushLog('cloud', 'PostgreSQL', `Hydration warning: ${(err as Error).message}`, 'error');
+    }
+  }
+
+  // 2. Hydrate from Server-Side Admin Firestore (if configured)
   const { db, mode } = getAdminFirestore();
   if (!db) return;
   try {
@@ -1164,7 +1980,10 @@ async function hydrateFromCloudAdmin() {
     const cloudMemories = await adminLoadCollection<ChatMemoryRecord>('chat_memories');
     if (cloudMemories.length > 0) {
       for (const mem of cloudMemories) {
-        chatMemories[mem.id] = { ...mem, chatId: mem.id };
+        if (!chatMemories[mem.id] || Date.parse(mem.updatedAt) > Date.parse(chatMemories[mem.id].updatedAt)) {
+          chatMemories[mem.id] = { ...mem, chatId: mem.id };
+        }
+        syncArchiveTurns(mem.id, mem.turns || []);
       }
       persistMemories();
     }
@@ -1406,6 +2225,9 @@ async function bootstrap() {
       lastError: lastBotError,
       geminiConfigured: geminiPool.hasKeys(),
       geminiKeyPool: geminiPool.getStats(),
+      openRouterConfigured: openRouterReader.hasKeys(),
+      openRouterStats: openRouterReader.getStats(),
+      postgres: getPostgresStatus(),
       firestoreAdminMode,
       config: botConfig,
       logs: eventLogs,
@@ -1475,6 +2297,8 @@ async function bootstrap() {
     }
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     void adminDeleteDocument('bot_sessions', 'primary');
+    void adminDeleteDocument('bot_sessions', 'keys_backup');
+    void pgDeleteSessionBackup();
     botStatus = 'disconnected';
     pushLog('pairing', 'Operator', 'Cleared MultiFileAuthState credentials.', 'info');
     res.json({ status: botStatus, sessionExists: false });
@@ -1486,6 +2310,80 @@ async function bootstrap() {
     persistConfig();
     pushLog('autoreply', 'Dashboard', 'Saved assistant & moderation configuration.', 'info');
     res.json({ config: botConfig });
+  });
+
+  app.get('/api/groups', async (_req, res) => {
+    const map = new Map<
+      string,
+      {
+        jid: string;
+        name: string;
+        participantCount: number;
+        antilinkEnabled: boolean;
+        groupAiEnabled: boolean;
+      }
+    >();
+
+    // 1. Seed from saved configs & memories
+    for (const [jid, enabled] of Object.entries(botConfig.antilinkGroups || {})) {
+      map.set(jid, {
+        jid,
+        name: chatMemories[sanitizeId(jid)]?.contactName || jid,
+        participantCount: 0,
+        antilinkEnabled: Boolean(enabled),
+        groupAiEnabled: Boolean(botConfig.groupAiGroups[jid]),
+      });
+    }
+    for (const [jid, enabled] of Object.entries(botConfig.groupAiGroups || {})) {
+      const existing = map.get(jid);
+      map.set(jid, {
+        jid,
+        name: existing?.name || chatMemories[sanitizeId(jid)]?.contactName || jid,
+        participantCount: existing?.participantCount || 0,
+        antilinkEnabled: existing?.antilinkEnabled ?? false,
+        groupAiEnabled: Boolean(enabled),
+      });
+    }
+    for (const mem of Object.values(chatMemories)) {
+      if (mem.contactJid?.endsWith('@g.us') && !map.has(mem.contactJid)) {
+        map.set(mem.contactJid, {
+          jid: mem.contactJid,
+          name: mem.contactName || mem.contactJid,
+          participantCount: 0,
+          antilinkEnabled: Boolean(botConfig.antilinkGroups[mem.contactJid]),
+          groupAiEnabled: Boolean(botConfig.groupAiGroups[mem.contactJid]),
+        });
+      }
+    }
+
+    // 2. Enrich with live WhatsApp participating groups when connected
+    if (currentSocket && botStatus === 'connected') {
+      try {
+        const participating = await withTimeout(
+          currentSocket.groupFetchAllParticipating(),
+          4_000,
+          'Fetch participating groups'
+        );
+        for (const [jid, meta] of Object.entries(participating || {})) {
+          const existing = map.get(jid);
+          map.set(jid, {
+            jid,
+            name: meta.subject || existing?.name || jid,
+            participantCount: Array.isArray(meta.participants) ? meta.participants.length : 0,
+            antilinkEnabled: Boolean(botConfig.antilinkGroups[jid]),
+            groupAiEnabled: Boolean(botConfig.groupAiGroups[jid]),
+          });
+        }
+      } catch {
+        // Return cached/known groups safely
+      }
+    }
+
+    const groups = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+    res.json({
+      connected: botStatus === 'connected',
+      groups,
+    });
   });
 
   // Cloud Sync endpoint used by browser-authenticated Firestore client
@@ -1554,6 +2452,7 @@ async function bootstrap() {
       ownerId: activeCloudOwnerId,
       ...entry,
     });
+    void pgSaveDictionaryEntries(activeCloudOwnerId, [entry]);
     pushLog('system', 'Dictionary', `Added term "${entry.term}" (${entry.district})`, 'success');
     res.json({ entry, entries: dictionaryEntries });
   });
@@ -1585,6 +2484,7 @@ async function bootstrap() {
           ...entry,
         });
       }
+      void pgSaveDictionaryEntries(activeCloudOwnerId, added);
       pushLog('system', 'Dictionary Upload', `Imported ${added.length} entries from ${fileName}`, 'success');
       res.json({ importedCount: added.length, added, entries: dictionaryEntries });
     } catch (err) {
@@ -1608,6 +2508,7 @@ async function bootstrap() {
         ...entry,
       });
     }
+    void pgSaveDictionaryEntries(activeCloudOwnerId, fresh);
     pushLog('system', 'Dictionary', `Loaded ${fresh.length} starter 64-district entries.`, 'success');
     res.json({ importedCount: fresh.length, added: fresh, entries: dictionaryEntries });
   });
@@ -1617,6 +2518,7 @@ async function bootstrap() {
     dictionaryEntries = dictionaryEntries.filter((d) => d.id !== id);
     persistDictionary();
     void adminDeleteDocument('dictionary_entries', id);
+    void pgDeleteDictionaryEntry(id);
     res.json({ entries: dictionaryEntries });
   });
 
@@ -1624,19 +2526,47 @@ async function bootstrap() {
   // Chat Memories & Notes for Sir Endpoints
   // --------------------------------------------------------------------------
   app.get('/api/assistant/inbox', (_req, res) => {
+    const enrichedMemories = Object.values(chatMemories)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      .map((m) => ({
+        ...m,
+        archiveCount: Math.max(m.turns.length, getArchiveCount(m.chatId), (m as ChatMemoryRecord & { archiveCount?: number }).archiveCount || 0),
+      }));
     res.json({
-      memories: Object.values(chatMemories).sort(
-        (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
-      ),
+      memories: enrichedMemories,
       notes: inboxNotes,
+    });
+  });
+
+  app.get('/api/memories/:chatId/archive', async (req, res) => {
+    const chatId = req.params.chatId;
+    const localTurns = getArchiveTurns(chatId);
+    const pgTurns = isPostgresConfigured() ? await pgGetChatArchive(chatId) : [];
+    const fallbackTurns = chatMemories[chatId]?.turns || [];
+    const combined = [...pgTurns, ...localTurns, ...fallbackTurns];
+    const seen = new Set<string>();
+    const merged = combined
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+      .filter((t) => {
+        const key = `${t.role}|${t.text.trim()}|${(t.timestamp || '').slice(0, 16)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    res.json({
+      chatId,
+      totalArchived: merged.length,
+      turns: merged,
     });
   });
 
   app.delete('/api/memories/:chatId', (req, res) => {
     const chatId = req.params.chatId;
     delete chatMemories[chatId];
+    clearArchiveTurns(chatId);
     persistMemories();
     void adminDeleteDocument('chat_memories', chatId);
+    void pgDeleteChatMemory(chatId);
     res.json({ ok: true });
   });
 
@@ -1650,6 +2580,7 @@ async function bootstrap() {
         ownerId: activeCloudOwnerId,
         ...updated,
       });
+      void pgSaveNote(activeCloudOwnerId, updated);
     }
     res.json({ notes: inboxNotes });
   });
@@ -1659,6 +2590,7 @@ async function bootstrap() {
     inboxNotes = inboxNotes.filter((n) => n.id !== id);
     persistNotes();
     void adminDeleteDocument('inbox_notes', id);
+    void pgDeleteNote(id);
     res.json({ notes: inboxNotes });
   });
 
@@ -1849,6 +2781,49 @@ async function bootstrap() {
           return;
         }
 
+        if (command === 'groupai') {
+          if (!isGroup) {
+            res.json({
+              deleted: false,
+              reply: '⚠️ The *.groupai* command can only be used inside WhatsApp groups.',
+              ruleTriggered: 'GROUP_AI_PRIVATE_REJECTED',
+              config: botConfig,
+            });
+            return;
+          }
+          const sub = argsText.toLowerCase().trim();
+          if (sub === 'on') {
+            botConfig.groupAiEnabled = true;
+            botConfig.groupAiGroups[groupJid] = true;
+            persistConfig();
+            res.json({
+              deleted: false,
+              reply: `✅ *Group AI Clone is now ON* for this group (${botConfig.groupAiMode}).`,
+              ruleTriggered: 'GROUP_AI_ENABLED',
+              config: botConfig,
+            });
+            return;
+          }
+          if (sub === 'off') {
+            botConfig.groupAiGroups[groupJid] = false;
+            persistConfig();
+            res.json({
+              deleted: false,
+              reply: '🛑 *Group AI Clone is now OFF* for this group.',
+              ruleTriggered: 'GROUP_AI_DISABLED',
+              config: botConfig,
+            });
+            return;
+          }
+          res.json({
+            deleted: false,
+            reply: `🎭 *Group AI Clone Status:* ${botConfig.groupAiEnabled && botConfig.groupAiGroups[groupJid] ? 'ON' : 'OFF'} (Mode: ${botConfig.groupAiMode})`,
+            ruleTriggered: 'GROUP_AI_STATUS',
+            config: botConfig,
+          });
+          return;
+        }
+
         if (command === 'ping') {
           res.json({
             deleted: false,
@@ -1869,6 +2844,7 @@ async function bootstrap() {
               `*${PREFIX}gemini <query>* — Ask Gemini AI`,
               `*${PREFIX}antilink delete on* — Enable group link deletion`,
               `*${PREFIX}antilink delete off* — Disable group link deletion`,
+              `*${PREFIX}groupai on/off* — Enable Group AI Clone`,
               `*${PREFIX}autoreply on* — Enable private AI assistant`,
               `*${PREFIX}autoreply off* — Disable private AI assistant`,
               `*${PREFIX}ping* — Check bot responsiveness`,
@@ -1889,29 +2865,60 @@ async function bootstrap() {
         return;
       }
 
-      // 3. Automated Private Inbox Assistant
+      // 3A. Group AI Clone Simulator Evaluation
+      if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[groupJid] === true) {
+        const decision = await runGroupCloneTurn({
+          groupJid,
+          groupName: 'Simulator Group',
+          senderName: contactName || 'Friend',
+          incomingText: text,
+          isDirectlyAddressed: text.includes('@') || text.toLowerCase().includes((botConfig.ownerName || '').toLowerCase()),
+          canTextReply: true,
+        });
+        res.json({
+          deleted: false,
+          reply: decision.replyText || null,
+          reactionEmoji: decision.reactionEmoji || undefined,
+          groupAction: decision.action,
+          note: `Group Clone Action: ${decision.action}${decision.reactionEmoji ? ` (${decision.reactionEmoji})` : ''} — ${decision.reason}`,
+          detectedDistrict: decision.detectedDistrict,
+          providerUsed: decision.providerUsed,
+          ruleTriggered: `GROUP_CLONE_${decision.action.toUpperCase()}`,
+          config: botConfig,
+        });
+        return;
+      }
+
+      // 3B. Automated Private Inbox Assistant
       if (botConfig.autoreply) {
         if (chatType === 'private') {
-          const { replyText, detectedDistrict, noteCreated, usedFallback, keySlotUsed, fallbackReason } =
-            await runExecutiveAssistantTurn({
-              contactJid,
-              contactName,
-              incomingText: text,
-            });
-          pushLog(
-            'autoreply',
-            'Simulator DM',
-            usedFallback
-              ? `Static Fallback (${fallbackReason || 'Static Mode'})`
-              : `Replied (AI Key #${keySlotUsed || 1} · ${detectedDistrict})`,
-            usedFallback ? 'info' : 'success'
-          );
+          const {
+            replyText,
+            detectedDistrict,
+            noteCreated,
+            usedFallback,
+            providerUsed,
+            keySlotUsed,
+            fallbackReason,
+          } = await runExecutiveAssistantTurn({
+            contactJid,
+            contactName,
+            incomingText: text,
+          });
+          const simSummary =
+            providerUsed === 'openrouter'
+              ? `OpenRouter Failover (${detectedDistrict})`
+              : usedFallback || providerUsed === 'offline_emotion'
+                ? `Offline Emotion Engine (${fallbackReason || 'Fallback'})`
+                : `Replied (Gemini Key #${keySlotUsed || 1} · ${detectedDistrict})`;
+          pushLog('autoreply', 'Simulator DM', simSummary, usedFallback ? 'info' : 'success');
           res.json({
             deleted: false,
             reply: replyText,
             detectedDistrict,
             noteCreated,
             usedFallback,
+            providerUsed,
             keySlotUsed,
             ruleTriggered: usedFallback ? 'STATIC_AUTOREPLY' : 'AI_EXECUTIVE_ASSISTANT',
             config: botConfig,
@@ -1934,7 +2941,7 @@ async function bootstrap() {
           res.json({
             deleted: false,
             reply: null,
-            note: 'Auto-reply skipped: Group chats never trigger private inbox auto-reply.',
+            note: 'Private auto-reply skipped in group. Enable Group AI Clone for this Group JID or run .groupai on to test Group Clone behavior.',
             ruleTriggered: 'AUTOREPLY_SKIPPED_GROUP',
             config: botConfig,
           });
@@ -2038,6 +3045,8 @@ async function bootstrap() {
       botStatus,
       connectedUser: currentSocket?.user?.id || null,
       geminiKeyPool: geminiPool.getStats(),
+      openRouter: openRouterReader.getStats(),
+      postgres: getPostgresStatus(),
       selfPing: {
         enabled: selfPingEnabled,
         intervalMs: SELF_PING_INTERVAL_MS,
@@ -2139,6 +3148,7 @@ async function bootstrap() {
       currentSocket = null;
     }
 
+    void pgClosePool();
     httpServer.close(() => process.exit(0));
     const forceExit = setTimeout(() => process.exit(0), 3000);
     forceExit.unref?.();

@@ -49,6 +49,7 @@ export function AssistantBrainPanel({
   const [ownerLocation, setOwnerLocation] = useState(config.ownerLocation);
   const [ownerBio, setOwnerBio] = useState(config.ownerBio);
   const [ownerBoundaries, setOwnerBoundaries] = useState(config.ownerBoundaries);
+  const [strictLogicRules, setStrictLogicRules] = useState(config.strictLogicRules || '');
   const [firstGreeting, setFirstGreeting] = useState(config.firstGreetingTemplate);
   const [assistantTone, setAssistantTone] = useState<AssistantTone>(config.assistantTone);
   const [takeoverPauseMs, setTakeoverPauseMs] = useState(config.takeoverPauseMs);
@@ -87,6 +88,7 @@ export function AssistantBrainPanel({
       setOwnerLocation(config.ownerLocation);
       setOwnerBio(config.ownerBio);
       setOwnerBoundaries(config.ownerBoundaries);
+      setStrictLogicRules(config.strictLogicRules || '');
       setFirstGreeting(config.firstGreetingTemplate);
     }
   }, [config]);
@@ -175,6 +177,7 @@ export function AssistantBrainPanel({
         ownerLocation,
         ownerBio,
         ownerBoundaries,
+        strictLogicRules,
         firstGreetingTemplate: firstGreeting,
         assistantTone,
         takeoverPauseMs,
@@ -446,6 +449,22 @@ export function AssistantBrainPanel({
           </div>
         </div>
 
+        <div>
+          <label className="block text-xs font-medium text-slate-600">
+            Strict Logic, Debate, Emotion &amp; Time-Lapse Rules (যুক্তি-তর্ক, আবেগ ও সময়-সচেতনতা নিয়ম)
+          </label>
+          <textarea
+            rows={4}
+            value={strictLogicRules}
+            onChange={(e) => {
+              setStrictLogicRules(e.target.value);
+              markTextDirty();
+            }}
+            className="mt-1.5 w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+            placeholder="Rules governing how the AI debates logically, matches human emotion, reads full inbox continuity, and tracks BD time gaps..."
+          />
+        </div>
+
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-7">
             <label className="block text-xs font-medium text-slate-600">
@@ -508,7 +527,7 @@ export function AssistantBrainPanel({
         <div className="pt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs text-slate-500">
             {hasUnsavedText
-              ? 'You have unsaved text edits in Bio, Name, Boundaries, or Greeting.'
+              ? 'You have unsaved text edits in Bio, Name, Boundaries, Logic Rules, or Greeting.'
               : 'All persona & bio changes are up to date.'}
           </div>
           <button

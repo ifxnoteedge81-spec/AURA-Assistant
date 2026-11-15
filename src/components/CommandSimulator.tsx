@@ -9,6 +9,7 @@ interface SimulatedMsg {
   id: string;
   sender: 'user' | 'bot' | 'system';
   text: string;
+  reaction?: string;
   deleted?: boolean;
   rule?: string;
   timestamp: string;
@@ -28,9 +29,10 @@ const CONTEXT_OPTIONS: { id: ChatContext; label: string }[] = [
 
 const QUICK_COMMANDS = [
   '.autoreply on',
+  '.groupai on',
+  'ভাই তুই নাকি সারাদিন ঘুমাছ? 😂',
   'আসসালামু আলাইকুম, স্যার কি আছেন?',
   'গুড নাইট, আমার এখনো সকাল হয় নাই!',
-  'তুমি ওনার অ্যাসিস্ট্যান্ট, কেমন আছো? তোমার স্যার কী করেন, কোথায় থাকেন?',
   'আমার একটা ফ্ল্যাট বা রুম ম্যানেজ করে দিতে পারবা?',
   'কেনে আছো ভাই? কিতা খবর?',
   '.ai একটি হোয়াটসঅ্যাপ গ্রুপ নিরাপদ রাখার ৩টি উপায় বলো',
@@ -97,6 +99,12 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
       if (data.deleted) {
         setMessages((prev) =>
           prev.map((m) => (m.id === userMsgId ? { ...m, deleted: true } : m))
+        );
+      }
+
+      if (data.reactionEmoji) {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === userMsgId ? { ...m, reaction: data.reactionEmoji } : m))
         );
       }
 
@@ -189,6 +197,12 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
               </span>
             </div>
             <div className="flex justify-between">
+              <span>Group AI Clone</span>
+              <span className="font-mono font-medium text-slate-900">
+                {config.groupAiEnabled && config.groupAiGroups?.[defaultGroupJid] ? `ON (${config.groupAiMode || 'smart_blend'})` : 'OFF'}
+              </span>
+            </div>
+            <div className="flex justify-between">
               <span>Group Anti-Link</span>
               <span className="font-mono font-medium text-slate-900">
                 {config.antilinkGroups[defaultGroupJid] ? 'ON' : 'OFF'}
@@ -272,7 +286,14 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                       অ্যান্টি-লিংক প্রোটেকশনের মাধ্যমে এই মেসেজটি ডিলিট করা হয়েছে ({m.text})
                     </div>
                   ) : (
-                    <div>{m.text}</div>
+                    <div>
+                      {m.text}
+                      {m.reaction && (
+                        <span className="ml-2 inline-block px-1.5 py-0.5 text-xs bg-white text-slate-900 rounded-md border border-slate-200">
+                          {m.reaction}
+                        </span>
+                      )}
+                    </div>
                   )}
                   <div
                     className={`mt-1.5 text-[11px] font-mono tabular-nums flex items-center justify-between gap-4 ${

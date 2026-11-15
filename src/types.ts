@@ -13,6 +13,16 @@ export type AssistantTone =
   | 'executive_formal'
   | 'sharp_shut_down';
 
+export type GroupAiMode = 'smart_blend' | 'mention_only' | 'active_chat';
+
+export interface KnownGroupItem {
+  jid: string;
+  name: string;
+  participantCount: number;
+  antilinkEnabled: boolean;
+  groupAiEnabled: boolean;
+}
+
 export interface BotConfig {
   autoreply: boolean;
   aiAssistantEnabled: boolean;
@@ -23,12 +33,18 @@ export interface BotConfig {
   ownerLocation: string;
   ownerBio: string;
   ownerBoundaries: string;
+  strictLogicRules?: string;
   assistantTone: AssistantTone;
   cooldownMs: number;
   takeoverPauseMs: number;
   humanTypingEnabled: boolean;
   dailyReplyLimit: number;
   antilinkGroups: Record<string, boolean>;
+  groupAiEnabled?: boolean;
+  groupAiMode?: GroupAiMode;
+  groupReactionEnabled?: boolean;
+  groupCooldownMs?: number;
+  groupAiGroups?: Record<string, boolean>;
 }
 
 export interface DictionaryEntry {
@@ -53,6 +69,7 @@ export interface ChatMemoryRecord {
   detectedDistrict: string;
   lastSummary: string;
   turns: ChatTurn[];
+  archiveCount?: number;
   updatedAt: string;
 }
 
@@ -96,6 +113,14 @@ export interface BotStatusResponse {
   sessionExists: boolean;
   lastError: string | null;
   geminiConfigured: boolean;
+  openRouterConfigured?: boolean;
+  openRouterStats?: {
+    configuredKeysCount: number;
+    primaryModel: string;
+    lastSummaryAt: string | null;
+    lastFallbackAt: string | null;
+    lastError: string | null;
+  };
   firestoreAdminMode?: string;
   config: BotConfig;
   logs: BotLogEntry[];
