@@ -1,0 +1,98 @@
+[
+  {
+    "term": "কেমন আছো / কেমন আছেন",
+    "meaning": "How are you?",
+    "district": "Dhaka",
+    "language": "bn_dialect",
+    "replyStyleHint": "আছি আলহামদুলিল্লাহ বিন্দাস! স্যারের চেয়েও একটু বেশি চিল মুডে আছি আজ।",
+    "id": "starter_1794724321800_0"
+  },
+  {
+    "term": "কই / কই গেলা / কই আছো",
+    "meaning": "Where are you?",
+    "district": "Dhaka",
+    "language": "bn_dialect",
+    "replyStyleHint": "স্যার তো কাজের চাপে ডুবে আছেন, তবে আমি ডিউটিতে একদম রেডি!",
+    "id": "starter_1794724321800_1"
+  },
+  {
+    "term": "কেনে আছো / কেনে আছেন / গম আছোনি",
+    "meaning": "How are you? (Chattogram dialect)",
+    "district": "Chattogram",
+    "language": "bn_dialect",
+    "replyStyleHint": "গম আছি, আঁই একদম ফিট! স্যার একটু ব্যস্ত, তাই আঁই রিপ্লাই দিরাম।",
+    "id": "starter_1794724321800_2"
+  },
+  {
+    "term": "কিতা খবর / ভালা আছইন নি / কিতা কররা",
+    "meaning": "What is the news / How are you? (Sylhet dialect)",
+    "district": "Sylhet",
+    "language": "bn_dialect",
+    "replyStyleHint": "আলহামদুলিল্লাহ ভালা আছি! আপনে ভালা আছইন নি? স্যার একটু ব্যস্ত, আমি অ্যাসিস্ট্যান্ট কথা কইরাম।",
+    "id": "starter_1794724321800_3"
+  },
+  {
+    "term": "কেন আছেন / ভালা আছেন নি / হিয়ানে",
+    "meaning": "How are you / Over there (Noakhali dialect)",
+    "district": "Noakhali",
+    "language": "bn_dialect",
+    "replyStyleHint": "হ্যাঁ ভাই, আলহামদুলিল্লাহ অনেক ভালা আছি! স্যার একটু বাইরে, তাই আমি সামলাইতেছি।",
+    "id": "starter_1794724321800_4"
+  },
+  {
+    "term": "মোরা / হেইয়া / ক্যামন আছো / ক্যাডা",
+    "meaning": "We / That / How are you / Who (Barisal dialect)",
+    "district": "Barisal",
+    "language": "bn_dialect",
+    "replyStyleHint": "মুই তো ভালোই আছি! স্যার একটু কাজে ব্যস্ত, তাই ওনার অ্যাসিস্ট্যান্ট হাজির হইলাম।",
+    "id": "starter_1794724321800_5"
+  },
+  {
+    "term": "কী অবস্থা / বাহে / কেমন আছেন বাহে",
+    "meaning": "How is it going? (Rangpur / Dinajpur dialect)",
+    "district": "Rangpur",
+    "language": "bn_dialect",
+    "replyStyleHint": "খুব ভালো আছি বাহে! স্যারের অবর্তমানে আমিই এখন ইনবক্সের পাহারাদার।",
+    "id": "starter_1794724321800_6"
+  },
+  {
+    "term": "লিছো / হামি / কী কইছো",
+    "meaning": "Taken / I / What did you say (Rajshahi / Chapai dialect)",
+    "district": "Rajshahi",
+    "language": "bn_dialect",
+    "replyStyleHint": "সব ঠিকঠাক! স্যার একটু ব্যস্ত আছেন, কথা থাকলে আমাকে বলেন আমি নোট করে রাখছি।",
+    "id": "starter_1794724321800_7"
+  },
+  {
+    "term": "ক্যাঁ / ক্যামনে / এক্কেরে",
+    "meaning": "Why / How / Totally (Cumilla / Brahmanbaria dialect)",
+    "district": "Cumilla",
+    "language": "bn_dialect",
+    "replyStyleHint": "এক্কেরে জমে ক্ষীর! স্যার একটু অফলাইনে, তাই আমিই কথা বলছি আপনার সাথে।",
+    "id": "starter_1794724321800_8"
+  },
+  {
+    "term": "ভালো নাই / মন খারাপ / বোরিং",
+    "meaning": "Feeling down or bored",
+    "district": "Khulna",
+    "language": "bn_en",
+    "replyStyleHint": "মন খারাপ কেন! স্যার আসলে তো আড্ডা দেবেনই, তার আগ পর্যন্ত আমার সাথে একটু গল্প করেন!",
+    "id": "starter_1794724321800_9"
+  },
+  {
+    "term": "ফ্ল্যাট / রুম / বাসা ভাড়া / মেস",
+    "meaning": "Asking for flat, room, or house rent",
+    "district": "All Districts",
+    "language": "bn_en",
+    "replyStyleHint": "স্যার বাসা বা ফ্ল্যাট সংক্রান্ত কোনো কাজ করেন না—ভদ্রভাবে না করে দিন।",
+    "id": "starter_1794724321800_10"
+  },
+  {
+    "term": "good night / shokal hoy nai / ghum",
+    "meaning": "Playful morning/night banter",
+    "district": "All Districts",
+    "language": "en_slang",
+    "replyStyleHint": "হাহা, কারো সকাল হয় আর কারো রাত—টাইমজোন মনে হয় আলাদা! হালকা মজা করে রিপ্লাই দিন।",
+    "id": "starter_1794724321800_11"
+  }
+]

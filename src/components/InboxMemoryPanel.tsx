@@ -1,0 +1,180 @@
+import { useEffect, useState } from 'react';
+import { CheckCircle2, MessageSquareText, RefreshCw, Trash2 } from 'lucide-react';
+import { authFetch } from '../lib/api';
+import type { ChatMemoryRecord, InboxNoteRecord } from '../types';
+
+export function InboxMemoryPanel() {
+  const [memories, setMemories] = useState<ChatMemoryRecord[]>([]);
+  const [notes, setNotes] = useState<InboxNoteRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  async function fetchInboxData() {
+    setLoading(true);
+    try {
+      const res = await authFetch('/api/assistant/inbox');
+      if (res.ok) {
+        const data = await res.json();
+        setMemories(data.memories || []);
+        setNotes(data.notes || []);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void fetchInboxData();
+  }, []);
+
+  async function handleToggleNote(id: string) {
+    const res = await authFetch(`/api/notes/${id}/toggle`, { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      setNotes(data.notes || []);
+    }
+  }
+
+  async function handleDeleteNote(id: string) {
+    const res = await authFetch(`/api/notes/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      const data = await res.json();
+      setNotes(data.notes || []);
+    }
+  }
+
+  async function handleClearMemory(chatId: string) {
+    const res = await authFetch(`/api/memories/${chatId}`, { method: 'DELETE' });
+    if (res.ok) {
+      setMemories((prev) => prev.filter((m) => m.chatId !== chatId));
+    }
+  }
+
+  return (
+    <div className="space-y-8">
+      {/* Notes for Sir */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Messages &amp; Notes Left for Sir</h2>
+            <p className="text-xs text-slate-600">
+              When contacts leave important requests or callback messages while you are offline, the AI logs them here.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={fetchInboxData}
+            className="p-2 text-slate-500 hover:text-slate-900 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+            title="Refresh"
+          >
+            <RefreshCw className="w-4 h-4" />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="p-8 text-sm text-slate-500">Loading inbox notes...</div>
+        ) : notes.length === 0 ? (
+          <div className="p-8 text-center text-sm text-slate-500">
+            No pending notes left for Sir yet. Test leaving a message in the Command Simulator with Auto-Reply enabled.
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-200">
+            {notes.map((note) => (
+              <div key={note.id} className="px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span className="font-semibold text-slate-900">{note.contactName || note.contactJid}</span>
+                    <span aria-hidden="true">&middot;</span>
+                    <span className={note.urgency === 'important' ? 'text-red-700 font-medium' : 'text-slate-600'}>
+                      {note.urgency === 'important' ? 'Important' : 'Normal'}
+                    </span>
+                    <span aria-hidden="true">&middot;</span>
+                    <span className="font-mono tabular-nums">{new Date(note.createdAt).toLocaleString()}</span>
+                  </div>
+                  <div className={`text-sm ${note.resolved ? 'line-through text-slate-400' : 'text-slate-800'}`}>
+                    {note.summary}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => handleToggleNote(note.id)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-lg border flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                      note.resolved
+                        ? 'bg-slate-50 text-slate-600 border-slate-200'
+                        : 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                    }`}
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    {note.resolved ? 'Reopen' : 'Mark Done'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteNote(note.id)}
+                    className="p-1.5 text-slate-400 hover:text-red-600 border border-slate-200 rounded-lg cursor-pointer"
+                    title="Delete note"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Per-Contact Conversation Memory */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200">
+          <h2 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+            <MessageSquareText className="w-4 h-4 text-emerald-600" />
+            Private Contact Chat Memories
+          </h2>
+          <p className="text-xs text-slate-600">
+            Recent conversation context remembered by the AI assistant so it never repeats robotic intros.
+          </p>
+        </div>
+
+        {memories.length === 0 ? (
+          <div className="p-8 text-center text-sm text-slate-500">
+            No saved conversation memories yet.
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-200">
+            {memories.map((mem) => (
+              <div key={mem.chatId} className="p-6 space-y-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-slate-900">{mem.contactName || mem.contactJid}</span>
+                    <span aria-hidden="true">&middot;</span>
+                    <span className="font-mono">{mem.contactJid}</span>
+                    <span aria-hidden="true">&middot;</span>
+                    <span>Dialect: {mem.detectedDistrict || 'Standard'}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleClearMemory(mem.chatId)}
+                    className="px-3 py-1 text-xs font-medium text-red-700 border border-slate-200 rounded-lg hover:bg-red-50 cursor-pointer whitespace-nowrap"
+                  >
+                    Clear Memory
+                  </button>
+                </div>
+
+                <div className="space-y-2 bg-slate-50 border border-slate-200 rounded-lg p-3.5 max-h-60 overflow-y-auto">
+                  {mem.turns.map((turn, idx) => (
+                    <div key={idx} className="text-xs leading-relaxed">
+                      <span className={`font-semibold ${turn.role === 'assistant' ? 'text-emerald-700' : 'text-slate-900'}`}>
+                        {turn.role === 'assistant' ? 'Assistant: ' : 'Contact: '}
+                      </span>
+                      <span className="text-slate-700">{turn.text}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}

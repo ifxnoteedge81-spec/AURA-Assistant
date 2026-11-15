@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { Plus, Search, ShieldAlert, Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Check, Pencil, Plus, RotateCcw, Search, ShieldAlert, Trash2, X } from 'lucide-react';
+import { authFetch } from '../lib/api';
 import { BENGALI_AUTOREPLY_EXACT, type BotConfig } from '../types';
 
 interface ModerationRulesProps {
@@ -8,12 +9,47 @@ interface ModerationRulesProps {
 }
 
 export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps) {
+  const activeReplyText = config.autoreplyMessage || BENGALI_AUTOREPLY_EXACT;
+  const [isEditingReply, setIsEditingReply] = useState(false);
+  const [replyDraft, setReplyDraft] = useState(activeReplyText);
+  const [isSavingReply, setIsSavingReply] = useState(false);
+
   const [newGroupJid, setNewGroupJid] = useState('');
   const [linkProbeText, setLinkProbeText] = useState('Check this out: https://youtube.com/watch?v=dQw4w9WgXcQ or t.me/mychannel');
   const [probeResult, setProbeResult] = useState<{ hasLink: boolean; matches: string[] } | null>(null);
   const [isTesting, setIsTesting] = useState(false);
 
+  useEffect(() => {
+    if (!isEditingReply) {
+      setReplyDraft(config.autoreplyMessage || BENGALI_AUTOREPLY_EXACT);
+    }
+  }, [config.autoreplyMessage, isEditingReply]);
+
   const groupEntries = Object.entries(config.antilinkGroups);
+
+  async function handleSaveReply(e: React.FormEvent) {
+    e.preventDefault();
+    const cleaned = replyDraft.trim();
+    if (!cleaned) return;
+    setIsSavingReply(true);
+    try {
+      await onUpdateConfig({ autoreplyMessage: cleaned });
+      setIsEditingReply(false);
+    } finally {
+      setIsSavingReply(false);
+    }
+  }
+
+  async function handleResetReply() {
+    setIsSavingReply(true);
+    try {
+      await onUpdateConfig({ autoreplyMessage: BENGALI_AUTOREPLY_EXACT });
+      setReplyDraft(BENGALI_AUTOREPLY_EXACT);
+      setIsEditingReply(false);
+    } finally {
+      setIsSavingReply(false);
+    }
+  }
 
   async function handleAddGroup(e: React.FormEvent) {
     e.preventDefault();
@@ -48,7 +84,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
     e.preventDefault();
     setIsTesting(true);
     try {
-      const res = await fetch('/api/antilink/test', {
+      const res = await authFetch('/api/antilink/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: linkProbeText }),
@@ -102,12 +138,74 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
         <div className="mt-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-7">
-            <div className="text-xs font-medium text-slate-500">
-              Configured Bengali Reply Text
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-medium text-slate-500">
+                Configured Auto-Reply Message
+              </div>
+              {!isEditingReply && (
+                <div className="flex items-center gap-2">
+                  {activeReplyText !== BENGALI_AUTOREPLY_EXACT && (
+                    <button
+                      type="button"
+                      onClick={handleResetReply}
+                      disabled={isSavingReply}
+                      className="px-2.5 py-1 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-md hover:bg-slate-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      Reset Default
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReplyDraft(activeReplyText);
+                      setIsEditingReply(true);
+                    }}
+                    className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    Edit Message
+                  </button>
+                </div>
+              )}
             </div>
-            <div className="mt-2 p-4 rounded-lg border border-slate-200 bg-slate-50 text-sm leading-relaxed text-slate-900">
-              {BENGALI_AUTOREPLY_EXACT}
-            </div>
+
+            {isEditingReply ? (
+              <form onSubmit={handleSaveReply} className="mt-2 space-y-3">
+                <textarea
+                  rows={4}
+                  value={replyDraft}
+                  onChange={(e) => setReplyDraft(e.target.value)}
+                  className="w-full p-3.5 rounded-lg border border-emerald-600 bg-white text-sm leading-relaxed text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+                  placeholder="Enter custom auto-reply message..."
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReplyDraft(activeReplyText);
+                      setIsEditingReply(false);
+                    }}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSavingReply || !replyDraft.trim()}
+                    className="px-3.5 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 disabled:opacity-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    {isSavingReply ? 'Saving...' : 'Save Message'}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="mt-2 p-4 rounded-lg border border-slate-200 bg-slate-50 text-sm leading-relaxed text-slate-900 whitespace-pre-wrap">
+                {activeReplyText}
+              </div>
+            )}
           </div>
 
           <div className="lg:col-span-5">

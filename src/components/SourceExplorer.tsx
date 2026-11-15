@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Check, Copy, Download, FileCode2 } from 'lucide-react';
+import { authFetch } from '../lib/api';
 import type { SourceFileItem } from '../types';
 
 export function SourceExplorer() {
@@ -10,8 +11,8 @@ export function SourceExplorer() {
 
   useEffect(() => {
     let active = true;
-    fetch('/api/source-files')
-      .then((r) => r.json())
+    authFetch('/api/source-files')
+      .then((r) => (r.ok ? r.json() : { files: [] }))
       .then((data) => {
         if (!active) return;
         const list: SourceFileItem[] = data.files || [];

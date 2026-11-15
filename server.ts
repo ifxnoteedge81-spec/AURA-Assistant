@@ -14,11 +14,52 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import type { GroupMetadata, proto, WAMessage, WASocket } from '@whiskeysockets/baileys';
+import {
+  DEFAULT_FIRST_GREETING,
+  DEFAULT_OWNER_BIO,
+  DEFAULT_OWNER_BOUNDARIES,
+  STARTER_REGIONAL_DICTIONARY,
+  generateExecutiveAssistantReply,
+  parseUploadedDictionary,
+  sanitizeId,
+  type AssistantTone,
+  type ChatMemoryRecord,
+  type DictionaryEntry,
+  type InboxNoteRecord,
+} from './server/assistantEngine.ts';
+import {
+  adminDeleteDocument,
+  adminLoadCollection,
+  adminLoadDocument,
+  adminSaveDocument,
+  getAdminFirestore,
+} from './server/firestoreAdmin.ts';
+import {
+  OWNER_EMAIL,
+  checkRateLimit,
+  clearCustomDashboardPin,
+  clearRateLimit,
+  createMathChallenge,
+  getClientIp,
+  isPinConfigured,
+  issuePreAuthToken,
+  issueSessionToken,
+  recordAuthFailure,
+  requireOwnerAuth,
+  setCustomDashboardPin,
+  verifyConfiguredPin,
+  verifyGoogleFirebaseIdToken,
+  verifyMathChallenge,
+  verifyPreAuthToken,
+} from './server/authSecurity.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = '.';
 const AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info_baileys');
 const CONFIG_FILE = path.resolve('./bot-config.json');
+const DICTIONARY_FILE = path.resolve('./bot-dictionary.json');
+const MEMORIES_FILE = path.resolve('./bot-memories.json');
+const NOTES_FILE = path.resolve('./bot-notes.json');
 const BOT_SOURCE_DIR = path.resolve('./bot');
 
 export const BENGALI_AUTOREPLY_TEXT =
@@ -26,14 +67,26 @@ export const BENGALI_AUTOREPLY_TEXT =
 
 interface BotConfig {
   autoreply: boolean;
+  aiAssistantEnabled: boolean;
+  autoreplyMessage: string;
+  firstGreetingTemplate: string;
+  ownerName: string;
+  ownerProfession: string;
+  ownerLocation: string;
+  ownerBio: string;
+  ownerBoundaries: string;
+  assistantTone: AssistantTone;
   cooldownMs: number;
+  takeoverPauseMs: number;
+  humanTypingEnabled: boolean;
+  dailyReplyLimit: number;
   antilinkGroups: Record<string, boolean>;
 }
 
 interface BotLogEntry {
   id: string;
   timestamp: string;
-  category: 'system' | 'pairing' | 'gemini' | 'antilink' | 'autoreply' | 'simulator';
+  category: 'system' | 'pairing' | 'gemini' | 'antilink' | 'autoreply' | 'simulator' | 'cloud';
   actor: string;
   summary: string;
   outcome: 'success' | 'blocked' | 'info' | 'error';
@@ -44,6 +97,8 @@ interface SimulatorRequest {
   chatType: 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self';
   senderIsGroupAdmin?: boolean;
   groupJid?: string;
+  contactJid?: string;
+  contactName?: string;
 }
 
 // ----------------------------------------------------------------------------
@@ -64,43 +119,178 @@ const ai = geminiApiKey
 const baileysLogger = pino({ level: 'silent' });
 
 // ----------------------------------------------------------------------------
-// Persistent Configuration & Runtime State
+// Persistent Local + Cloud State Loaders & Savers
 // ----------------------------------------------------------------------------
-function loadConfig(): BotConfig {
-  try {
-    if (fs.existsSync(CONFIG_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-      return {
-        autoreply: Boolean(raw.autoreply),
-        cooldownMs: typeof raw.cooldownMs === 'number' ? raw.cooldownMs : 60_000,
-        antilinkGroups:
-          raw.antilinkGroups && typeof raw.antilinkGroups === 'object'
-            ? raw.antilinkGroups
-            : { '120363041928374655@g.us': true },
-      };
-    }
-  } catch (err) {
-    console.warn('[Config] Failed to load bot-config.json, using defaults:', err);
-  }
+function defaultConfig(): BotConfig {
   return {
     autoreply: false,
-    cooldownMs: 60_000,
+    aiAssistantEnabled: true,
+    autoreplyMessage: BENGALI_AUTOREPLY_TEXT,
+    firstGreetingTemplate: DEFAULT_FIRST_GREETING,
+    ownerName: 'Sir',
+    ownerProfession: 'Software & Automation Developer',
+    ownerLocation: 'Dhaka, Bangladesh',
+    ownerBio: DEFAULT_OWNER_BIO,
+    ownerBoundaries: DEFAULT_OWNER_BOUNDARIES,
+    assistantTone: 'witty_flirty',
+    cooldownMs: 3000,
+    takeoverPauseMs: 30 * 60 * 1000,
+    humanTypingEnabled: true,
+    dailyReplyLimit: 120,
     antilinkGroups: { '120363041928374655@g.us': true },
   };
 }
 
-function saveConfig(config: BotConfig) {
+function loadJsonFile<T>(filePath: string, fallback: T): T {
   try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+    }
   } catch (err) {
-    console.error('[Config] Failed to persist bot-config.json:', err);
+    console.warn(`[Storage] Failed reading ${path.basename(filePath)}:`, err);
+  }
+  return fallback;
+}
+
+function saveJsonFile(filePath: string, data: unknown) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error(`[Storage] Failed writing ${path.basename(filePath)}:`, err);
   }
 }
 
-let botConfig: BotConfig = loadConfig();
+function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
+  const base = defaultConfig();
+  const validTones: AssistantTone[] = ['witty_flirty', 'warm_polite', 'executive_formal', 'sharp_shut_down'];
+  const rawDailyLimit = typeof raw.dailyReplyLimit === 'number' ? raw.dailyReplyLimit : base.dailyReplyLimit;
+  return {
+    autoreply: typeof raw.autoreply === 'boolean' ? raw.autoreply : base.autoreply,
+    aiAssistantEnabled: typeof raw.aiAssistantEnabled === 'boolean' ? raw.aiAssistantEnabled : base.aiAssistantEnabled,
+    autoreplyMessage:
+      typeof raw.autoreplyMessage === 'string' && raw.autoreplyMessage.trim()
+        ? raw.autoreplyMessage
+        : base.autoreplyMessage,
+    firstGreetingTemplate:
+      typeof raw.firstGreetingTemplate === 'string' && raw.firstGreetingTemplate.trim()
+        ? raw.firstGreetingTemplate
+        : base.firstGreetingTemplate,
+    ownerName: typeof raw.ownerName === 'string' ? raw.ownerName : base.ownerName,
+    ownerProfession: typeof raw.ownerProfession === 'string' ? raw.ownerProfession : base.ownerProfession,
+    ownerLocation: typeof raw.ownerLocation === 'string' ? raw.ownerLocation : base.ownerLocation,
+    ownerBio: typeof raw.ownerBio === 'string' ? raw.ownerBio : base.ownerBio,
+    ownerBoundaries: typeof raw.ownerBoundaries === 'string' ? raw.ownerBoundaries : base.ownerBoundaries,
+    assistantTone: validTones.includes(raw.assistantTone as AssistantTone)
+      ? (raw.assistantTone as AssistantTone)
+      : base.assistantTone,
+    cooldownMs: typeof raw.cooldownMs === 'number' && raw.cooldownMs >= 0 ? raw.cooldownMs : base.cooldownMs,
+    takeoverPauseMs:
+      typeof raw.takeoverPauseMs === 'number' && raw.takeoverPauseMs >= 0
+        ? raw.takeoverPauseMs
+        : base.takeoverPauseMs,
+    humanTypingEnabled:
+      typeof raw.humanTypingEnabled === 'boolean' ? raw.humanTypingEnabled : base.humanTypingEnabled,
+    dailyReplyLimit: Math.max(10, Math.min(500, Math.round(rawDailyLimit))),
+    antilinkGroups:
+      raw.antilinkGroups && typeof raw.antilinkGroups === 'object'
+        ? raw.antilinkGroups
+        : base.antilinkGroups,
+  };
+}
+
+let botConfig: BotConfig = normalizeConfig(loadJsonFile<Partial<BotConfig>>(CONFIG_FILE, {}));
+let dictionaryEntries: DictionaryEntry[] = loadJsonFile<DictionaryEntry[]>(DICTIONARY_FILE, []);
+let chatMemories: Record<string, ChatMemoryRecord> = loadJsonFile<Record<string, ChatMemoryRecord>>(MEMORIES_FILE, {});
+let inboxNotes: InboxNoteRecord[] = loadJsonFile<InboxNoteRecord[]>(NOTES_FILE, []);
+
+function persistConfig() {
+  saveJsonFile(CONFIG_FILE, botConfig);
+  void adminSaveDocument('bot_settings', 'primary', {
+    ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+    ...botConfig,
+  });
+}
+
+function persistDictionary() {
+  saveJsonFile(DICTIONARY_FILE, dictionaryEntries);
+}
+
+function persistMemories() {
+  saveJsonFile(MEMORIES_FILE, chatMemories);
+}
+
+function persistNotes() {
+  saveJsonFile(NOTES_FILE, inboxNotes);
+}
+
 const eventLogs: BotLogEntry[] = [];
 const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
 const autoReplyCooldowns = new Map<string, number>();
+const ownerTakeoverUntil = new Map<string, number>();
+const botSentMessageIds = new Set<string>();
+
+interface PendingDmBuffer {
+  texts: string[];
+  lastMsg: WAMessage;
+  contactName: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingDmBuffers = new Map<string, PendingDmBuffer>();
+let replyQueueChain: Promise<void> = Promise.resolve();
+let dailyReplyDate = new Date().toISOString().slice(0, 10);
+let dailyReplyCount = 0;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function randomBetween(minMs: number, maxMs: number): number {
+  return minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs));
+}
+
+function getDailyReplyStats() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (dailyReplyDate !== today) {
+    dailyReplyDate = today;
+    dailyReplyCount = 0;
+  }
+  return {
+    date: dailyReplyDate,
+    count: dailyReplyCount,
+    limit: botConfig.dailyReplyLimit,
+  };
+}
+
+function getActiveTakeovers() {
+  const now = Date.now();
+  const active: Array<{ jid: string; phone: string; remainingMs: number; resumeAt: string }> = [];
+  for (const [jid, until] of ownerTakeoverUntil.entries()) {
+    if (until > now) {
+      active.push({
+        jid,
+        phone: extractDigits(jid) || jid,
+        remainingMs: until - now,
+        resumeAt: new Date(until).toISOString(),
+      });
+    } else {
+      ownerTakeoverUntil.delete(jid);
+    }
+  }
+  return active;
+}
+
+function enqueuePrivateReply(task: () => Promise<void>) {
+  replyQueueChain = replyQueueChain
+    .then(async () => {
+      await task();
+      // Natural pacing gap between replies across different contacts (Anti-Ban protection)
+      await sleep(randomBetween(1400, 2800));
+    })
+    .catch((err) => {
+      pushLog('autoreply', 'Reply Queue', `Queue error: ${(err as Error).message}`, 'error');
+    });
+}
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'awaiting_pairing' | 'connected';
 
@@ -126,15 +316,15 @@ function pushLog(
     summary,
     outcome,
   });
-  if (eventLogs.length > 100) {
-    eventLogs.length = 100;
+  if (eventLogs.length > 120) {
+    eventLogs.length = 120;
   }
 }
 
-pushLog('system', 'Control Plane', 'WaNexus bot runtime initialized.', 'info');
+pushLog('system', 'Control Plane', 'WaNexus AI Executive Assistant runtime initialized.', 'info');
 
 // ----------------------------------------------------------------------------
-// Shared Bot Logic Helpers (Matches /bot/index.js)
+// Shared Bot Logic Helpers
 // ----------------------------------------------------------------------------
 const LINK_PATTERNS: RegExp[] = [
   /(?:https?:\/\/|www\.)[^\s]+/gi,
@@ -247,6 +437,115 @@ async function askGemini(query: string): Promise<string> {
   return text || 'I could not generate a response for that query. Please try rephrasing.';
 }
 
+async function sendTrackedMessage(
+  sock: WASocket,
+  jid: string,
+  content: { text: string; mentions?: string[] },
+  options?: { quoted?: WAMessage }
+) {
+  const sent = await sock.sendMessage(jid, content, options);
+  const sentId = sent?.key?.id;
+  if (sentId) {
+    botSentMessageIds.add(sentId);
+    if (botSentMessageIds.size > 500) {
+      const first = botSentMessageIds.values().next().value;
+      if (first) botSentMessageIds.delete(first);
+    }
+  }
+  return sent;
+}
+
+async function runExecutiveAssistantTurn(params: {
+  contactJid: string;
+  contactName: string;
+  incomingText: string;
+}): Promise<{ replyText: string; detectedDistrict: string; noteCreated: InboxNoteRecord | null }> {
+  const chatId = sanitizeId(params.contactJid);
+  const memory = chatMemories[chatId] || null;
+  const nowIso = new Date().toISOString();
+
+  let replyText = botConfig.autoreplyMessage || BENGALI_AUTOREPLY_TEXT;
+  let detectedDistrict = memory?.detectedDistrict || 'Standard';
+  let noteSummary = '';
+  let noteUrgency: 'normal' | 'important' = 'normal';
+  let noteCreated: InboxNoteRecord | null = null;
+
+  try {
+    const result = await generateExecutiveAssistantReply({
+      ai: botConfig.aiAssistantEnabled ? ai : null,
+      settings: botConfig,
+      memory,
+      incomingText: params.incomingText,
+      contactName: params.contactName,
+      dictionaryEntries,
+    });
+    replyText = result.replyText;
+    detectedDistrict = result.detectedDistrict;
+    noteSummary = result.noteSummary;
+    noteUrgency = result.noteUrgency;
+  } catch (err) {
+    pushLog(
+      'autoreply',
+      params.contactName || params.contactJid,
+      `AI fallback triggered: ${(err as Error).message}`,
+      'error'
+    );
+    const fallbackResult = await generateExecutiveAssistantReply({
+      ai: null,
+      settings: botConfig,
+      memory,
+      incomingText: params.incomingText,
+      contactName: params.contactName,
+      dictionaryEntries,
+    });
+    replyText = fallbackResult.replyText;
+  }
+
+  const nextTurns = [
+    ...(memory?.turns || []),
+    { role: 'user' as const, text: params.incomingText, timestamp: nowIso },
+    { role: 'assistant' as const, text: replyText, timestamp: nowIso },
+  ].slice(-16);
+
+  const updatedMemory: ChatMemoryRecord = {
+    chatId,
+    contactJid: params.contactJid,
+    contactName: params.contactName,
+    detectedDistrict,
+    lastSummary: noteSummary || memory?.lastSummary || params.incomingText.slice(0, 120),
+    turns: nextTurns,
+    updatedAt: nowIso,
+  };
+  chatMemories[chatId] = updatedMemory;
+  persistMemories();
+  void adminSaveDocument('chat_memories', chatId, {
+    ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+    ...updatedMemory,
+  });
+
+  if (noteSummary) {
+    const noteId = sanitizeId(`note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+    noteCreated = {
+      id: noteId,
+      contactJid: params.contactJid,
+      contactName: params.contactName,
+      summary: noteSummary,
+      urgency: noteUrgency,
+      resolved: false,
+      createdAt: nowIso,
+    };
+    inboxNotes.unshift(noteCreated);
+    if (inboxNotes.length > 200) inboxNotes.length = 200;
+    persistNotes();
+    void adminSaveDocument('inbox_notes', noteId, {
+      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      ...noteCreated,
+    });
+  }
+
+  return { replyText, detectedDistrict, noteCreated };
+}
+
 // ----------------------------------------------------------------------------
 // Live Baileys Message Handler
 // ----------------------------------------------------------------------------
@@ -261,6 +560,29 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   const text = extractMessageText(msg.message);
   const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
 
+  // Detect manual human owner reply in a private chat -> pause AI assistant temporarily
+  if (!isGroup && !remoteJid.endsWith('@g.us') && msg.key.fromMe) {
+    const msgId = msg.key.id;
+    const isCommand = text.startsWith(PREFIX);
+    if (msgId && !botSentMessageIds.has(msgId) && !isCommand && text) {
+      // Cancel any buffered incoming DM reply waiting to send to this contact
+      const pending = pendingDmBuffers.get(remoteJid);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingDmBuffers.delete(remoteJid);
+      }
+      if (botConfig.takeoverPauseMs > 0) {
+        ownerTakeoverUntil.set(remoteJid, Date.now() + botConfig.takeoverPauseMs);
+        pushLog(
+          'autoreply',
+          extractDigits(remoteJid) || remoteJid,
+          `Owner typed manually; AI paused for ${Math.round(botConfig.takeoverPauseMs / 60000)}m.`,
+          'info'
+        );
+      }
+    }
+  }
+
   // 1. Group Anti-Link Protection
   if (isGroup && botConfig.antilinkGroups[remoteJid] === true && text) {
     const isAntiLinkCommand = text.toLowerCase().startsWith(`${PREFIX}antilink`);
@@ -273,7 +595,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         if (botIsAdmin && !senderIsAdmin) {
           await sock.sendMessage(remoteJid, { delete: msg.key });
           const senderTag = senderJid.split('@')[0];
-          await sock.sendMessage(remoteJid, {
+          await sendTrackedMessage(sock, remoteJid, {
             text: `🚫 *Anti-Link Protection*\n@${senderTag}, links are not allowed in this group. Your message has been deleted.`,
             mentions: [senderJid],
           });
@@ -295,7 +617,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
     if (command === 'ai' || command === 'gemini') {
       if (!argsText) {
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: `Please provide a prompt.\nExample: *${PREFIX}ai Explain quantum computing*` },
           { quoted: msg }
@@ -305,11 +628,12 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       try {
         await sock.sendPresenceUpdate('composing', remoteJid);
         const reply = await askGemini(argsText);
-        await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+        await sendTrackedMessage(sock, remoteJid, { text: reply }, { quoted: msg });
         pushLog('gemini', extractDigits(senderJid) || remoteJid, `Answered .${command} query`, 'success');
       } catch (err) {
         pushLog('gemini', extractDigits(senderJid) || remoteJid, `Gemini error: ${(err as Error).message}`, 'error');
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '❌ Failed to get a response from Gemini AI. Please try again shortly.' },
           { quoted: msg }
@@ -322,7 +646,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
     if (command === 'antilink') {
       if (!isGroup) {
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '⚠️ The *.antilink* command can only be used inside WhatsApp groups.' },
           { quoted: msg }
@@ -333,7 +658,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       const metadata = await getCachedGroupMetadata(sock, remoteJid);
       const senderIsAdmin = isParticipantAdmin(metadata, senderJid) || isOwnerOrSelf(msg, sock);
       if (!senderIsAdmin) {
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '⛔ Only group admins can configure Anti-Link settings.' },
           { quoted: msg }
@@ -344,9 +670,10 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       const subArgs = argsText.toLowerCase().split(/\s+/);
       if (subArgs[0] === 'delete' && subArgs[1] === 'on') {
         botConfig.antilinkGroups[remoteJid] = true;
-        saveConfig(botConfig);
+        persistConfig();
         pushLog('antilink', metadata.subject || remoteJid, 'Enabled .antilink delete on', 'success');
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '✅ *Anti-Link Delete Mode is now ON* for this group.' },
           { quoted: msg }
@@ -356,9 +683,10 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
       if (subArgs[0] === 'delete' && subArgs[1] === 'off') {
         botConfig.antilinkGroups[remoteJid] = false;
-        saveConfig(botConfig);
+        persistConfig();
         pushLog('antilink', metadata.subject || remoteJid, 'Disabled .antilink delete off', 'info');
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '🛑 *Anti-Link Delete Mode is now OFF* for this group.' },
           { quoted: msg }
@@ -366,7 +694,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         return;
       }
 
-      await sock.sendMessage(
+      await sendTrackedMessage(
+        sock,
         remoteJid,
         {
           text: `🛡️ *Anti-Link Status:* ${botConfig.antilinkGroups[remoteJid] ? 'ON' : 'OFF'}\nUsage: *${PREFIX}antilink delete on* | *${PREFIX}antilink delete off*`,
@@ -378,7 +707,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
     if (command === 'autoreply') {
       if (!isOwnerOrSelf(msg, sock)) {
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '⛔ Only the bot owner can toggle private auto-reply mode.' },
           { quoted: msg }
@@ -388,9 +718,10 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       const mode = argsText.toLowerCase();
       if (mode === 'on') {
         botConfig.autoreply = true;
-        saveConfig(botConfig);
+        persistConfig();
         pushLog('autoreply', 'Owner', 'Enabled .autoreply on', 'success');
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '✅ *Private Auto-Reply Assistant is now ON.*' },
           { quoted: msg }
@@ -399,9 +730,10 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       }
       if (mode === 'off') {
         botConfig.autoreply = false;
-        saveConfig(botConfig);
+        persistConfig();
         pushLog('autoreply', 'Owner', 'Disabled .autoreply off', 'info');
-        await sock.sendMessage(
+        await sendTrackedMessage(
+          sock,
           remoteJid,
           { text: '🛑 *Private Auto-Reply Assistant is now OFF.*' },
           { quoted: msg }
@@ -412,15 +744,17 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     }
 
     if (command === 'ping') {
-      await sock.sendMessage(remoteJid, { text: '🏓 Pong! Bot is online and active.' }, { quoted: msg });
+      await sendTrackedMessage(sock, remoteJid, { text: '🏓 Pong! Bot is online and active.' }, { quoted: msg });
     }
     return;
   }
 
-  // 3. Automated Private Inbox Assistant (Bengali)
+  // 3. Automated Private Inbox Assistant (STRICTLY Private DMs Only — NEVER Groups)
   if (botConfig.autoreply) {
     const isPrivateChat =
-      !isGroup && (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'));
+      !isGroup &&
+      !remoteJid.endsWith('@g.us') &&
+      (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'));
     if (!isPrivateChat || msg.key.fromMe || !text) return;
 
     const botDigits = extractDigits(sock.user?.id);
@@ -430,18 +764,139 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       return;
     }
 
+    const pausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
+    if (Date.now() < pausedUntil) {
+      return;
+    }
+
     const lastSent = autoReplyCooldowns.get(remoteJid) || 0;
     if (Date.now() - lastSent < botConfig.cooldownMs) return;
 
-    autoReplyCooldowns.set(remoteJid, Date.now());
-    await sock.sendMessage(remoteJid, { text: BENGALI_AUTOREPLY_TEXT }, { quoted: msg });
-    pushLog('autoreply', senderDigits || remoteJid, 'Sent Bengali private auto-reply', 'success');
+    const contactName = msg.pushName || senderDigits || 'Contact';
+
+    // Coalesce rapid consecutive lines from the same contact (~2.6s) before replying
+    const existingBuffer = pendingDmBuffers.get(remoteJid);
+    if (existingBuffer) {
+      clearTimeout(existingBuffer.timer);
+      existingBuffer.texts.push(text);
+      existingBuffer.lastMsg = msg;
+      existingBuffer.contactName = contactName;
+    }
+
+    const texts = existingBuffer ? existingBuffer.texts : [text];
+    const debounceMs = botConfig.humanTypingEnabled ? 2600 : 400;
+
+    const timer = setTimeout(() => {
+      const finalized = pendingDmBuffers.get(remoteJid);
+      pendingDmBuffers.delete(remoteJid);
+      if (!finalized) return;
+
+      const combinedText = finalized.texts.join('\n').trim();
+      const targetMsg = finalized.lastMsg;
+
+      enqueuePrivateReply(async () => {
+        if (!botConfig.autoreply || currentSocket !== sock) return;
+
+        // Re-check takeover pause in case owner started typing while buffered/queued
+        const latestPausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
+        if (Date.now() < latestPausedUntil) return;
+
+        // Enforce daily safety cap to protect WhatsApp account from automated spam flags
+        const daily = getDailyReplyStats();
+        if (daily.count >= daily.limit) {
+          pushLog(
+            'autoreply',
+            finalized.contactName,
+            `Daily safety cap (${daily.limit} replies/day) reached; auto-reply skipped.`,
+            'blocked'
+          );
+          return;
+        }
+
+        autoReplyCooldowns.set(remoteJid, Date.now());
+
+        try {
+          if (botConfig.humanTypingEnabled) {
+            await sleep(randomBetween(1100, 2400));
+            await sock.readMessages([targetMsg.key]).catch(() => {});
+          }
+
+          const { replyText, detectedDistrict } = await runExecutiveAssistantTurn({
+            contactJid: remoteJid,
+            contactName: finalized.contactName,
+            incomingText: combinedText,
+          });
+
+          if (botConfig.humanTypingEnabled) {
+            await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+            const typingMs = Math.min(8500, Math.max(2200, replyText.length * 42 + randomBetween(400, 1200)));
+            await sleep(typingMs);
+            await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+          }
+
+          // Check takeover one final time right before sending
+          if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
+
+          // Vary quoting naturally (~45% quoted) rather than quoting 100% robotically
+          const shouldQuote = finalized.texts.length > 1 || Math.random() < 0.45;
+          await sendTrackedMessage(
+            sock,
+            remoteJid,
+            { text: replyText },
+            shouldQuote ? { quoted: targetMsg } : undefined
+          );
+
+          dailyReplyCount += 1;
+          pushLog(
+            'autoreply',
+            finalized.contactName,
+            `Replied (${botConfig.aiAssistantEnabled ? `AI · ${detectedDistrict}` : 'Static'})`,
+            'success'
+          );
+        } finally {
+          await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+        }
+      });
+    }, debounceMs);
+
+    pendingDmBuffers.set(remoteJid, {
+      texts,
+      lastMsg: msg,
+      contactName,
+      timer,
+    });
   }
 }
 
 // ----------------------------------------------------------------------------
-// Baileys Socket Connection & Pairing Code Trigger
+// Baileys Session Cloud Backup & Socket Connection
 // ----------------------------------------------------------------------------
+async function backupCredsToCloud() {
+  try {
+    const credsPath = path.join(AUTH_DIR, 'creds.json');
+    if (!fs.existsSync(credsPath)) return;
+    const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    await adminSaveDocument('bot_sessions', 'primary', {
+      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      phoneNumber: currentPairingPhone || '',
+      credsData,
+    });
+  } catch {
+    // ignore backup failures
+  }
+}
+
+async function restoreCredsFromCloudIfMissing() {
+  const credsPath = path.join(AUTH_DIR, 'creds.json');
+  if (fs.existsSync(credsPath)) return;
+  const docData = await adminLoadDocument<{ credsData?: Record<string, unknown> }>('bot_sessions', 'primary');
+  if (docData?.credsData) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    fs.writeFileSync(credsPath, JSON.stringify(docData.credsData, null, 2), 'utf8');
+    pushLog('cloud', 'Firestore', 'Restored WhatsApp session credentials from Firestore backup.', 'success');
+  }
+}
+
 async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCode: string | null }> {
   manualDisconnect = false;
   lastBotError = null;
@@ -456,14 +911,22 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
     currentSocket = null;
   }
 
+  await restoreCredsFromCloudIfMissing();
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+
+  let socketVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    socketVersion = version;
+  } catch {
+    // fall back to built-in version
+  }
 
   botStatus = 'connecting';
 
   const sock = makeWASocket({
-    version,
+    ...(socketVersion ? { version: socketVersion } : {}),
     logger: baileysLogger,
     printQRInTerminal: false,
     browser: Browsers.ubuntu('Chrome'),
@@ -471,13 +934,16 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
     },
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   });
 
   currentSocket = sock;
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    await backupCredsToCloud();
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
@@ -487,11 +953,14 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
       reconnectAttempts = 0;
       currentPairingCode = null;
       lastBotError = null;
+      await backupCredsToCloud();
       pushLog('pairing', sock.user?.id || 'WhatsApp', 'WhatsApp device linked and online.', 'success');
     }
 
     if (connection === 'close') {
-      const errObj = lastDisconnect?.error as { output?: { statusCode?: number }; statusCode?: number; message?: string } | undefined;
+      const errObj = lastDisconnect?.error as
+        | { output?: { statusCode?: number }; statusCode?: number; message?: string }
+        | undefined;
       const statusCode = errObj?.output?.statusCode ?? errObj?.statusCode;
 
       if (manualDisconnect) {
@@ -499,7 +968,11 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
         return;
       }
 
-      if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden || statusCode === DisconnectReason.badSession) {
+      if (
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.forbidden ||
+        statusCode === DisconnectReason.badSession
+      ) {
         botStatus = 'disconnected';
         lastBotError = 'Session logged out or expired. Clear session and pair again.';
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -536,8 +1009,11 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    const nowSec = Math.floor(Date.now() / 1000);
     for (const msg of messages) {
+      const rawTs = Number(msg.messageTimestamp || 0);
+      const isFreshOwnEcho = type === 'append' && msg.key.fromMe && (rawTs === 0 || nowSec - rawTs < 25);
+      if (type !== 'notify' && !isFreshOwnEcho) continue;
       try {
         await handleLiveMessage(sock, msg);
       } catch (err) {
@@ -568,14 +1044,259 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
 }
 
 // ----------------------------------------------------------------------------
+// Hydrate from Server-Side Admin Firestore on Boot (if configured)
+// ----------------------------------------------------------------------------
+async function hydrateFromCloudAdmin() {
+  const { db, mode } = getAdminFirestore();
+  if (!db) return;
+  try {
+    const cloudSettings = await adminLoadDocument<Partial<BotConfig>>('bot_settings', 'primary');
+    if (cloudSettings) {
+      botConfig = normalizeConfig(cloudSettings);
+      saveJsonFile(CONFIG_FILE, botConfig);
+    }
+
+    const cloudDict = await adminLoadCollection<DictionaryEntry>('dictionary_entries');
+    if (cloudDict.length > 0) {
+      dictionaryEntries = cloudDict;
+      persistDictionary();
+    }
+
+    const cloudMemories = await adminLoadCollection<ChatMemoryRecord>('chat_memories');
+    if (cloudMemories.length > 0) {
+      for (const mem of cloudMemories) {
+        chatMemories[mem.id] = { ...mem, chatId: mem.id };
+      }
+      persistMemories();
+    }
+
+    const cloudNotes = await adminLoadCollection<InboxNoteRecord>('inbox_notes');
+    if (cloudNotes.length > 0) {
+      inboxNotes = cloudNotes.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      persistNotes();
+    }
+
+    pushLog('cloud', 'Firestore Admin', `Hydrated state from Firestore (${mode}).`, 'success');
+  } catch (err) {
+    pushLog('cloud', 'Firestore Admin', `Hydration warning: ${(err as Error).message}`, 'error');
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Express Server & API Routes
 // ----------------------------------------------------------------------------
 async function bootstrap() {
+  await hydrateFromCloudAdmin();
+
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '5mb' }));
+
+  // --------------------------------------------------------------------------
+  // Public Owner Authentication & Anti-Bot Challenge Endpoints
+  // --------------------------------------------------------------------------
+  app.get('/api/auth/status', (_req, res) => {
+    res.json({
+      ownerEmail: OWNER_EMAIL,
+      pinConfigured: isPinConfigured(),
+    });
+  });
+
+  app.get('/api/auth/challenge', (_req, res) => {
+    res.json(createMathChallenge());
+  });
+
+  app.post('/api/auth/google', async (req, res) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `Too many failed attempts. Try again in ${limit.retryAfterSec}s.`,
+      });
+      return;
+    }
+
+    try {
+      const idToken = String(req.body?.idToken || '');
+      const challengeToken = String(req.body?.challengeToken || '');
+      const challengeAnswer = String(req.body?.challengeAnswer ?? '');
+
+      if (!verifyMathChallenge(challengeToken, challengeAnswer)) {
+        recordAuthFailure(ip);
+        res.status(400).json({ error: 'Verification answer was incorrect or expired. Try the new math check.' });
+        return;
+      }
+
+      const identity = await verifyGoogleFirebaseIdToken(idToken);
+      if (!identity.emailVerified || identity.email !== OWNER_EMAIL) {
+        recordAuthFailure(ip);
+        pushLog('system', identity.email || ip, 'Blocked unauthorized dashboard Google login attempt.', 'blocked');
+        res.status(403).json({
+          error: `Access denied. Only authorized owner (${OWNER_EMAIL}) can unlock this dashboard.`,
+        });
+        return;
+      }
+
+      clearRateLimit(ip);
+
+      if (isPinConfigured()) {
+        res.json({
+          requiresPin: true,
+          preAuthToken: issuePreAuthToken(identity.email),
+          email: identity.email,
+        });
+        return;
+      }
+
+      const sessionToken = issueSessionToken(identity.email);
+      pushLog('system', identity.email, 'Owner unlocked dashboard via Google Auth.', 'success');
+      res.json({
+        requiresPin: false,
+        sessionToken,
+        email: identity.email,
+        pinConfigured: false,
+      });
+    } catch (err) {
+      recordAuthFailure(ip);
+      res.status(401).json({ error: (err as Error).message || 'Google sign-in verification failed.' });
+    }
+  });
+
+  app.post('/api/auth/verify-pin', (req, res) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip);
+    if (!limit.allowed) {
+      res.status(429).json({ error: `Locked due to failed attempts. Try again in ${limit.retryAfterSec}s.` });
+      return;
+    }
+
+    const preAuthToken = String(req.body?.preAuthToken || '');
+    const pin = String(req.body?.pin || '');
+    const email = verifyPreAuthToken(preAuthToken);
+
+    if (!email) {
+      res.status(401).json({ error: 'Pre-auth session expired. Sign in with Google again.' });
+      return;
+    }
+
+    if (!verifyConfiguredPin(pin)) {
+      const failure = recordAuthFailure(ip);
+      res.status(401).json({
+        error: failure.locked
+          ? 'Too many incorrect PIN attempts. Temporarily locked for 5 minutes.'
+          : `Incorrect 2FA Security PIN (${failure.attemptsLeft} attempts remaining).`,
+      });
+      return;
+    }
+
+    clearRateLimit(ip);
+    const sessionToken = issueSessionToken(email);
+    pushLog('system', email, 'Owner verified 2FA Security PIN.', 'success');
+    res.json({
+      sessionToken,
+      email,
+      pinConfigured: true,
+    });
+  });
+
+  app.post('/api/auth/pin-unlock', (req, res) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip);
+    if (!limit.allowed) {
+      res.status(429).json({ error: `Locked due to failed attempts. Try again in ${limit.retryAfterSec}s.` });
+      return;
+    }
+
+    if (!isPinConfigured()) {
+      res.status(400).json({ error: 'No Security PIN is set yet. Unlock using Google Sign-In first.' });
+      return;
+    }
+
+    const pin = String(req.body?.pin || '');
+    const challengeToken = String(req.body?.challengeToken || '');
+    const challengeAnswer = String(req.body?.challengeAnswer ?? '');
+
+    if (!verifyMathChallenge(challengeToken, challengeAnswer)) {
+      recordAuthFailure(ip);
+      res.status(400).json({ error: 'Verification math answer was incorrect or expired.' });
+      return;
+    }
+
+    if (!verifyConfiguredPin(pin)) {
+      const failure = recordAuthFailure(ip);
+      pushLog('system', ip, 'Failed PIN unlock attempt.', 'blocked');
+      res.status(401).json({
+        error: failure.locked
+          ? 'Too many incorrect PIN attempts. Temporarily locked for 5 minutes.'
+          : `Incorrect Security PIN (${failure.attemptsLeft} attempts remaining).`,
+      });
+      return;
+    }
+
+    clearRateLimit(ip);
+    const sessionToken = issueSessionToken(OWNER_EMAIL);
+    pushLog('system', OWNER_EMAIL, 'Owner unlocked dashboard via 2FA PIN.', 'success');
+    res.json({
+      sessionToken,
+      email: OWNER_EMAIL,
+      pinConfigured: true,
+    });
+  });
+
+  // Protect ALL other /api/* routes behind authenticated owner session token
+  app.use('/api', (req, res, next) => {
+    if (req.path.startsWith('/auth/')) {
+      next();
+      return;
+    }
+    requireOwnerAuth(req, res, next);
+  });
+
+  app.get('/api/security/stats', (_req, res) => {
+    res.json({
+      ownerEmail: OWNER_EMAIL,
+      pinConfigured: isPinConfigured(),
+      envPinActive: Boolean(process.env.DASHBOARD_PIN?.trim()),
+      dailyReplyStats: getDailyReplyStats(),
+      activeTakeovers: getActiveTakeovers(),
+      humanTypingEnabled: botConfig.humanTypingEnabled,
+      dailyReplyLimit: botConfig.dailyReplyLimit,
+      markOnlineOnConnect: false,
+    });
+  });
+
+  app.post('/api/security/pin', (req, res) => {
+    try {
+      const action = String(req.body?.action || 'set');
+      if (action === 'clear') {
+        clearCustomDashboardPin();
+        pushLog('system', OWNER_EMAIL, 'Removed custom 2FA dashboard PIN.', 'info');
+        res.json({ pinConfigured: isPinConfigured() });
+        return;
+      }
+      const newPin = String(req.body?.pin || '');
+      setCustomDashboardPin(newPin);
+      pushLog('system', OWNER_EMAIL, 'Updated dashboard 2FA Security PIN.', 'success');
+      res.json({ pinConfigured: isPinConfigured() });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/security/resume-takeover', (req, res) => {
+    const jid = String(req.body?.jid || '');
+    if (jid) {
+      ownerTakeoverUntil.delete(jid);
+      pushLog('autoreply', extractDigits(jid) || jid, 'Owner manually resumed AI auto-reply.', 'info');
+    } else {
+      ownerTakeoverUntil.clear();
+      pushLog('autoreply', 'Owner', 'Resumed AI auto-reply across all paused chats.', 'info');
+    }
+    res.json({ activeTakeovers: getActiveTakeovers() });
+  });
 
   app.get('/api/bot/status', (_req, res) => {
     const sessionExists = fs.existsSync(path.join(AUTH_DIR, 'creds.json'));
+    const { mode: firestoreAdminMode } = getAdminFirestore();
     res.json({
       status: botStatus,
       connectedUser: currentSocket?.user?.id || null,
@@ -584,8 +1305,14 @@ async function bootstrap() {
       sessionExists,
       lastError: lastBotError,
       geminiConfigured: Boolean(geminiApiKey),
+      firestoreAdminMode,
       config: botConfig,
       logs: eventLogs,
+      dictionaryCount: dictionaryEntries.length,
+      memoryCount: Object.keys(chatMemories).length,
+      unreadNotesCount: inboxNotes.filter((n) => !n.resolved).length,
+      dailyReplyStats: getDailyReplyStats(),
+      activeTakeoversCount: getActiveTakeovers().length,
     });
   });
 
@@ -642,26 +1369,183 @@ async function bootstrap() {
       currentSocket = null;
     }
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    void adminDeleteDocument('bot_sessions', 'primary');
     botStatus = 'disconnected';
     pushLog('pairing', 'Operator', 'Cleared MultiFileAuthState credentials.', 'info');
     res.json({ status: botStatus, sessionExists: false });
   });
 
   app.post('/api/bot/config', (req, res) => {
-    const { autoreply, cooldownMs, antilinkGroups } = req.body || {};
-    if (typeof autoreply === 'boolean') {
-      botConfig.autoreply = autoreply;
-      pushLog('autoreply', 'Dashboard', `Private auto-reply set to ${autoreply ? 'ON' : 'OFF'}`, 'info');
-    }
-    if (typeof cooldownMs === 'number' && cooldownMs >= 0) {
-      botConfig.cooldownMs = cooldownMs;
-    }
-    if (antilinkGroups && typeof antilinkGroups === 'object') {
-      botConfig.antilinkGroups = antilinkGroups;
-      pushLog('antilink', 'Dashboard', 'Updated group anti-link rule table.', 'info');
-    }
-    saveConfig(botConfig);
+    const patch = req.body || {};
+    botConfig = normalizeConfig({ ...botConfig, ...patch });
+    persistConfig();
+    pushLog('autoreply', 'Dashboard', 'Saved assistant & moderation configuration.', 'info');
     res.json({ config: botConfig });
+  });
+
+  // Cloud Sync endpoint used by browser-authenticated Firestore client
+  app.post('/api/cloud/sync', (req, res) => {
+    const { settings, dictionary, memories, notes } = req.body || {};
+    if (settings && typeof settings === 'object') {
+      botConfig = normalizeConfig({ ...botConfig, ...settings });
+      saveJsonFile(CONFIG_FILE, botConfig);
+    }
+    if (Array.isArray(dictionary) && dictionary.length > 0) {
+      dictionaryEntries = dictionary;
+      persistDictionary();
+    }
+    if (Array.isArray(memories) && memories.length > 0) {
+      for (const mem of memories) {
+        if (mem?.chatId) chatMemories[mem.chatId] = mem;
+      }
+      persistMemories();
+    }
+    if (Array.isArray(notes) && notes.length > 0) {
+      inboxNotes = notes;
+      persistNotes();
+    }
+    pushLog('cloud', 'Browser Sync', 'Synced dashboard & Firestore cloud data with bot server.', 'success');
+    res.json({
+      config: botConfig,
+      dictionary: dictionaryEntries,
+      memories: Object.values(chatMemories),
+      notes: inboxNotes,
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 64-District Bangla & English Dictionary Endpoints
+  // --------------------------------------------------------------------------
+  app.get('/api/dictionary', (_req, res) => {
+    res.json({ entries: dictionaryEntries });
+  });
+
+  app.post('/api/dictionary', (req, res) => {
+    const term = String(req.body?.term || '').trim();
+    const meaning = String(req.body?.meaning || '').trim();
+    const district = String(req.body?.district || 'All Districts').trim();
+    const language = (req.body?.language || 'bn_dialect') as DictionaryEntry['language'];
+    const replyStyleHint = String(req.body?.replyStyleHint || '').trim();
+
+    if (!term || !meaning) {
+      res.status(400).json({ error: 'Term and meaning are required.' });
+      return;
+    }
+
+    const entry: DictionaryEntry = {
+      id: sanitizeId(`dict_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`),
+      term: term.slice(0, 200),
+      meaning: meaning.slice(0, 500),
+      district: district.slice(0, 100),
+      language,
+      replyStyleHint: replyStyleHint.slice(0, 300),
+    };
+    dictionaryEntries.unshift(entry);
+    persistDictionary();
+    void adminSaveDocument('dictionary_entries', entry.id, {
+      ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+      ...entry,
+    });
+    pushLog('system', 'Dictionary', `Added term "${entry.term}" (${entry.district})`, 'success');
+    res.json({ entry, entries: dictionaryEntries });
+  });
+
+  app.post('/api/dictionary/import', (req, res) => {
+    try {
+      const content = String(req.body?.content || '');
+      const fileName = String(req.body?.fileName || 'dictionary.txt');
+      const parsed = parseUploadedDictionary(content, fileName);
+
+      if (parsed.length === 0) {
+        res.status(400).json({
+          error:
+            'No valid dictionary entries found. Use JSON array [{term, meaning, district, replyStyleHint}] or CSV/TXT lines: term | meaning | district | hint',
+        });
+        return;
+      }
+
+      const added: DictionaryEntry[] = parsed.map((item, idx) => ({
+        ...item,
+        id: sanitizeId(`dict_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`),
+      }));
+
+      dictionaryEntries = [...added, ...dictionaryEntries].slice(0, 2000);
+      persistDictionary();
+      for (const entry of added.slice(0, 50)) {
+        void adminSaveDocument('dictionary_entries', entry.id, {
+          ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+          ...entry,
+        });
+      }
+      pushLog('system', 'Dictionary Upload', `Imported ${added.length} entries from ${fileName}`, 'success');
+      res.json({ importedCount: added.length, added, entries: dictionaryEntries });
+    } catch (err) {
+      res.status(400).json({ error: `Failed to parse file: ${(err as Error).message}` });
+    }
+  });
+
+  app.post('/api/dictionary/starter', (_req, res) => {
+    const existingTerms = new Set(dictionaryEntries.map((d) => d.term.toLowerCase()));
+    const fresh = STARTER_REGIONAL_DICTIONARY.filter((d) => !existingTerms.has(d.term.toLowerCase())).map(
+      (item, idx) => ({
+        ...item,
+        id: sanitizeId(`starter_${Date.now()}_${idx}`),
+      })
+    );
+    dictionaryEntries = [...fresh, ...dictionaryEntries];
+    persistDictionary();
+    pushLog('system', 'Dictionary', `Loaded ${fresh.length} starter 64-district entries.`, 'success');
+    res.json({ importedCount: fresh.length, entries: dictionaryEntries });
+  });
+
+  app.delete('/api/dictionary/:id', (req, res) => {
+    const id = req.params.id;
+    dictionaryEntries = dictionaryEntries.filter((d) => d.id !== id);
+    persistDictionary();
+    void adminDeleteDocument('dictionary_entries', id);
+    res.json({ entries: dictionaryEntries });
+  });
+
+  // --------------------------------------------------------------------------
+  // Chat Memories & Notes for Sir Endpoints
+  // --------------------------------------------------------------------------
+  app.get('/api/assistant/inbox', (_req, res) => {
+    res.json({
+      memories: Object.values(chatMemories).sort(
+        (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
+      ),
+      notes: inboxNotes,
+    });
+  });
+
+  app.delete('/api/memories/:chatId', (req, res) => {
+    const chatId = req.params.chatId;
+    delete chatMemories[chatId];
+    persistMemories();
+    void adminDeleteDocument('chat_memories', chatId);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/notes/:id/toggle', (req, res) => {
+    const id = req.params.id;
+    inboxNotes = inboxNotes.map((n) => (n.id === id ? { ...n, resolved: !n.resolved } : n));
+    persistNotes();
+    const updated = inboxNotes.find((n) => n.id === id);
+    if (updated) {
+      void adminSaveDocument('inbox_notes', id, {
+        ownerId: process.env.FIREBASE_OWNER_UID || 'server_admin',
+        ...updated,
+      });
+    }
+    res.json({ notes: inboxNotes });
+  });
+
+  app.delete('/api/notes/:id', (req, res) => {
+    const id = req.params.id;
+    inboxNotes = inboxNotes.filter((n) => n.id !== id);
+    persistNotes();
+    void adminDeleteDocument('inbox_notes', id);
+    res.json({ notes: inboxNotes });
   });
 
   app.post('/api/antilink/test', (req, res) => {
@@ -673,6 +1557,9 @@ async function bootstrap() {
     });
   });
 
+  // --------------------------------------------------------------------------
+  // Interactive Simulator (Supports Commands + AI Executive Assistant + Takeover)
+  // --------------------------------------------------------------------------
   app.post('/api/simulator/message', async (req, res) => {
     try {
       const body = req.body as SimulatorRequest;
@@ -680,6 +1567,8 @@ async function bootstrap() {
       const chatType = body?.chatType || 'private';
       const senderIsGroupAdmin = Boolean(body?.senderIsGroupAdmin);
       const groupJid = body?.groupJid || '120363041928374655@g.us';
+      const contactJid = body?.contactJid || '8801700000000@s.whatsapp.net';
+      const contactName = body?.contactName || 'Simulator Contact';
 
       if (!text) {
         res.status(400).json({ error: 'Message text cannot be empty.' });
@@ -707,7 +1596,6 @@ async function bootstrap() {
             return;
           }
           if (!botIsAdmin) {
-            pushLog('antilink', 'Simulator Group', `Link detected (${matches[0]}), skipped because bot is not admin`, 'info');
             res.json({
               deleted: false,
               matchedLinks: matches,
@@ -771,7 +1659,6 @@ async function bootstrap() {
             });
             return;
           }
-
           if (!senderIsGroupAdmin && !isSelf) {
             res.json({
               deleted: false,
@@ -781,28 +1668,21 @@ async function bootstrap() {
             });
             return;
           }
-
           const subArgs = argsText.toLowerCase().split(/\s+/);
           if (subArgs[0] === 'delete' && subArgs[1] === 'on') {
             botConfig.antilinkGroups[groupJid] = true;
-            saveConfig(botConfig);
-            pushLog('antilink', groupJid, 'Simulator: .antilink delete on', 'success');
-            const adminNote = botIsAdmin
-              ? ''
-              : '\n\n⚠️ *Note:* Please promote this bot to Group Admin so it can delete link messages.';
+            persistConfig();
             res.json({
               deleted: false,
-              reply: `✅ *Anti-Link Delete Mode is now ON* for this group.${adminNote}`,
+              reply: '✅ *Anti-Link Delete Mode is now ON* for this group.',
               ruleTriggered: 'ANTILINK_ENABLED',
               config: botConfig,
             });
             return;
           }
-
           if (subArgs[0] === 'delete' && subArgs[1] === 'off') {
             botConfig.antilinkGroups[groupJid] = false;
-            saveConfig(botConfig);
-            pushLog('antilink', groupJid, 'Simulator: .antilink delete off', 'info');
+            persistConfig();
             res.json({
               deleted: false,
               reply: '🛑 *Anti-Link Delete Mode is now OFF* for this group.',
@@ -811,10 +1691,9 @@ async function bootstrap() {
             });
             return;
           }
-
           res.json({
             deleted: false,
-            reply: `🛡️ *Anti-Link Status:* ${botConfig.antilinkGroups[groupJid] ? 'ON' : 'OFF'}\nUsage: *${PREFIX}antilink delete on* | *${PREFIX}antilink delete off*`,
+            reply: `🛡️ *Anti-Link Status:* ${botConfig.antilinkGroups[groupJid] ? 'ON' : 'OFF'}`,
             ruleTriggered: 'ANTILINK_STATUS',
             config: botConfig,
           });
@@ -825,12 +1704,11 @@ async function bootstrap() {
           const mode = argsText.toLowerCase();
           if (mode === 'on') {
             botConfig.autoreply = true;
-            saveConfig(botConfig);
+            persistConfig();
             pushLog('autoreply', 'Simulator', 'Executed .autoreply on', 'success');
             res.json({
               deleted: false,
-              reply:
-                '✅ *Private Auto-Reply Assistant is now ON.*\nIncoming private DMs will receive the automated Bengali reply.',
+              reply: '✅ *Private Auto-Reply Assistant is now ON.*',
               ruleTriggered: 'AUTOREPLY_ENABLED',
               config: botConfig,
             });
@@ -838,7 +1716,7 @@ async function bootstrap() {
           }
           if (mode === 'off') {
             botConfig.autoreply = false;
-            saveConfig(botConfig);
+            persistConfig();
             pushLog('autoreply', 'Simulator', 'Executed .autoreply off', 'info');
             res.json({
               deleted: false,
@@ -848,12 +1726,6 @@ async function bootstrap() {
             });
             return;
           }
-          res.json({
-            deleted: false,
-            reply: `🤖 *Auto-Reply Status:* ${botConfig.autoreply ? 'ON' : 'OFF'}\nUsage: *${PREFIX}autoreply on* | *${PREFIX}autoreply off*`,
-            ruleTriggered: 'AUTOREPLY_STATUS',
-            config: botConfig,
-          });
           return;
         }
 
@@ -877,8 +1749,8 @@ async function bootstrap() {
               `*${PREFIX}gemini <query>* — Ask Gemini AI`,
               `*${PREFIX}antilink delete on* — Enable group link deletion`,
               `*${PREFIX}antilink delete off* — Disable group link deletion`,
-              `*${PREFIX}autoreply on* — Enable private DM Bengali assistant`,
-              `*${PREFIX}autoreply off* — Disable private DM assistant`,
+              `*${PREFIX}autoreply on* — Enable private AI assistant`,
+              `*${PREFIX}autoreply off* — Disable private AI assistant`,
               `*${PREFIX}ping* — Check bot responsiveness`,
             ].join('\n'),
             ruleTriggered: 'HELP',
@@ -897,14 +1769,26 @@ async function bootstrap() {
         return;
       }
 
-      // 3. Automated Private Inbox Assistant (Bengali)
+      // 3. Automated Private Inbox Assistant
       if (botConfig.autoreply) {
         if (chatType === 'private') {
-          pushLog('autoreply', 'Simulator DM', 'Triggered Bengali private auto-reply', 'success');
+          const { replyText, detectedDistrict, noteCreated } = await runExecutiveAssistantTurn({
+            contactJid,
+            contactName,
+            incomingText: text,
+          });
+          pushLog(
+            'autoreply',
+            'Simulator DM',
+            `Replied (${botConfig.aiAssistantEnabled ? `AI · ${detectedDistrict}` : 'Static'})`,
+            'success'
+          );
           res.json({
             deleted: false,
-            reply: BENGALI_AUTOREPLY_TEXT,
-            ruleTriggered: 'BENGALI_AUTOREPLY',
+            reply: replyText,
+            detectedDistrict,
+            noteCreated,
+            ruleTriggered: botConfig.aiAssistantEnabled ? 'AI_EXECUTIVE_ASSISTANT' : 'STATIC_AUTOREPLY',
             config: botConfig,
           });
           return;
@@ -914,7 +1798,7 @@ async function bootstrap() {
           res.json({
             deleted: false,
             reply: null,
-            note: 'Auto-reply skipped: Message-to-self / fromMe messages are excluded.',
+            note: 'Auto-reply skipped: Message-to-self / fromMe messages are excluded (triggers human takeover pause in live chats).',
             ruleTriggered: 'AUTOREPLY_SKIPPED_SELF',
             config: botConfig,
           });
@@ -936,7 +1820,7 @@ async function bootstrap() {
       res.json({
         deleted: false,
         reply: null,
-        note: 'No command, link violation, or active auto-reply rule matched.',
+        note: 'No command, link violation, or active auto-reply rule matched. Enable .autoreply on to test the AI assistant.',
         ruleTriggered: 'NO_OP',
         config: botConfig,
       });
@@ -983,22 +1867,26 @@ async function bootstrap() {
     console.log(`[WaNexus] Control Plane & Bot Studio running on http://0.0.0.0:${PORT}`);
 
     // Automatically resume an already-paired WhatsApp session on startup
-    const credsPath = path.join(AUTH_DIR, 'creds.json');
-    if (fs.existsSync(credsPath)) {
-      try {
-        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-        if (creds?.registered) {
-          pushLog('pairing', 'Baileys', 'Resuming existing WhatsApp session...', 'info');
-          startBaileysConnection().catch((err) => {
-            lastBotError = (err as Error).message;
-            botStatus = 'disconnected';
-            pushLog('pairing', 'Baileys', `Auto-resume failed: ${lastBotError}`, 'error');
-          });
+    restoreCredsFromCloudIfMissing()
+      .then(() => {
+        const credsPath = path.join(AUTH_DIR, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+          try {
+            const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+            if (creds?.registered) {
+              pushLog('pairing', 'Baileys', 'Resuming existing WhatsApp session...', 'info');
+              startBaileysConnection().catch((err) => {
+                lastBotError = (err as Error).message;
+                botStatus = 'disconnected';
+                pushLog('pairing', 'Baileys', `Auto-resume failed: ${lastBotError}`, 'error');
+              });
+            }
+          } catch {
+            // ignore malformed creds.json
+          }
         }
-      } catch {
-        // ignore malformed creds.json
-      }
-    }
+      })
+      .catch(() => {});
   });
 }
 

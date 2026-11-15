@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Send, Trash2 } from 'lucide-react';
+import { authFetch } from '../lib/api';
 import type { BotConfig } from '../types';
 
 type ChatContext = 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self';
@@ -26,12 +27,15 @@ const CONTEXT_OPTIONS: { id: ChatContext; label: string }[] = [
 ];
 
 const QUICK_COMMANDS = [
+  '.autoreply on',
+  'আসসালামু আলাইকুম, স্যার কি আছেন?',
+  'গুড নাইট, আমার এখনো সকাল হয় নাই!',
+  'তুমি ওনার অ্যাসিস্ট্যান্ট, কেমন আছো? তোমার স্যার কী করেন, কোথায় থাকেন?',
+  'আমার একটা ফ্ল্যাট বা রুম ম্যানেজ করে দিতে পারবা?',
+  'কেনে আছো ভাই? কিতা খবর?',
   '.ai একটি হোয়াটসঅ্যাপ গ্রুপ নিরাপদ রাখার ৩টি উপায় বলো',
-  '.gemini একটি সুন্দর বাংলা শুভেচ্ছা বার্তা লিখে দাও',
   '.antilink delete on',
   'আমাদের চ্যানেলে জয়েন করুন https://t.me/example_channel',
-  '.autoreply on',
-  'আসসালামু আলাইকুম, ভাই কেমন আছেন?',
 ];
 
 export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorProps) {
@@ -65,7 +69,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
     setIsSending(true);
 
     try {
-      const res = await fetch('/api/simulator/message', {
+      const res = await authFetch('/api/simulator/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
