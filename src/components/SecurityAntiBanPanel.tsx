@@ -253,9 +253,9 @@ export function SecurityAntiBanPanel({
 
           <div className="flex items-center justify-between gap-4">
             <div>
-              <div className="text-sm font-medium text-slate-900">Human Typing &amp; Reading Simulation</div>
+              <div className="text-sm font-medium text-slate-900">Instant Typing &amp; Read Presence</div>
               <div className="text-xs text-slate-500">
-                2.6s multi-message coalescing, 1.2–2.5s read delay, composing indicator proportional to text length, and queued reply pacing.
+                Sends read receipt and composing indicator in parallel while AI generates in milliseconds—zero artificial pause added.
               </div>
             </div>
             <button

@@ -76,7 +76,7 @@ const DEFAULT_STATUS: BotStatusResponse = {
     ownerBoundaries:
       'স্যার বাসা/ফ্ল্যাট/রুম ভাড়া বা মেস খোঁজার কাজ করেন না। টাকা ধার দেওয়া, অজানা বিনিয়োগ বা অপ্রাসঙ্গিক ব্যক্তিগত অনুরোধ স্যার গ্রহণ করেন না—কেউ এসব চাইলে ভদ্রভাবে না করে দেবেন।',
     assistantTone: 'witty_flirty',
-    cooldownMs: 3000,
+    cooldownMs: 0,
     takeoverPauseMs: 1800000,
     humanTypingEnabled: true,
     dailyReplyLimit: 120,

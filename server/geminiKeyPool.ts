@@ -19,6 +19,10 @@ export interface KeyRotationEvent {
   reason: string;
 }
 
+export interface RotationOptions {
+  maxTotalMs?: number;
+}
+
 function isRealApiKey(candidate: string | undefined | null): candidate is string {
   if (!candidate) return false;
   const trimmed = candidate.trim();
@@ -61,6 +65,7 @@ export function collectConfiguredGeminiKeys(): string[] {
 
 export class GeminiKeyPool {
   private readonly clients: GoogleGenAI[];
+  private readonly cooldownUntil: number[];
   private activeIndex = 0;
   private lastRotationReason: string | null = null;
   private lastRotatedAt: string | null = null;
@@ -77,6 +82,7 @@ export class GeminiKeyPool {
           },
         })
     );
+    this.cooldownUntil = new Array(this.clients.length).fill(0);
   }
 
   public hasKeys(): boolean {
@@ -96,31 +102,67 @@ export class GeminiKeyPool {
    * Executes a Gemini API task using the current active key slot.
    * On any quota/rate-limit/API error, automatically rotates sequentially
    * through Key #1 -> #2 -> #3 -> #4 -> #5 and wraps back around to Key #1.
+   * Skips keys currently in short failure cooldown unless all keys are cooled down,
+   * and enforces a hard total time budget so replies never stall.
    */
   public async executeWithRotation<T>(
     task: (ai: GoogleGenAI, keySlot: number) => Promise<T>,
-    onRotate?: (event: KeyRotationEvent) => void
+    onRotate?: (event: KeyRotationEvent) => void,
+    options?: RotationOptions
   ): Promise<GeminiExecutionResult<T>> {
     const total = this.clients.length;
     if (total === 0) {
       throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
     }
 
+    const now = Date.now();
+    const maxTotalMs = options?.maxTotalMs ?? 9_000;
+    const deadline = now + maxTotalMs;
+
+    // Build ordered candidate indices starting from activeIndex, prioritizing non-cooled-down slots
     const startIdx = this.activeIndex % total;
+    const readyOrder: number[] = [];
+    const cooledOrder: number[] = [];
+
+    for (let offset = 0; offset < total; offset += 1) {
+      const idx = (startIdx + offset) % total;
+      if (this.cooldownUntil[idx] <= now) {
+        readyOrder.push(idx);
+      } else {
+        cooledOrder.push(idx);
+      }
+    }
+
+    const attemptOrder = readyOrder.length > 0 ? readyOrder : cooledOrder;
     let lastError: Error = new Error('Unknown Gemini API error');
 
-    for (let attempt = 0; attempt < total; attempt += 1) {
-      const idx = (startIdx + attempt) % total;
+    for (let i = 0; i < attemptOrder.length; i += 1) {
+      if (i > 0 && Date.now() >= deadline) {
+        break;
+      }
+
+      const idx = attemptOrder[i];
       const keySlot = idx + 1;
 
       try {
         const value = await task(this.clients[idx], keySlot);
-        // Keep activeIndex pinned on the healthy key that succeeded
+        // Keep activeIndex pinned on the healthy key that succeeded and clear its cooldown
         this.activeIndex = idx;
+        this.cooldownUntil[idx] = 0;
         return { value, keySlot };
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         lastError = err instanceof Error ? err : new Error(reason);
+
+        // Apply short cooldown on failing key so subsequent messages don't stall re-testing it
+        const lowerReason = reason.toLowerCase();
+        const isHardAuthError =
+          lowerReason.includes('api_key_invalid') ||
+          lowerReason.includes('permission_denied') ||
+          lowerReason.includes('403') ||
+          lowerReason.includes('401');
+        const cooldownMs = isHardAuthError ? 120_000 : 20_000;
+        this.cooldownUntil[idx] = Date.now() + cooldownMs;
 
         const nextIdx = (idx + 1) % total;
         this.activeIndex = nextIdx;
@@ -138,8 +180,13 @@ export class GeminiKeyPool {
       }
     }
 
-    // All keys exhausted in this cycle -> wrap cycle cleanly back to Key #1 for the next cycle
+    // All attempted keys failed -> wrap cycle cleanly back to Key #1 for the next cycle
     this.activeIndex = 0;
+    for (let i = 0; i < this.cooldownUntil.length; i += 1) {
+      if (this.cooldownUntil[i] <= Date.now() + 20_000) {
+        this.cooldownUntil[i] = 0;
+      }
+    }
     throw new Error(
       `All ${total} Gemini API key(s) failed in this rotation cycle. Last error: ${lastError.message}`
     );

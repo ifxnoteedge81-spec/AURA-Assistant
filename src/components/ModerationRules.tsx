@@ -146,7 +146,8 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
               className="px-3 py-2 text-xs font-medium bg-white border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
               aria-label="Cooldown interval"
             >
-              <option value={0}>No Cooldown</option>
+              <option value={0}>Instant (No Cooldown)</option>
+              <option value={3000}>3s Cooldown</option>
               <option value={30000}>30s Cooldown</option>
               <option value={60000}>60s Cooldown</option>
               <option value={300000}>5m Cooldown</option>

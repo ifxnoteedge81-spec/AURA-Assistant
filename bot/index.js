@@ -37,7 +37,7 @@ const PREFIX = '.';
 const AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info_baileys');
 const CONFIG_FILE = path.resolve('./bot-config.json');
 const PORT = Number(process.env.PORT || 3000);
-const AUTOREPLY_COOLDOWN_MS = Number(process.env.AUTOREPLY_COOLDOWN_MS || 60_000);
+const AUTOREPLY_COOLDOWN_MS = Number(process.env.AUTOREPLY_COOLDOWN_MS || 0);
 
 // Exact Bengali auto-reply message required for private inbox assistant
 const BENGALI_AUTOREPLY_TEXT =
@@ -290,19 +290,24 @@ async function askGemini(query) {
   const total = aiClients.length;
   const startIdx = activeAiKeyIndex % total;
   let lastError = null;
+  const deadline = Date.now() + 9_000;
 
   for (let attempt = 0; attempt < total; attempt += 1) {
+    if (attempt > 0 && Date.now() >= deadline) break;
     const idx = (startIdx + attempt) % total;
     try {
-      const response = await aiClients[idx].models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: query,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          systemInstruction:
-            'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
-        },
-      });
+      const response = await Promise.race([
+        aiClients[idx].models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: query,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            systemInstruction:
+              'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
+          },
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout after 5000ms')), 5_000)),
+      ]);
       activeAiKeyIndex = idx;
       const text = response?.text?.trim();
       return text || 'I could not generate a response for that query. Please try rephrasing.';

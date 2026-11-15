@@ -91,7 +91,7 @@ export function PairingOverview({
             {botState.geminiConfigured ? 'Ready' : 'API Key Missing'}
           </div>
           <div className="mt-1 text-xs text-slate-500 font-mono">
-            .ai &middot; .gemini (gemini-4-hydrogen)
+            .ai &middot; .gemini (gemini-3.1-flash-lite)
           </div>
         </div>
 

@@ -165,7 +165,6 @@ export function parseUploadedDictionary(
   const trimmed = rawText.trim();
   if (!trimmed) return [];
 
-  // 1. JSON array or object format
   if (lowerName.endsWith('.json') || trimmed.startsWith('[') || trimmed.startsWith('{')) {
     const parsed = JSON.parse(trimmed);
     const items = Array.isArray(parsed) ? parsed : Array.isArray(parsed.entries) ? parsed.entries : [parsed];
@@ -193,7 +192,6 @@ export function parseUploadedDictionary(
     return results;
   }
 
-  // 2. CSV or Pipe/Tab-delimited TXT lines
   const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const results: Array<Omit<DictionaryEntry, 'id'>> = [];
 
@@ -201,7 +199,6 @@ export function parseUploadedDictionary(
     const line = lines[i];
     if (line.startsWith('#') || line.startsWith('//')) continue;
 
-    // Detect delimiter: pipe '|', tab '\t', or comma ','
     let parts: string[];
     if (line.includes('|')) {
       parts = line.split('|').map((s) => s.trim());
@@ -211,7 +208,6 @@ export function parseUploadedDictionary(
       parts = line.split(',').map((s) => s.trim().replace(/^["']|["']$/g, ''));
     }
 
-    // Skip CSV header row
     if (
       i === 0 &&
       parts[0]?.toLowerCase().includes('term') &&
@@ -257,7 +253,7 @@ export function findRelevantDictionaryEntries(
     const hits = subTerms.some((token) => lower.includes(token));
     if (hits) {
       matched.push(entry);
-      if (matched.length >= 8) break;
+      if (matched.length >= 5) break;
     }
   }
   return matched;
@@ -266,13 +262,13 @@ export function findRelevantDictionaryEntries(
 function getToneInstruction(tone: AssistantTone): string {
   switch (tone) {
     case 'witty_flirty':
-      return 'Friendly, charming, playfully witty, and lightly flirtatious/bantering when appropriate (while staying classy, respectful, and never offensive). Match the user’s playful energy—if they tease or joke (like saying Good Night when you said Good Morning), banter back smoothly while reminding them Sir is away and you are holding the fort.';
+      return 'Friendly, charming, playfully witty, lightly flirtatious/bantering when appropriate (always classy and respectful).';
     case 'warm_polite':
-      return 'Warm, welcoming, humble, and helpful in natural Bengali/Banglish/English matching the sender.';
+      return 'Warm, welcoming, humble, and helpful in natural Bengali/Banglish/English.';
     case 'executive_formal':
-      return 'Crisp, respectful, executive assistant demeanor—concise, polite, and business-focused.';
+      return 'Crisp, respectful, executive assistant demeanor—concise and business-focused.';
     case 'sharp_shut_down':
-      return 'Confident, sharp-tongued, and firm—politely but decisively shut down time-wasters, boundary-crossers, or pushy requests without tolerating nonsense.';
+      return 'Confident, sharp-tongued, and firm—politely shut down time-wasters or boundary-crossers.';
   }
 }
 
@@ -340,7 +336,7 @@ export async function generateExecutiveAssistantReply(params: {
   const existingTurns = memory?.turns || [];
   const recentAssistantReplies = existingTurns
     .filter((t) => t.role === 'assistant')
-    .slice(-6)
+    .slice(-4)
     .map((t) => t.text);
 
   const canUseAi = Boolean(keyPool?.hasKeys() || ai);
@@ -357,135 +353,77 @@ export async function generateExecutiveAssistantReply(params: {
   const lastTurnTime = existingTurns.length > 0 ? Date.parse(existingTurns[existingTurns.length - 1].timestamp) : 0;
   const isNewSession = existingTurns.length === 0 || (lastTurnTime > 0 && Date.now() - lastTurnTime > 6 * 3600 * 1000);
 
-  // Only inject dictionary entries that actually match the incoming message so unrelated hints do not override AI
   const matchedDict = findRelevantDictionaryEntries(incomingText, dictionaryEntries);
 
   const systemInstruction = [
-    `You are the smart, natural 24/7 WhatsApp Personal Assistant acting on behalf of "${settings.ownerName || 'Sir'}".`,
-    `Sir's Profession: ${settings.ownerProfession || 'Not specified'}.`,
-    `Sir's Location: ${settings.ownerLocation || 'Bangladesh'}.`,
-    `Positive Bio about Sir (use naturally if asked about Sir): ${settings.ownerBio || DEFAULT_OWNER_BIO}`,
-    `Strict Boundaries (Things Sir DOES NOT do — refuse politely & firmly if asked): ${settings.ownerBoundaries || DEFAULT_OWNER_BOUNDARIES}`,
-    `Personality & Tone: ${getToneInstruction(settings.assistantTone)}`,
-    '',
+    `You are the fast, natural 24/7 WhatsApp Personal Assistant for "${settings.ownerName || 'Sir'}" (${settings.ownerProfession || 'Professional'}, ${settings.ownerLocation || 'Bangladesh'}).`,
+    `Bio: ${settings.ownerBio || DEFAULT_OWNER_BIO}`,
+    `Boundaries (refuse politely if asked): ${settings.ownerBoundaries || DEFAULT_OWNER_BOUNDARIES}`,
+    `Tone: ${getToneInstruction(settings.assistantTone)}`,
     isNewSession
-      ? `FIRST MESSAGE RULE: This is a fresh conversation while Sir is away/busy. Write a completely natural, human-sounding reply tailored to what the contact actually wrote. Briefly let them know Sir is unavailable/offline and you are his personal assistant taking messages (general vibe inspiration only — DO NOT copy word-for-word: "${settings.firstGreetingTemplate || DEFAULT_FIRST_GREETING}").`
-      : `ONGOING CONVERSATION RULE: You already introduced yourself earlier. Do NOT repeat "Sir is busy/offline" boilerplate unless they specifically ask where Sir is. Respond directly and naturally to their latest message.`,
-    '',
-    'ANTI-REPETITION & NATURALNESS RULE (CRITICAL):',
-    '- NEVER copy static boilerplate templates word-for-word. Always compose a fresh, contextual, conversational response.',
-    '- NEVER repeat the exact same SMS or sentence you already sent earlier to this contact.',
+      ? `First reply: mention briefly in a fresh human way (do NOT copy word-for-word: "${settings.firstGreetingTemplate || DEFAULT_FIRST_GREETING}") that Sir is busy/away and you are taking messages, while directly answering their message.`
+      : 'Ongoing chat: respond directly to the latest message without repeating boilerplate.',
+    'Rules: Match sender language/script (Bengali/Banglish/English) & dialect naturally. Reply in 1–2 crisp WhatsApp sentences. Never reuse earlier replies verbatim.',
     recentAssistantReplies.length > 0
-      ? `Previous replies you ALREADY sent to this contact (NEVER reuse these sentences):\n${recentAssistantReplies
-          .map((r, i) => `${i + 1}. "${r}"`)
-          .join('\n')}`
+      ? `Avoid repeating:\n${recentAssistantReplies.map((r) => `- "${r}"`).join('\n')}`
       : '',
-    '',
-    'LANGUAGE & 64-DISTRICT DIALECT RULE:',
-    '- Reply in the exact language/script/style the sender used (Bengali script, Banglish/Roman Bengali, or English).',
-    '- If the sender uses a regional Bangladesh dialect, match its friendly local warmth naturally without forcing unrelated phrases.',
     matchedDict.length > 0
-      ? `Matched Regional Dictionary Context for this message:\n${matchedDict
-          .map(
-            (d) =>
-              `• [${d.district}] "${d.term}" => ${d.meaning}${d.replyStyleHint ? ` (Local flavor: ${d.replyStyleHint})` : ''}`
-          )
+      ? `Dialect cues:\n${matchedDict
+          .map((d) => `• [${d.district}] "${d.term}"=${d.meaning}${d.replyStyleHint ? ` (${d.replyStyleHint})` : ''}`)
           .join('\n')}`
       : '',
-    '',
-    'NOTE-TAKING RULE:',
-    '- If the sender asks Sir to call back, leaves a concrete message, proposes work/meeting, or shares something important Sir should know, write a concise 1-sentence summary in `noteSummary`. For casual greetings or small talk, leave `noteSummary` as an empty string "".',
-    '- Keep `replyText` crisp (1–3 sentences max), natural for WhatsApp, and never invent false facts about Sir.',
+    'Set `noteSummary` to a 1-sentence note only for callbacks/work/important info (else "").',
   ]
     .filter(Boolean)
     .join('\n');
 
   const historyLines = existingTurns
-    .slice(-10)
-    .map((t) => `${t.role === 'user' ? contactName || 'Contact' : 'Assistant'}: ${t.text}`)
+    .slice(-6)
+    .map((t) => `${t.role === 'user' ? contactName || 'User' : 'AI'}: ${t.text}`)
     .join('\n');
 
   const promptContent = historyLines
-    ? `Recent Conversation History:\n${historyLines}\n\nLatest incoming message from ${contactName || 'Contact'}:\n"${incomingText}"`
-    : `Incoming message from ${contactName || 'Contact'}:\n"${incomingText}"`;
+    ? `History:\n${historyLines}\n${contactName || 'User'}: "${incomingText}"`
+    : `${contactName || 'User'}: "${incomingText}"`;
 
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      replyText: {
-        type: Type.STRING,
-        description: 'Natural WhatsApp reply to send back to the contact.',
-      },
-      detectedDistrict: {
-        type: Type.STRING,
-        description: 'Detected Bangladesh district dialect or Standard/English.',
-      },
-      noteSummary: {
-        type: Type.STRING,
-        description: 'Concise 1-sentence note for Sir if the contact left a real message/request, else empty string.',
-      },
-      noteUrgency: {
-        type: Type.STRING,
-        description: 'Either "normal" or "important".',
-      },
+      replyText: { type: Type.STRING },
+      detectedDistrict: { type: Type.STRING },
+      noteSummary: { type: Type.STRING },
+      noteUrgency: { type: Type.STRING },
     },
     required: ['replyText', 'detectedDistrict', 'noteSummary', 'noteUrgency'],
   };
 
-  const runGenerate = async (contents: string, timeoutMs: number) => {
-    const exec = async (client: GoogleGenAI) =>
-      withTimeout(
-        client.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents,
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema,
-          },
-        }),
-        timeoutMs,
-        'Executive Assistant Gemini call'
-      );
+  // Ultra-low-latency call using gemini-3.1-flash-lite + ThinkingLevel.MINIMAL (zero thinking delay)
+  const exec = async (client: GoogleGenAI) =>
+    withTimeout(
+      client.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: promptContent,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          responseMimeType: 'application/json',
+          responseSchema,
+        },
+      }),
+      4_000,
+      'Instant Assistant Gemini call'
+    );
 
-    if (keyPool && keyPool.hasKeys()) {
-      return keyPool.executeWithRotation(exec, onKeyRotate);
-    }
-    if (!ai) {
-      throw new Error('No Gemini client available.');
-    }
-    return { value: await exec(ai), keySlot: 1 };
-  };
-
-  const { value: response, keySlot } = await runGenerate(promptContent, 20_000);
-  let activeSlot = keySlot;
+  const { value: response, keySlot } =
+    keyPool && keyPool.hasKeys()
+      ? await keyPool.executeWithRotation(exec, onKeyRotate, { maxTotalMs: 8_000 })
+      : { value: await exec(ai!), keySlot: 1 };
 
   const rawJson = extractJsonObject(response.text || '{}');
-  let parsed = JSON.parse(rawJson) as Partial<AssistantGenerationResult>;
+  const parsed = JSON.parse(rawJson) as Partial<AssistantGenerationResult>;
   let replyText = parsed.replyText?.trim() || '';
 
   const prevSet = new Set(recentAssistantReplies.map(normalizeForComparison));
-  if (!replyText || prevSet.has(normalizeForComparison(replyText))) {
-    // Re-prompt once if Gemini generated an exact duplicate
-    const { value: retryResponse, keySlot: retrySlot } = await runGenerate(
-      `${promptContent}\n\nIMPORTANT: Your previous draft "${replyText}" was already sent earlier to this contact. Write a completely DIFFERENT, fresh, natural reply without reusing the same wording.`,
-      15_000
-    );
-    activeSlot = retrySlot;
-    try {
-      const retryParsed = JSON.parse(
-        extractJsonObject(retryResponse.text || '{}')
-      ) as Partial<AssistantGenerationResult>;
-      if (retryParsed.replyText?.trim() && !prevSet.has(normalizeForComparison(retryParsed.replyText))) {
-        parsed = retryParsed;
-        replyText = retryParsed.replyText.trim();
-      }
-    } catch {
-      // fall through to safe fallback below
-    }
-  }
-
   let usedFallback = false;
   if (!replyText || prevSet.has(normalizeForComparison(replyText))) {
     replyText = pickNonRepeatingFallback(settings.autoreplyMessage, recentAssistantReplies);
@@ -498,6 +436,6 @@ export async function generateExecutiveAssistantReply(params: {
     noteSummary: parsed.noteSummary?.trim() || '',
     noteUrgency: parsed.noteUrgency === 'important' ? 'important' : 'normal',
     usedFallback,
-    keySlotUsed: activeSlot,
+    keySlotUsed: keySlot,
   };
 }

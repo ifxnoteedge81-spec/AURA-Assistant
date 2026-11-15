@@ -125,7 +125,7 @@ function defaultConfig(): BotConfig {
     ownerBio: DEFAULT_OWNER_BIO,
     ownerBoundaries: DEFAULT_OWNER_BOUNDARIES,
     assistantTone: 'witty_flirty',
-    cooldownMs: 3000,
+    cooldownMs: 0,
     takeoverPauseMs: 30 * 60 * 1000,
     humanTypingEnabled: true,
     dailyReplyLimit: 120,
@@ -150,6 +150,12 @@ function saveJsonFile(filePath: string, data: unknown) {
   } catch (err) {
     console.error(`[Storage] Failed writing ${path.basename(filePath)}:`, err);
   }
+}
+
+function saveJsonFileAsync(filePath: string, data: unknown) {
+  void fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8').catch((err) => {
+    console.error(`[Storage] Failed async writing ${path.basename(filePath)}:`, err);
+  });
 }
 
 function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
@@ -205,15 +211,15 @@ function persistConfig() {
 }
 
 function persistDictionary() {
-  saveJsonFile(DICTIONARY_FILE, dictionaryEntries);
+  saveJsonFileAsync(DICTIONARY_FILE, dictionaryEntries);
 }
 
 function persistMemories() {
-  saveJsonFile(MEMORIES_FILE, chatMemories);
+  saveJsonFileAsync(MEMORIES_FILE, chatMemories);
 }
 
 function persistNotes() {
-  saveJsonFile(NOTES_FILE, inboxNotes);
+  saveJsonFileAsync(NOTES_FILE, inboxNotes);
 }
 
 const eventLogs: BotLogEntry[] = [];
@@ -222,16 +228,8 @@ const autoReplyCooldowns = new Map<string, number>();
 const ownerTakeoverUntil = new Map<string, number>();
 const botSentMessageIds = new Set<string>();
 
-interface PendingDmBuffer {
-  texts: string[];
-  lastMsg: WAMessage;
-  contactName: string;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-const pendingDmBuffers = new Map<string, PendingDmBuffer>();
 const chatReplyQueues = new Map<string, Promise<void>>();
-const MAX_CONCURRENT_REPLIES = 5;
+const MAX_CONCURRENT_REPLIES = 8;
 let activeReplyWorkers = 0;
 const replySlotWaiters: Array<() => void> = [];
 
@@ -243,10 +241,6 @@ let credsBackupTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
-function randomBetween(minMs: number, maxMs: number): number {
-  return minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs));
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -338,8 +332,6 @@ function enqueuePrivateReply(chatJid: string, task: () => Promise<void>) {
       } finally {
         releaseReplySlot();
       }
-      // Natural pacing gap per conversation without blocking other contacts
-      await sleep(randomBetween(500, 1000));
     })
     .catch((err) => {
       pushLog('autoreply', 'Reply Queue', `Queue error: ${(err as Error).message}`, 'error');
@@ -489,15 +481,15 @@ async function askGemini(query: string): Promise<string> {
     (client) =>
       withTimeout(
         client.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model: 'gemini-3.1-flash-lite',
           contents: query,
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             systemInstruction:
               'You are a helpful, concise, and intelligent WhatsApp AI assistant. Format responses cleanly for mobile reading using plain text or simple WhatsApp formatting (*bold*, _italic_, bullet points). Keep answers accurate and easy to read.',
           },
         }),
-        20_000,
+        5_000,
         'Gemini .ai command'
       ),
     (rot) => {
@@ -507,7 +499,8 @@ async function askGemini(query: string): Promise<string> {
         `Rotated Gemini key (${rot.fromSlot}/${rot.totalSlots} -> ${rot.toSlot}/${rot.totalSlots}): ${rot.reason.slice(0, 90)}`,
         'info'
       );
-    }
+    },
+    { maxTotalMs: 9_000 }
   );
 
   const text = response?.text?.trim();
@@ -669,12 +662,6 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     const msgId = msg.key.id;
     const isCommand = text.startsWith(PREFIX);
     if (msgId && !botSentMessageIds.has(msgId) && !isCommand && text) {
-      // Cancel any buffered incoming DM reply waiting to send to this contact
-      const pending = pendingDmBuffers.get(remoteJid);
-      if (pending) {
-        clearTimeout(pending.timer);
-        pendingDmBuffers.delete(remoteJid);
-      }
       if (botConfig.takeoverPauseMs > 0) {
         ownerTakeoverUntil.set(remoteJid, Date.now() + botConfig.takeoverPauseMs);
         pushLog(
@@ -886,99 +873,68 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
     const contactName = msg.pushName || senderDigits || 'Contact';
 
-    // Coalesce rapid consecutive lines from the same contact (~2.6s) before replying
-    const existingBuffer = pendingDmBuffers.get(remoteJid);
-    if (existingBuffer) {
-      clearTimeout(existingBuffer.timer);
-      existingBuffer.texts.push(text);
-      existingBuffer.lastMsg = msg;
-      existingBuffer.contactName = contactName;
-    }
+    // Instant zero-delay enqueue: start AI generation immediately on message arrival
+    enqueuePrivateReply(remoteJid, async () => {
+      if (!botConfig.autoreply || currentSocket !== sock) return;
 
-    const texts = existingBuffer ? existingBuffer.texts : [text];
-    const debounceMs = botConfig.humanTypingEnabled ? 1200 : 300;
+      const latestPausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
+      if (Date.now() < latestPausedUntil) return;
 
-    const timer = setTimeout(() => {
-      const finalized = pendingDmBuffers.get(remoteJid);
-      pendingDmBuffers.delete(remoteJid);
-      if (!finalized) return;
+      const daily = getDailyReplyStats();
+      if (daily.count >= daily.limit) {
+        pushLog(
+          'autoreply',
+          contactName,
+          `Daily safety cap (${daily.limit} replies/day) reached; auto-reply skipped.`,
+          'blocked'
+        );
+        return;
+      }
 
-      const combinedText = finalized.texts.join('\n').trim();
-      const targetMsg = finalized.lastMsg;
-
-      enqueuePrivateReply(remoteJid, async () => {
-        if (!botConfig.autoreply || currentSocket !== sock) return;
-
-        // Re-check takeover pause in case owner started typing while buffered/queued
-        const latestPausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
-        if (Date.now() < latestPausedUntil) return;
-
-        // Enforce daily safety cap to protect WhatsApp account from automated spam flags
-        const daily = getDailyReplyStats();
-        if (daily.count >= daily.limit) {
-          pushLog(
-            'autoreply',
-            finalized.contactName,
-            `Daily safety cap (${daily.limit} replies/day) reached; auto-reply skipped.`,
-            'blocked'
-          );
-          return;
-        }
-
+      if (botConfig.cooldownMs > 0) {
         autoReplyCooldowns.set(remoteJid, Date.now());
+      }
 
-        try {
-          if (botConfig.humanTypingEnabled) {
-            await sleep(randomBetween(350, 850));
-            await sock.readMessages([targetMsg.key]).catch(() => {});
-          }
+      // Fire read receipt & typing indicator in parallel so they add 0ms to reply latency
+      if (botConfig.humanTypingEnabled) {
+        void sock.readMessages([msg.key]).catch(() => {});
+        void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+      }
 
-          const { replyText, detectedDistrict, usedFallback, keySlotUsed, fallbackReason } =
-            await runExecutiveAssistantTurn({
-              contactJid: remoteJid,
-              contactName: finalized.contactName,
-              incomingText: combinedText,
-            });
+      try {
+        const startedAt = Date.now();
+        const { replyText, detectedDistrict, usedFallback, keySlotUsed, fallbackReason } =
+          await runExecutiveAssistantTurn({
+            contactJid: remoteJid,
+            contactName,
+            incomingText: text,
+          });
 
-          if (botConfig.humanTypingEnabled) {
-            await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-            const typingMs = Math.min(2800, Math.max(900, replyText.length * 16 + randomBetween(150, 450)));
-            await sleep(typingMs);
-            await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-          }
+        if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
 
-          // Check takeover one final time right before sending
-          if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
+        const shouldQuote = Math.random() < 0.45;
+        await sendTrackedMessage(
+          sock,
+          remoteJid,
+          { text: replyText },
+          shouldQuote ? { quoted: msg } : undefined
+        );
 
-          // Vary quoting naturally (~45% quoted) rather than quoting 100% robotically
-          const shouldQuote = finalized.texts.length > 1 || Math.random() < 0.45;
-          await sendTrackedMessage(
-            sock,
-            remoteJid,
-            { text: replyText },
-            shouldQuote ? { quoted: targetMsg } : undefined
-          );
-
-          dailyReplyCount += 1;
-          pushLog(
-            'autoreply',
-            finalized.contactName,
-            usedFallback
-              ? `Static Fallback (${fallbackReason || 'Static Mode'})`
-              : `Replied (AI Key #${keySlotUsed || 1} · ${detectedDistrict})`,
-            usedFallback ? 'info' : 'success'
-          );
-        } finally {
-          await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+        const elapsedMs = Date.now() - startedAt;
+        dailyReplyCount += 1;
+        pushLog(
+          'autoreply',
+          contactName,
+          usedFallback
+            ? `Static Fallback (${fallbackReason || 'Static Mode'} · ${elapsedMs}ms)`
+            : `Instant AI Key #${keySlotUsed || 1} (${detectedDistrict} · ${elapsedMs}ms)`,
+          usedFallback ? 'info' : 'success'
+        );
+      } finally {
+        if (botConfig.humanTypingEnabled) {
+          void sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
         }
-      });
-    }, debounceMs);
-
-    pendingDmBuffers.set(remoteJid, {
-      texts,
-      lastMsg: msg,
-      contactName,
-      timer,
+      }
     });
   }
 }
@@ -2173,11 +2129,6 @@ async function bootstrap() {
     if (selfPingWarmupTimer) clearTimeout(selfPingWarmupTimer);
     if (selfPingRetryTimer) clearTimeout(selfPingRetryTimer);
     clearInterval(cleanupTimer);
-
-    for (const pending of pendingDmBuffers.values()) {
-      clearTimeout(pending.timer);
-    }
-    pendingDmBuffers.clear();
 
     if (currentSocket) {
       try {
