@@ -31,6 +31,8 @@ import {
   type DictionaryEntry,
   type GroupAiMode,
   type GroupCloneResult,
+  type GroupDirectiveConfig,
+  type GroupMemberTargetDirective,
   type InboxNoteRecord,
 } from './server/assistantEngine.ts';
 import { GeminiKeyPool } from './server/geminiKeyPool.ts';
@@ -108,10 +110,19 @@ const CONFIG_FILE = path.resolve('./bot-config.json');
 const DICTIONARY_FILE = path.resolve('./bot-dictionary.json');
 const MEMORIES_FILE = path.resolve('./bot-memories.json');
 const NOTES_FILE = path.resolve('./bot-notes.json');
+const GROUP_MEMBERS_FILE = path.resolve('./bot-group-members.json');
 const BOT_SOURCE_DIR = path.resolve('./bot');
 
 export const BENGALI_AUTOREPLY_TEXT =
   'ওয়ালাইকুমুস সালাম! আমি ওনার অ্যাসিস্ট্যান্ট বলছিলাম। স্যার তো এই মুহূর্তে ব্যস্ত আছেন বা স্যার এই মুহূর্তে অফলাইনে আছেন বা স্যার এই মুহূর্তে নেই। স্যার আসলে আপনাকে নক করবেন।';
+
+interface KnownGroupMemberRecord {
+  jid: string;
+  lid?: string;
+  phone: string;
+  name: string;
+  isAdmin: boolean;
+}
 
 interface BotConfig {
   autoreply: boolean;
@@ -135,6 +146,8 @@ interface BotConfig {
   groupReactionEnabled: boolean;
   groupCooldownMs: number;
   groupAiGroups: Record<string, boolean>;
+  groupDirectives: Record<string, GroupDirectiveConfig>;
+  configUpdatedAt: string;
 }
 
 interface BotLogEntry {
@@ -153,6 +166,7 @@ interface SimulatorRequest {
   groupJid?: string;
   contactJid?: string;
   contactName?: string;
+  senderJid?: string;
 }
 
 // ----------------------------------------------------------------------------
@@ -189,6 +203,8 @@ function defaultConfig(): BotConfig {
     groupReactionEnabled: true,
     groupCooldownMs: 6000,
     groupAiGroups: {},
+    groupDirectives: {},
+    configUpdatedAt: '',
   };
 }
 
@@ -215,6 +231,56 @@ function saveJsonFileAsync(filePath: string, data: unknown) {
   void fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8').catch((err) => {
     console.error(`[Storage] Failed async writing ${path.basename(filePath)}:`, err);
   });
+}
+
+function normalizeGroupDirectives(raw: unknown): Record<string, GroupDirectiveConfig> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const result: Record<string, GroupDirectiveConfig> = {};
+  for (const [jid, val] of Object.entries(raw as Record<string, unknown>).slice(0, 200)) {
+    if (!jid || !val || typeof val !== 'object') continue;
+    const item = val as Partial<GroupDirectiveConfig>;
+    const groupPrompt = typeof item.groupPrompt === 'string' ? item.groupPrompt.slice(0, 3000) : '';
+    const targetsRaw = Array.isArray(item.targets) ? item.targets : [];
+    const targets: GroupMemberTargetDirective[] = [];
+    for (const t of targetsRaw.slice(0, 50)) {
+      if (!t || typeof t !== 'object') continue;
+      const targetObj = t as Partial<GroupMemberTargetDirective>;
+      const targetName = String(targetObj.targetName || '').trim().slice(0, 120);
+      const targetJid = String(targetObj.targetJid || '').trim().slice(0, 128);
+      const targetPhone = String(targetObj.targetPhone || '').replace(/\D/g, '').slice(0, 24);
+      const objective = String(targetObj.objective || '').trim().slice(0, 1500);
+      if (!objective || (!targetName && !targetJid && !targetPhone)) continue;
+      targets.push({
+        id:
+          typeof targetObj.id === 'string' && targetObj.id.trim()
+            ? targetObj.id.trim().slice(0, 64)
+            : sanitizeId(`tgt_${Date.now()}_${targets.length}`),
+        targetJid,
+        targetPhone,
+        targetName: targetName || (targetPhone ? `+${targetPhone}` : targetJid.split('@')[0]),
+        objective,
+        enabled: targetObj.enabled !== false,
+      });
+    }
+    if (groupPrompt.trim() || targets.length > 0) {
+      result[jid] = { groupPrompt, targets };
+    }
+  }
+  return result;
+}
+
+function parseConfigTimestampMs(raw: unknown): number {
+  if (typeof raw === 'string' && raw.trim()) {
+    const ms = Date.parse(raw);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (raw && typeof (raw as { toDate?: () => Date }).toDate === 'function') {
+    const ms = (raw as { toDate: () => Date }).toDate().getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  return 0;
 }
 
 function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
@@ -275,6 +341,8 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
       raw.groupAiGroups && typeof raw.groupAiGroups === 'object'
         ? raw.groupAiGroups
         : base.groupAiGroups,
+    groupDirectives: normalizeGroupDirectives(raw.groupDirectives),
+    configUpdatedAt: typeof raw.configUpdatedAt === 'string' ? raw.configUpdatedAt : base.configUpdatedAt,
   };
 }
 
@@ -287,6 +355,9 @@ let dictionaryEntries: DictionaryEntry[] = loadJsonFile<DictionaryEntry[]>(DICTI
 let totalDictionaryCount: number = dictionaryEntries.length;
 let chatMemories: Record<string, ChatMemoryRecord> = loadJsonFile<Record<string, ChatMemoryRecord>>(MEMORIES_FILE, {});
 let inboxNotes: InboxNoteRecord[] = loadJsonFile<InboxNoteRecord[]>(NOTES_FILE, []);
+let knownGroupMembers: Record<string, Record<string, KnownGroupMemberRecord>> = loadJsonFile<
+  Record<string, Record<string, KnownGroupMemberRecord>>
+>(GROUP_MEMBERS_FILE, {});
 let activeCloudOwnerId: string = process.env.FIREBASE_OWNER_UID || 'server_admin';
 
 const clientBotManager = new ClientBotManager({
@@ -294,7 +365,85 @@ const clientBotManager = new ClientBotManager({
   onEvent: (summary, outcome) => pushLog('system', 'Client Bots', summary, outcome || 'info'),
 });
 
-function persistConfig() {
+let groupMembersSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSaveGroupMembers() {
+  if (groupMembersSaveTimer) return;
+  groupMembersSaveTimer = setTimeout(() => {
+    groupMembersSaveTimer = null;
+    saveJsonFileAsync(GROUP_MEMBERS_FILE, knownGroupMembers);
+  }, 1500);
+  groupMembersSaveTimer.unref?.();
+}
+
+function upsertGroupMemberRecord(groupJid: string, member: Partial<KnownGroupMemberRecord> & { jid: string }) {
+  if (!groupJid || !member.jid) return;
+  const cleanJid = member.jid.split(':')[0];
+  const digits = extractDigits(cleanJid) || member.phone?.replace(/\D/g, '') || '';
+  const lidDigits = extractDigits(member.lid);
+  const bucket = (knownGroupMembers[groupJid] ||= {});
+  const key = digits || lidDigits || cleanJid;
+  const existing = bucket[key];
+  const cleanName = member.name?.trim();
+  const isDefaultPhoneName = !cleanName || /^\+?\d{6,}$/.test(cleanName);
+  const resolvedName =
+    !isDefaultPhoneName
+      ? cleanName!
+      : existing?.name || (digits ? `+${digits}` : cleanJid.split('@')[0]);
+
+  bucket[key] = {
+    jid: cleanJid.endsWith('@s.whatsapp.net') ? cleanJid : existing?.jid || cleanJid,
+    lid: member.lid ? member.lid.split(':')[0] : existing?.lid,
+    phone: digits || existing?.phone || '',
+    name: resolvedName,
+    isAdmin: member.isAdmin ?? existing?.isAdmin ?? false,
+  };
+  scheduleSaveGroupMembers();
+}
+
+function recordParticipantsFromMetadata(groupJid: string, metadata: GroupMetadata | null | undefined) {
+  if (!groupJid || !metadata || !Array.isArray(metadata.participants)) return;
+  for (const p of metadata.participants) {
+    const rawId = p.id || '';
+    const rawLid = (p as { lid?: string }).lid;
+    const rawNotify = (p as { notify?: string; name?: string }).notify || (p as { name?: string }).name || '';
+    const primaryJid = rawId.endsWith('@s.whatsapp.net') ? rawId : rawLid && rawLid.endsWith('@s.whatsapp.net') ? rawLid : rawId;
+    const digits = extractDigits(primaryJid);
+    upsertGroupMemberRecord(groupJid, {
+      jid: primaryJid,
+      lid: rawId.endsWith('@lid') ? rawId : rawLid,
+      phone: digits,
+      name: rawNotify || (digits ? `+${digits}` : primaryJid.split('@')[0]),
+      isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
+    });
+  }
+}
+
+async function persistConfigAsync(stampNow = true): Promise<void> {
+  if (stampNow || !botConfig.configUpdatedAt) {
+    botConfig.configUpdatedAt = new Date().toISOString();
+  }
+  saveJsonFile(CONFIG_FILE, botConfig);
+  await Promise.allSettled([
+    withTimeout(
+      adminSaveDocument('bot_settings', 'primary', {
+        ownerId: activeCloudOwnerId,
+        ...botConfig,
+      }),
+      2_500,
+      'Firestore settings write'
+    ),
+    withTimeout(
+      pgSaveSettings(activeCloudOwnerId, botConfig as unknown as Record<string, unknown>),
+      2_500,
+      'Postgres settings write'
+    ),
+  ]);
+}
+
+function persistConfig(stampNow = true) {
+  if (stampNow || !botConfig.configUpdatedAt) {
+    botConfig.configUpdatedAt = new Date().toISOString();
+  }
   saveJsonFile(CONFIG_FILE, botConfig);
   void adminSaveDocument('bot_settings', 'primary', {
     ownerId: activeCloudOwnerId,
@@ -580,6 +729,7 @@ async function getCachedGroupMetadata(sock: WASocket, groupJid: string): Promise
     metadata,
     expiresAt: Date.now() + 30_000,
   });
+  recordParticipantsFromMetadata(groupJid, metadata);
   return metadata;
 }
 
@@ -1206,6 +1356,8 @@ async function runGroupCloneTurn(params: {
   groupJid: string;
   groupName: string;
   senderName: string;
+  senderJid?: string;
+  senderAlt?: string;
   incomingText: string;
   isDirectlyAddressed: boolean;
   canTextReply: boolean;
@@ -1216,6 +1368,7 @@ async function runGroupCloneTurn(params: {
   const nowIso = new Date().toISOString();
   const speakerText = `[${params.senderName}]: ${params.incomingText}`;
   const incomingTurn: ChatTurn = { role: 'user', text: speakerText, timestamp: nowIso };
+  const groupDirective = botConfig.groupDirectives?.[params.groupJid];
 
   if (params.observeOnly) {
     const nextTurns = [...(memory?.turns || []), incomingTurn].slice(-20);
@@ -1278,6 +1431,9 @@ async function runGroupCloneTurn(params: {
       archivedMatches,
       groupName: params.groupName,
       senderName: params.senderName,
+      senderJid: params.senderJid,
+      senderAlt: params.senderAlt,
+      groupDirective,
       incomingText: params.incomingText,
       isDirectlyAddressed: params.isDirectlyAddressed,
       canTextReply: params.canTextReply,
@@ -1293,6 +1449,9 @@ async function runGroupCloneTurn(params: {
       archivedMatches,
       groupName: params.groupName,
       senderName: params.senderName,
+      senderJid: params.senderJid,
+      senderAlt: params.senderAlt,
+      groupDirective,
       incomingText: params.incomingText,
       isDirectlyAddressed: params.isDirectlyAddressed,
       canTextReply: params.canTextReply,
@@ -1648,6 +1807,15 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   }
 
   // 3A. Smart Group AI Clone ("আমার কপি" — Observe, React, Debate, Roast, Flirt in Enabled Groups)
+  if (isGroup && !msg.key.fromMe) {
+    upsertGroupMemberRecord(remoteJid, {
+      jid: senderAlt && senderAlt.endsWith('@s.whatsapp.net') ? senderAlt : senderJid,
+      lid: senderJid.endsWith('@lid') ? senderJid : senderAlt?.endsWith('@lid') ? senderAlt : undefined,
+      phone: extractDigits(senderAlt) || extractDigits(senderJid),
+      name: msg.pushName || extractDigits(senderAlt) || extractDigits(senderJid) || 'Member',
+    });
+  }
+
   if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[remoteJid] === true) {
     if (msg.key.fromMe || !text) return;
 
@@ -1675,6 +1843,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           groupJid: remoteJid,
           groupName,
           senderName,
+          senderJid,
+          senderAlt,
           incomingText: text,
           isDirectlyAddressed,
           canTextReply: false,
@@ -1689,6 +1859,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           groupJid: remoteJid,
           groupName,
           senderName,
+          senderJid,
+          senderAlt,
           incomingText: text,
           isDirectlyAddressed,
           canTextReply: false,
@@ -1705,6 +1877,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         groupJid: remoteJid,
         groupName,
         senderName,
+        senderJid,
+        senderAlt,
         incomingText: text,
         isDirectlyAddressed,
         canTextReply,
@@ -1736,14 +1910,17 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           await sendTrackedMessage(
             sock,
             remoteJid,
-            { text: decision.replyText },
+            {
+              text: decision.replyText,
+              ...(decision.mentionTarget && senderJid ? { mentions: [senderJid] } : {}),
+            },
             quoteOrMention
           );
           dailyReplyCount += 1;
           const elapsedMs = Date.now() - startedAt;
           pushLog(
             'autoreply',
-            `${groupName} · ${senderName}`,
+            `${groupName} · ${senderName}${decision.matchedTargetName ? ` [Target: ${decision.matchedTargetName}]` : ''}`,
             `Group Clone (${decision.action}${decision.reactionEmoji ? ` ${decision.reactionEmoji}` : ''} · ${decision.providerUsed || 'gemini'} · ${elapsedMs}ms)`,
             'success'
           );
@@ -2149,6 +2326,8 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
 // Hydrate from Server-Side Admin Firestore on Boot (if configured)
 // ----------------------------------------------------------------------------
 async function hydrateFromCloudAdmin() {
+  let activeConfigTs = parseConfigTimestampMs(botConfig.configUpdatedAt);
+
   // 1. Hydrate from External PostgreSQL (if DATABASE_URL is configured)
   if (isPostgresConfigured()) {
     try {
@@ -2157,8 +2336,18 @@ async function hydrateFromCloudAdmin() {
         if (pgSettings.ownerId && pgSettings.ownerId !== 'server_admin') {
           activeCloudOwnerId = pgSettings.ownerId;
         }
-        botConfig = normalizeConfig(pgSettings.config as Partial<BotConfig>);
-        saveJsonFile(CONFIG_FILE, botConfig);
+        const pgTs = parseConfigTimestampMs(pgSettings.config.configUpdatedAt || pgSettings.config.updatedAt);
+        if (activeConfigTs === 0 || pgTs >= activeConfigTs) {
+          botConfig = normalizeConfig({
+            ...(pgSettings.config as Partial<BotConfig>),
+            configUpdatedAt:
+              typeof pgSettings.config.configUpdatedAt === 'string' && pgSettings.config.configUpdatedAt
+                ? pgSettings.config.configUpdatedAt
+                : new Date().toISOString(),
+          });
+          activeConfigTs = parseConfigTimestampMs(botConfig.configUpdatedAt);
+          saveJsonFile(CONFIG_FILE, botConfig);
+        }
       }
 
       const pgDict = await pgLoadDictionary(MAX_RAM_DICTIONARY_ITEMS);
@@ -2188,17 +2377,31 @@ async function hydrateFromCloudAdmin() {
     }
   }
 
-  // 2. Hydrate from Server-Side Admin Firestore (if configured)
+  // 2. Hydrate from Server-Side Admin Firestore (if configured) without overwriting newer Postgres/local config
   const { db, mode } = getAdminFirestore();
   if (!db) return;
   try {
-    const cloudSettings = await adminLoadDocument<Partial<BotConfig> & { ownerId?: string }>('bot_settings', 'primary');
+    const cloudSettings = await adminLoadDocument<Partial<BotConfig> & { ownerId?: string; updatedAt?: unknown }>(
+      'bot_settings',
+      'primary'
+    );
     if (cloudSettings) {
       if (cloudSettings.ownerId && cloudSettings.ownerId !== 'server_admin') {
         activeCloudOwnerId = cloudSettings.ownerId;
       }
-      botConfig = normalizeConfig(cloudSettings);
-      saveJsonFile(CONFIG_FILE, botConfig);
+      const fsTs = parseConfigTimestampMs(cloudSettings.configUpdatedAt || cloudSettings.updatedAt);
+      if (activeConfigTs === 0 || fsTs > activeConfigTs) {
+        botConfig = normalizeConfig({
+          ...cloudSettings,
+          configUpdatedAt:
+            typeof cloudSettings.configUpdatedAt === 'string' && cloudSettings.configUpdatedAt
+              ? cloudSettings.configUpdatedAt
+              : fsTs > 0
+                ? new Date(fsTs).toISOString()
+                : new Date().toISOString(),
+        });
+        saveJsonFile(CONFIG_FILE, botConfig);
+      }
     }
 
     const cloudDict = await adminLoadCollection<DictionaryEntry>('dictionary_entries');
@@ -2766,10 +2969,14 @@ async function bootstrap() {
     res.json({ status: botStatus, sessionExists: false });
   });
 
-  app.post('/api/bot/config', (req, res) => {
-    const patch = req.body || {};
-    botConfig = normalizeConfig({ ...botConfig, ...patch });
-    persistConfig();
+  app.post('/api/bot/config', async (req, res) => {
+    const patch = (req.body || {}) as Partial<BotConfig>;
+    botConfig = normalizeConfig({
+      ...botConfig,
+      ...patch,
+      configUpdatedAt: new Date().toISOString(),
+    });
+    await persistConfigAsync(false);
     pushLog('autoreply', 'Dashboard', 'Saved assistant & moderation configuration.', 'info');
     res.json({ config: botConfig });
   });
@@ -2783,10 +2990,22 @@ async function bootstrap() {
         participantCount: number;
         antilinkEnabled: boolean;
         groupAiEnabled: boolean;
+        members: KnownGroupMemberRecord[];
       }
     >();
 
-    // 1. Seed from saved configs & memories
+    const getMembersForGroup = (jid: string): KnownGroupMemberRecord[] => {
+      const bucket = knownGroupMembers[jid];
+      if (!bucket) return [];
+      return Object.values(bucket)
+        .sort((a, b) => {
+          if (a.isAdmin !== b.isAdmin) return a.isAdmin ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        })
+        .slice(0, 250);
+    };
+
+    // 1. Seed from saved configs, group directives & memories
     for (const [jid, enabled] of Object.entries(botConfig.antilinkGroups || {})) {
       map.set(jid, {
         jid,
@@ -2794,6 +3013,7 @@ async function bootstrap() {
         participantCount: 0,
         antilinkEnabled: Boolean(enabled),
         groupAiEnabled: Boolean(botConfig.groupAiGroups[jid]),
+        members: getMembersForGroup(jid),
       });
     }
     for (const [jid, enabled] of Object.entries(botConfig.groupAiGroups || {})) {
@@ -2804,7 +3024,20 @@ async function bootstrap() {
         participantCount: existing?.participantCount || 0,
         antilinkEnabled: existing?.antilinkEnabled ?? false,
         groupAiEnabled: Boolean(enabled),
+        members: getMembersForGroup(jid),
       });
+    }
+    for (const jid of Object.keys(botConfig.groupDirectives || {})) {
+      if (!map.has(jid)) {
+        map.set(jid, {
+          jid,
+          name: chatMemories[sanitizeId(jid)]?.contactName || jid,
+          participantCount: 0,
+          antilinkEnabled: Boolean(botConfig.antilinkGroups[jid]),
+          groupAiEnabled: Boolean(botConfig.groupAiGroups[jid]),
+          members: getMembersForGroup(jid),
+        });
+      }
     }
     for (const mem of Object.values(chatMemories)) {
       if (mem.contactJid?.endsWith('@g.us') && !map.has(mem.contactJid)) {
@@ -2814,11 +3047,12 @@ async function bootstrap() {
           participantCount: 0,
           antilinkEnabled: Boolean(botConfig.antilinkGroups[mem.contactJid]),
           groupAiEnabled: Boolean(botConfig.groupAiGroups[mem.contactJid]),
+          members: getMembersForGroup(mem.contactJid),
         });
       }
     }
 
-    // 2. Enrich with live WhatsApp participating groups when connected
+    // 2. Enrich with live WhatsApp participating groups & participants when connected
     if (currentSocket && botStatus === 'connected') {
       try {
         const participating = await withTimeout(
@@ -2827,13 +3061,16 @@ async function bootstrap() {
           'Fetch participating groups'
         );
         for (const [jid, meta] of Object.entries(participating || {})) {
+          recordParticipantsFromMetadata(jid, meta);
           const existing = map.get(jid);
+          const members = getMembersForGroup(jid);
           map.set(jid, {
             jid,
             name: meta.subject || existing?.name || jid,
-            participantCount: Array.isArray(meta.participants) ? meta.participants.length : 0,
+            participantCount: Array.isArray(meta.participants) ? meta.participants.length : members.length,
             antilinkEnabled: Boolean(botConfig.antilinkGroups[jid]),
             groupAiEnabled: Boolean(botConfig.groupAiGroups[jid]),
+            members,
           });
         }
       } catch {
@@ -2849,14 +3086,31 @@ async function bootstrap() {
   });
 
   // Cloud Sync endpoint used by browser-authenticated Firestore client
-  app.post('/api/cloud/sync', (req, res) => {
+  app.post('/api/cloud/sync', async (req, res) => {
     const { ownerId, settings, dictionary, memories, notes } = req.body || {};
     if (typeof ownerId === 'string' && ownerId.trim()) {
       activeCloudOwnerId = ownerId.trim();
     }
     if (settings && typeof settings === 'object') {
-      botConfig = normalizeConfig({ ...botConfig, ...settings });
-      saveJsonFile(CONFIG_FILE, botConfig);
+      const serverTs = parseConfigTimestampMs(botConfig.configUpdatedAt);
+      const incomingObj = settings as Partial<BotConfig> & { updatedAt?: unknown };
+      const incomingTs = parseConfigTimestampMs(incomingObj.configUpdatedAt || incomingObj.updatedAt);
+
+      // Apply Firestore settings ONLY when server has never saved a timestamped config OR incoming Firestore settings are strictly newer
+      if (serverTs === 0 || incomingTs > serverTs) {
+        botConfig = normalizeConfig({
+          ...botConfig,
+          ...incomingObj,
+          configUpdatedAt:
+            typeof incomingObj.configUpdatedAt === 'string' && incomingObj.configUpdatedAt
+              ? incomingObj.configUpdatedAt
+              : incomingTs > 0
+                ? new Date(incomingTs).toISOString()
+                : new Date().toISOString(),
+        });
+        saveJsonFile(CONFIG_FILE, botConfig);
+        void pgSaveSettings(activeCloudOwnerId, botConfig as unknown as Record<string, unknown>);
+      }
     }
     if (Array.isArray(dictionary) && dictionary.length > 0) {
       if (!isPostgresConfigured() || dictionaryEntries.length === 0) {
@@ -3483,10 +3737,13 @@ async function bootstrap() {
 
       // 3A. Group AI Clone Simulator Evaluation
       if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[groupJid] === true) {
+        const simSenderJid = body?.senderJid || contactJid;
+        const simGroupName = chatMemories[sanitizeId(groupJid)]?.contactName || 'Simulator Group';
         const decision = await runGroupCloneTurn({
           groupJid,
-          groupName: 'Simulator Group',
+          groupName: simGroupName,
           senderName: contactName || 'Friend',
+          senderJid: simSenderJid,
           incomingText: text,
           isDirectlyAddressed: text.includes('@') || text.toLowerCase().includes((botConfig.ownerName || '').toLowerCase()),
           canTextReply: true,
@@ -3496,7 +3753,7 @@ async function bootstrap() {
           reply: decision.replyText || null,
           reactionEmoji: decision.reactionEmoji || undefined,
           groupAction: decision.action,
-          note: `Group Clone Action: ${decision.action}${decision.reactionEmoji ? ` (${decision.reactionEmoji})` : ''} — ${decision.reason}`,
+          note: `Group Clone Action: ${decision.action}${decision.reactionEmoji ? ` (${decision.reactionEmoji})` : ''}${decision.matchedTargetName ? ` [Target: @${decision.matchedTargetName}]` : ''} — ${decision.reason}`,
           detectedDistrict: decision.detectedDistrict,
           providerUsed: decision.providerUsed,
           ruleTriggered: `GROUP_CLONE_${decision.action.toUpperCase()}`,

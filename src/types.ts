@@ -16,12 +16,35 @@ export type AssistantTone =
 
 export type GroupAiMode = 'smart_blend' | 'mention_only' | 'active_chat';
 
+export interface KnownGroupMemberItem {
+  jid: string;
+  lid?: string;
+  phone: string;
+  name: string;
+  isAdmin: boolean;
+}
+
+export interface GroupMemberTargetDirective {
+  id: string;
+  targetJid: string;
+  targetPhone: string;
+  targetName: string;
+  objective: string;
+  enabled: boolean;
+}
+
+export interface GroupDirectiveConfig {
+  groupPrompt: string;
+  targets: GroupMemberTargetDirective[];
+}
+
 export interface KnownGroupItem {
   jid: string;
   name: string;
   participantCount: number;
   antilinkEnabled: boolean;
   groupAiEnabled: boolean;
+  members?: KnownGroupMemberItem[];
 }
 
 export interface BotConfig {
@@ -46,6 +69,8 @@ export interface BotConfig {
   groupReactionEnabled?: boolean;
   groupCooldownMs?: number;
   groupAiGroups?: Record<string, boolean>;
+  groupDirectives?: Record<string, GroupDirectiveConfig>;
+  configUpdatedAt?: string;
 }
 
 export interface DictionaryEntry {

@@ -108,6 +108,15 @@
           "type": "object",
           "description": "Map of WhatsApp group JIDs to boolean Group AI Clone enabled state."
         },
+        "groupDirectives": {
+          "type": "object",
+          "description": "Map of WhatsApp group JIDs to per-group AI command prompts and member mention target objectives."
+        },
+        "configUpdatedAt": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Monotonic ISO timestamp tracking latest settings modification."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

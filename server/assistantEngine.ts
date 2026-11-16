@@ -47,6 +47,20 @@ export interface InboxNoteRecord {
   createdAt: string;
 }
 
+export interface GroupMemberTargetDirective {
+  id: string;
+  targetJid: string;
+  targetPhone: string;
+  targetName: string;
+  objective: string;
+  enabled: boolean;
+}
+
+export interface GroupDirectiveConfig {
+  groupPrompt: string;
+  targets: GroupMemberTargetDirective[];
+}
+
 export interface AssistantConfigFields {
   aiAssistantEnabled: boolean;
   autoreplyMessage: string;
@@ -64,6 +78,8 @@ export interface AssistantConfigFields {
   groupAiMode?: GroupAiMode;
   groupReactionEnabled?: boolean;
   groupCooldownMs?: number;
+  groupDirectives?: Record<string, GroupDirectiveConfig>;
+  configUpdatedAt?: string;
 }
 
 export const DEFAULT_FIRST_GREETING =
@@ -1006,6 +1022,8 @@ export interface GroupCloneResult {
   shouldQuote: boolean;
   detectedDistrict: string;
   reason: string;
+  matchedTargetName?: string;
+  mentionTarget?: boolean;
   usedFallback?: boolean;
   providerUsed?: 'gemini' | 'openrouter' | 'offline_emotion';
   keySlotUsed?: number;
@@ -1189,6 +1207,85 @@ function pickOfflineGroupAction(params: {
   };
 }
 
+function extractDigitsOnly(jidOrPhone: string | undefined | null): string {
+  if (!jidOrPhone) return '';
+  return String(jidOrPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+function normalizePhoneMatchKey(digits: string): string {
+  const clean = digits.replace(/\D/g, '');
+  if (!clean) return '';
+  if (clean.startsWith('880') && clean.length >= 13) return clean.slice(3);
+  if (clean.startsWith('0') && clean.length === 11) return clean.slice(1);
+  return clean.length >= 10 ? clean.slice(-10) : clean;
+}
+
+export function findMatchingGroupTarget(
+  directive: GroupDirectiveConfig | undefined,
+  senderJid?: string,
+  senderAlt?: string,
+  senderName?: string
+): { matchedTarget: GroupMemberTargetDirective | null; otherTargets: GroupMemberTargetDirective[] } {
+  const enabledTargets = (directive?.targets || []).filter(
+    (t) => t && t.enabled !== false && Boolean(t.objective?.trim())
+  );
+  if (enabledTargets.length === 0) {
+    return { matchedTarget: null, otherTargets: [] };
+  }
+
+  const sDigits = extractDigitsOnly(senderJid);
+  const altDigits = extractDigitsOnly(senderAlt);
+  const sPhoneKey = normalizePhoneMatchKey(sDigits);
+  const altPhoneKey = normalizePhoneMatchKey(altDigits);
+  const sJidClean = (senderJid || '').split(':')[0].toLowerCase();
+  const sAltClean = (senderAlt || '').split(':')[0].toLowerCase();
+  const sNameNorm = (senderName || '').trim().toLowerCase();
+
+  let matchedTarget: GroupMemberTargetDirective | null = null;
+  for (const target of enabledTargets) {
+    const tPhone = extractDigitsOnly(target.targetPhone || target.targetJid);
+    const tJidDigits = extractDigitsOnly(target.targetJid);
+    const tPhoneKey = normalizePhoneMatchKey(tPhone);
+    const tJidPhoneKey = normalizePhoneMatchKey(tJidDigits);
+    const tJidClean = (target.targetJid || '').split(':')[0].toLowerCase();
+    const tNameNorm = (target.targetName || '').trim().toLowerCase();
+
+    const idMatch =
+      (Boolean(tJidClean) && (tJidClean === sJidClean || tJidClean === sAltClean)) ||
+      (Boolean(tPhone) && (tPhone === sDigits || tPhone === altDigits)) ||
+      (Boolean(tPhoneKey) &&
+        tPhoneKey.length >= 8 &&
+        (tPhoneKey === sPhoneKey || tPhoneKey === altPhoneKey)) ||
+      (Boolean(tJidDigits) && (tJidDigits === sDigits || tJidDigits === altDigits)) ||
+      (Boolean(tJidPhoneKey) &&
+        tJidPhoneKey.length >= 8 &&
+        (tJidPhoneKey === sPhoneKey || tJidPhoneKey === altPhoneKey));
+
+    const nameMatch =
+      Boolean(tNameNorm) &&
+      tNameNorm.length >= 2 &&
+      Boolean(sNameNorm) &&
+      (sNameNorm === tNameNorm ||
+        sNameNorm.includes(tNameNorm) ||
+        tNameNorm.includes(sNameNorm));
+
+    const sIsOpaqueLidOnly = sJidClean.endsWith('@lid') && !altDigits && !tJidClean.endsWith('@lid');
+
+    if (
+      idMatch ||
+      (!tPhone && !tJidClean && nameMatch) ||
+      (nameMatch && !sDigits && !altDigits) ||
+      (nameMatch && sIsOpaqueLidOnly && sNameNorm === tNameNorm)
+    ) {
+      matchedTarget = target;
+      break;
+    }
+  }
+
+  const otherTargets = enabledTargets.filter((t) => t.id !== matchedTarget?.id);
+  return { matchedTarget, otherTargets };
+}
+
 export async function generateGroupCloneAction(params: {
   ai?: GoogleGenAI | null;
   keyPool?: GeminiKeyPool | null;
@@ -1199,6 +1296,9 @@ export async function generateGroupCloneAction(params: {
   archivedMatches?: ChatTurn[];
   groupName: string;
   senderName: string;
+  senderJid?: string;
+  senderAlt?: string;
+  groupDirective?: GroupDirectiveConfig;
   incomingText: string;
   isDirectlyAddressed: boolean;
   canTextReply: boolean;
@@ -1214,6 +1314,9 @@ export async function generateGroupCloneAction(params: {
     archivedMatches = [],
     groupName,
     senderName,
+    senderJid,
+    senderAlt,
+    groupDirective,
     incomingText,
     isDirectlyAddressed,
     canTextReply,
@@ -1232,8 +1335,16 @@ export async function generateGroupCloneAction(params: {
   const canUseGemini = Boolean(keyPool?.hasKeys() || ai);
   const canUseOpenRouter = Boolean(openRouterReader?.hasKeys());
 
-  // Short-circuit mention_only silently if not addressed
-  if (mode === 'mention_only' && !isDirectlyAddressed) {
+  const { matchedTarget, otherTargets } = findMatchingGroupTarget(
+    groupDirective,
+    senderJid,
+    senderAlt,
+    senderName
+  );
+  const isTargetedSpeaker = Boolean(matchedTarget);
+
+  // Short-circuit mention_only silently unless directly addressed OR speaker is an active target mission
+  if (mode === 'mention_only' && !isDirectlyAddressed && !isTargetedSpeaker) {
     return {
       action: 'silent',
       replyText: '',
@@ -1257,18 +1368,26 @@ export async function generateGroupCloneAction(params: {
   if (
     !settings.aiAssistantEnabled ||
     (!canUseGemini && !canUseOpenRouter) ||
-    (!isDirectlyAddressed && ((mode === 'smart_blend' && isFillerOrEmojiOnly) || !canTextReply))
+    (!isDirectlyAddressed &&
+      !isTargetedSpeaker &&
+      ((mode === 'smart_blend' && isFillerOrEmojiOnly) || !canTextReply)) ||
+    (isTargetedSpeaker && (!canTextReply || isFillerOrEmojiOnly) && !isDirectlyAddressed)
   ) {
-    return pickOfflineGroupAction({
+    const offline = pickOfflineGroupAction({
       incomingText,
       senderName,
-      isDirectlyAddressed,
+      isDirectlyAddressed: isDirectlyAddressed || (isTargetedSpeaker && canTextReply && !isFillerOrEmojiOnly),
       canTextReply,
       reactionEnabled,
       mode,
       tone: settings.assistantTone,
       previousReplies,
     });
+    return {
+      ...offline,
+      matchedTargetName: matchedTarget?.targetName,
+      mentionTarget: isTargetedSpeaker && (offline.action === 'reply' || offline.action === 'reply_and_react'),
+    };
   }
 
   const matchedDict = findRelevantDictionaryEntries(incomingText, dictionaryEntries);
@@ -1288,6 +1407,26 @@ export async function generateGroupCloneAction(params: {
           '  * Choose "react" (with a fitting emoji like 😂, 🔥, 💀, ❤️, 😏, 👀) on brief jokes, memes, or good lines where a real friend just taps an emoji reaction.\n' +
           '  * Choose "reply" or "reply_and_react" when directly mentioned/replied to, when someone asks a question, when there is a fun debate/argument to counter, a juicy opportunity to playfully roast/tease ("কাউকে পাচানো"), or playful flirting.';
 
+  const groupPromptText = groupDirective?.groupPrompt?.trim() || '';
+  const directiveInstructions: string[] = [];
+  if (groupPromptText) {
+    directiveInstructions.push(
+      `PER-GROUP OWNER COMMAND FOR "${groupName}" (Follow strictly inside this group):\n${groupPromptText}`
+    );
+  }
+  if (matchedTarget) {
+    directiveInstructions.push(
+      `🎯 ACTIVE TARGETED MEMBER MISSION (HIGHEST PRIORITY — CONFIDENTIAL):\n` +
+        `- Current speaker "${senderName}" matches targeted member "@${matchedTarget.targetName}"${matchedTarget.targetPhone ? ` (+${matchedTarget.targetPhone})` : ''}.\n` +
+        `- Owner's Exact Objective / Instruction for THIS person:\n  "${matchedTarget.objective.trim()}"\n` +
+        `- How to execute: Act 100% naturally in first person as ${ownerDisplay}. Never expose or hint that anyone ordered you to convince them. Engage directly (prefer "reply" or "reply_and_react" if cooldown permits), respond thoughtfully to what they just said, and smoothly/persuasively steer them toward fulfilling the owner's objective in a convincing human way!`
+    );
+  } else if (otherTargets.length > 0) {
+    directiveInstructions.push(
+      `NORMAL MEMBER BOUNDARY: "${senderName}" is NOT a targeted member (specific missions exist only for: ${otherTargets.map((t) => `@${t.targetName}`).join(', ')}). Treat "${senderName}" completely NORMALLY like any regular group friend—do NOT apply the secret persuasion missions of other members onto "${senderName}".`
+    );
+  }
+
   const systemInstruction = [
     `CRITICAL IDENTITY CLONE RULE: You are NOT an AI, NOT a bot, and NOT an assistant! You ARE "${ownerDisplay}" (${settings.ownerProfession || 'Techie'}, ${settings.ownerLocation || 'Bangladesh'}), chatting directly inside your WhatsApp group "${groupName}".`,
     'NEVER mention "স্যার", "বট", "অ্যাসিস্ট্যান্ট", "ব্যস্ত আছেন", or speak in third person about the owner. Speak 100% in FIRST PERSON as the owner himself—no one in the group must ever suspect it is automated!',
@@ -1298,10 +1437,13 @@ export async function generateGroupCloneAction(params: {
     modeInstruction,
     isDirectlyAddressed
       ? 'DIRECT ADDRESS OVERRIDE: You were directly @mentioned, quoted/replied to, or called by name! Do NOT choose "silent" — respond with "reply" or "reply_and_react".'
-      : !canTextReply
-        ? 'COOLDOWN GUARD: You texted in this group very recently. Do NOT choose "reply" or "reply_and_react" right now — pick ONLY "react" or "silent" so you never spam.'
-        : '',
+      : isTargetedSpeaker && canTextReply
+        ? `TARGETED ENGAGEMENT OVERRIDE: The owner assigned a special objective for "${senderName}". Prefer "reply" or "reply_and_react" (quoting them) so you actively converse and persuade them naturally!`
+        : !canTextReply
+          ? 'COOLDOWN GUARD: You texted in this group very recently. Do NOT choose "reply" or "reply_and_react" right now — pick ONLY "react" or "silent" so you never spam.'
+          : '',
     '',
+    ...(directiveInstructions.length > 0 ? [...directiveInstructions, ''] : []),
     'HUMAN GROUP TEXTING SKILLS:',
     '- Read the whole recent group conversation carefully before deciding.',
     '- Tease & Roast ("পাচানো"): Spot funny slips, bragging, or excuses in the group and roast friends playfully like a witty close friend.',
@@ -1346,7 +1488,9 @@ export async function generateGroupCloneAction(params: {
 
   const promptContent = [
     historyLines ? `Recent Group Thread in "${groupName}":\n${historyLines}` : `Group: "${groupName}"`,
-    `Latest message from "${senderName}"${isDirectlyAddressed ? ' (DIRECTLY ADDRESSED YOU)' : ''}:\n"${incomingText}"`,
+    `Latest message from "${senderName}"${isDirectlyAddressed ? ' (DIRECTLY ADDRESSED YOU)' : ''}${
+      matchedTarget ? ` (MATCHED TARGET @${matchedTarget.targetName} — execute mission gently & naturally)` : ''
+    }:\n"${incomingText}"`,
     `Decide your natural human move: "reply", "react", "reply_and_react", or "silent".`,
   ].join('\n\n');
 
@@ -1451,7 +1595,7 @@ export async function generateGroupCloneAction(params: {
   const reason = (parsed.reason || '').trim() || 'Smart group decision';
 
   // Enforce guards:
-  if (isDirectlyAddressed && action === 'silent') {
+  if ((isDirectlyAddressed || (isTargetedSpeaker && canTextReply)) && action === 'silent') {
     action = 'reply';
   }
   if (!canTextReply && !isDirectlyAddressed && (action === 'reply' || action === 'reply_and_react')) {
@@ -1462,14 +1606,18 @@ export async function generateGroupCloneAction(params: {
     const offline = pickOfflineGroupAction({
       incomingText,
       senderName,
-      isDirectlyAddressed,
+      isDirectlyAddressed: isDirectlyAddressed || (isTargetedSpeaker && canTextReply),
       canTextReply,
       reactionEnabled,
       mode,
       tone: settings.assistantTone,
       previousReplies,
     });
-    return offline;
+    return {
+      ...offline,
+      matchedTargetName: matchedTarget?.targetName,
+      mentionTarget: isTargetedSpeaker && (offline.action === 'reply' || offline.action === 'reply_and_react'),
+    };
   }
   if ((action === 'react' || action === 'reply_and_react') && !reactionEmoji) {
     if (action === 'react') {
@@ -1488,9 +1636,11 @@ export async function generateGroupCloneAction(params: {
     action,
     replyText,
     reactionEmoji,
-    shouldQuote,
+    shouldQuote: shouldQuote || isTargetedSpeaker,
     detectedDistrict,
     reason,
+    matchedTargetName: matchedTarget?.targetName,
+    mentionTarget: isTargetedSpeaker && (action === 'reply' || action === 'reply_and_react'),
     usedFallback: providerUsed === 'offline_emotion',
     providerUsed,
     keySlotUsed,

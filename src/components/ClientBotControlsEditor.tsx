@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
   Copy,
@@ -96,8 +96,16 @@ export function ClientBotControlsEditor({
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState(false);
 
-  // Sync local form fields when switching selected bot
+  const isDefaultsDirtyRef = useRef(false);
+  const isRuleDirtyRef = useRef(false);
+  const isSmsDirtyRef = useRef(false);
+  const prevGroupSelectionRef = useRef<string>(`${bot.botId}::${selectedGroupJid}`);
+
+  // Reset all dirty flags & hydrate cleanly when switching to a different client bot slot
   useEffect(() => {
+    isDefaultsDirtyRef.current = false;
+    isRuleDirtyRef.current = false;
+    isSmsDirtyRef.current = false;
     setPhoneInput(bot.phoneNumber || '');
     setClientNameInput(bot.clientName);
     setModerateAllGroups(bot.moderateAllGroups);
@@ -113,12 +121,53 @@ export function ClientBotControlsEditor({
     }
   }, [bot.botId]);
 
-  // Keep selected group editor synced with saved group rule
+  // Sync clean fields when server updates (e.g. after save or WhatsApp .mod/.savedreply command) without wiping unsaved edits
   useEffect(() => {
+    if ((bot.knownGroups || []).length > 0) {
+      setLiveGroups(bot.knownGroups || []);
+    }
+    if (!isDefaultsDirtyRef.current) {
+      setClientNameInput(bot.clientName);
+      setModerateAllGroups(bot.moderateAllGroups);
+      setDefaultMod(bot.defaultModeration);
+    }
+    if (!isSmsDirtyRef.current) {
+      setSavedReplyEnabled(bot.savedReplyEnabled);
+      setSavedReplyMessage(bot.savedReplyMessage);
+      setSavedReplyCooldownSec(Math.round((bot.savedReplyCooldownMs || 0) / 1000));
+      setKeywordReplies(bot.keywordReplies || []);
+    }
+  }, [
+    bot.updatedAt,
+    bot.clientName,
+    bot.moderateAllGroups,
+    bot.defaultModeration,
+    bot.savedReplyEnabled,
+    bot.savedReplyMessage,
+    bot.savedReplyCooldownMs,
+    bot.keywordReplies,
+    bot.knownGroups,
+  ]);
+
+  // Keep selected group editor synced ONLY when group selection changes OR editor is clean (never clobber active edits on 5s poll)
+  useEffect(() => {
+    const selectionKey = `${bot.botId}::${selectedGroupJid}`;
+    const selectionChanged = prevGroupSelectionRef.current !== selectionKey;
+    prevGroupSelectionRef.current = selectionKey;
+
+    if (selectionChanged) {
+      isRuleDirtyRef.current = false;
+    }
+
     if (!selectedGroupJid) {
       setEditingRule(null);
       return;
     }
+
+    if (!selectionChanged && isRuleDirtyRef.current) {
+      return;
+    }
+
     const existing = bot.groupRules?.[selectedGroupJid];
     if (existing) {
       setEditingRule(existing);
@@ -128,7 +177,7 @@ export function ClientBotControlsEditor({
         createEmptyGroupRule(selectedGroupJid, known?.name || selectedGroupJid, bot.defaultModeration)
       );
     }
-  }, [selectedGroupJid, bot.groupRules, bot.defaultModeration, liveGroups]);
+  }, [bot.botId, selectedGroupJid, bot.groupRules, bot.defaultModeration, liveGroups]);
 
   const portalUrl =
     typeof window !== 'undefined'
@@ -176,6 +225,7 @@ export function ClientBotControlsEditor({
     if (!trimmed) return;
     const jid = trimmed.includes('@') ? trimmed : `${trimmed}@g.us`;
     const name = manualGroupName.trim() || jid;
+    isRuleDirtyRef.current = true;
     setSelectedGroupJid(jid);
     setEditingRule(createEmptyGroupRule(jid, name, defaultMod));
     setManualGroupJid('');
@@ -186,6 +236,7 @@ export function ClientBotControlsEditor({
     const kw = newKeyword.trim();
     const reply = newKeywordReply.trim();
     if (!kw || !reply) return;
+    isSmsDirtyRef.current = true;
     setKeywordReplies((prev) => [
       ...prev,
       { id: `kw_${Date.now()}`, keyword: kw, reply, enabled: true },
@@ -453,12 +504,14 @@ export function ClientBotControlsEditor({
             onClick={() =>
               runAction(
                 'saveDefaults',
-                () =>
-                  onUpdate({
+                async () => {
+                  await onUpdate({
                     ...(mode === 'owner' ? { clientName: clientNameInput } : {}),
                     moderateAllGroups,
                     defaultModeration: defaultMod,
-                  }),
+                  });
+                  isDefaultsDirtyRef.current = false;
+                },
                 'Saved default moderation policy.'
               )
             }
@@ -475,7 +528,10 @@ export function ClientBotControlsEditor({
             <input
               type="text"
               value={clientNameInput}
-              onChange={(e) => setClientNameInput(e.target.value)}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setClientNameInput(e.target.value);
+              }}
               className="w-full sm:max-w-sm px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
             />
           </div>
@@ -487,7 +543,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={moderateAllGroups}
-              onChange={(e) => setModerateAllGroups(e.target.checked)}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setModerateAllGroups(e.target.checked);
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -496,7 +555,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={defaultMod.deleteLinks}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, deleteLinks: e.target.checked }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, deleteLinks: e.target.checked }));
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -505,7 +567,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={defaultMod.deleteStickers}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, deleteStickers: e.target.checked }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, deleteStickers: e.target.checked }));
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -514,7 +579,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={defaultMod.deleteMedia}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, deleteMedia: e.target.checked }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, deleteMedia: e.target.checked }));
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -523,7 +591,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={defaultMod.warnEnabled}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, warnEnabled: e.target.checked }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, warnEnabled: e.target.checked }));
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -532,7 +603,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={defaultMod.kickOnLimit}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, kickOnLimit: e.target.checked }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, kickOnLimit: e.target.checked }));
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -548,12 +622,13 @@ export function ClientBotControlsEditor({
               min={1}
               max={20}
               value={defaultMod.maxWarnings}
-              onChange={(e) =>
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
                 setDefaultMod((d) => ({
                   ...d,
                   maxWarnings: Math.max(1, Math.min(20, Number(e.target.value) || 3)),
-                }))
-              }
+                }));
+              }}
               className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums focus:outline-none focus:border-emerald-600"
             />
           </div>
@@ -564,7 +639,10 @@ export function ClientBotControlsEditor({
             <input
               type="text"
               value={defaultMod.warningTemplate}
-              onChange={(e) => setDefaultMod((d) => ({ ...d, warningTemplate: e.target.value }))}
+              onChange={(e) => {
+                isDefaultsDirtyRef.current = true;
+                setDefaultMod((d) => ({ ...d, warningTemplate: e.target.value }));
+              }}
               className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
             />
           </div>
@@ -672,7 +750,10 @@ export function ClientBotControlsEditor({
                   onClick={() =>
                     runAction(
                       'saveGroupRule',
-                      () => onUpdate({ upsertGroupRule: editingRule }),
+                      async () => {
+                        await onUpdate({ upsertGroupRule: editingRule });
+                        isRuleDirtyRef.current = false;
+                      },
                       `Saved custom rules for ${editingRule.groupName}.`
                     )
                   }
@@ -690,7 +771,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.enabled}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, enabled: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, enabled: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -699,7 +783,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.deleteLinks}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, deleteLinks: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, deleteLinks: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -708,7 +795,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.deleteStickers}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, deleteStickers: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, deleteStickers: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -717,7 +807,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.deleteMedia}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, deleteMedia: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, deleteMedia: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -726,7 +819,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.warnEnabled}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, warnEnabled: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, warnEnabled: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -735,7 +831,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="checkbox"
                   checked={editingRule.kickOnLimit}
-                  onChange={(e) => setEditingRule((r) => (r ? { ...r, kickOnLimit: e.target.checked } : r))}
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, kickOnLimit: e.target.checked } : r));
+                  }}
                   className="accent-emerald-600 w-4 h-4"
                 />
               </label>
@@ -749,11 +848,12 @@ export function ClientBotControlsEditor({
                   min={1}
                   max={20}
                   value={editingRule.maxWarnings}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
                     setEditingRule((r) =>
                       r ? { ...r, maxWarnings: Math.max(1, Math.min(20, Number(e.target.value) || 3)) } : r
-                    )
-                  }
+                    );
+                  }}
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg tabular-nums"
                 />
               </div>
@@ -762,9 +862,10 @@ export function ClientBotControlsEditor({
                 <input
                   type="text"
                   value={editingRule.warningTemplate}
-                  onChange={(e) =>
-                    setEditingRule((r) => (r ? { ...r, warningTemplate: e.target.value } : r))
-                  }
+                  onChange={(e) => {
+                    isRuleDirtyRef.current = true;
+                    setEditingRule((r) => (r ? { ...r, warningTemplate: e.target.value } : r));
+                  }}
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
@@ -839,13 +940,15 @@ export function ClientBotControlsEditor({
             onClick={() =>
               runAction(
                 'saveSms',
-                () =>
-                  onUpdate({
+                async () => {
+                  await onUpdate({
                     savedReplyEnabled,
                     savedReplyMessage,
                     savedReplyCooldownMs: Math.max(0, savedReplyCooldownSec) * 1000,
                     keywordReplies,
-                  }),
+                  });
+                  isSmsDirtyRef.current = false;
+                },
                 'Saved auto-reply SMS & keyword rules.'
               )
             }
@@ -862,7 +965,10 @@ export function ClientBotControlsEditor({
             <input
               type="checkbox"
               checked={savedReplyEnabled}
-              onChange={(e) => setSavedReplyEnabled(e.target.checked)}
+              onChange={(e) => {
+                isSmsDirtyRef.current = true;
+                setSavedReplyEnabled(e.target.checked);
+              }}
               className="accent-emerald-600 w-4 h-4"
             />
           </label>
@@ -873,7 +979,10 @@ export function ClientBotControlsEditor({
               min={0}
               max={86400}
               value={savedReplyCooldownSec}
-              onChange={(e) => setSavedReplyCooldownSec(Math.max(0, Number(e.target.value) || 0))}
+              onChange={(e) => {
+                isSmsDirtyRef.current = true;
+                setSavedReplyCooldownSec(Math.max(0, Number(e.target.value) || 0));
+              }}
               className="w-24 px-2.5 py-1 text-right border border-slate-200 rounded-md tabular-nums"
             />
           </div>
@@ -884,7 +993,10 @@ export function ClientBotControlsEditor({
           <textarea
             rows={3}
             value={savedReplyMessage}
-            onChange={(e) => setSavedReplyMessage(e.target.value)}
+            onChange={(e) => {
+              isSmsDirtyRef.current = true;
+              setSavedReplyMessage(e.target.value);
+            }}
             className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
           />
         </div>
@@ -927,7 +1039,10 @@ export function ClientBotControlsEditor({
                   </div>
                   <button
                     type="button"
-                    onClick={() => setKeywordReplies((prev) => prev.filter((k) => k.id !== item.id))}
+                    onClick={() => {
+                      isSmsDirtyRef.current = true;
+                      setKeywordReplies((prev) => prev.filter((k) => k.id !== item.id));
+                    }}
                     className="text-red-600 hover:text-red-800 shrink-0 cursor-pointer"
                   >
                     Remove

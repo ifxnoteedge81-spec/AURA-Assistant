@@ -51,7 +51,8 @@ service cloud.firestore {
           'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone', 'cooldownMs',
           'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
           'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
-          'groupCooldownMs', 'groupAiGroups', 'createdAt', 'updatedAt'
+          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'configUpdatedAt',
+          'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128
         && data.autoreply is bool
@@ -75,6 +76,8 @@ service cloud.firestore {
         && (!('groupReactionEnabled' in data) || data.groupReactionEnabled is bool)
         && (!('groupCooldownMs' in data) || (data.groupCooldownMs is number && data.groupCooldownMs >= 0 && data.groupCooldownMs <= 3600000))
         && (!('groupAiGroups' in data) || (data.groupAiGroups is map && data.groupAiGroups.size() <= 200))
+        && (!('groupDirectives' in data) || (data.groupDirectives is map && data.groupDirectives.size() <= 200))
+        && (!('configUpdatedAt' in data) || (data.configUpdatedAt is string && data.configUpdatedAt.size() <= 64))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -200,7 +203,8 @@ service cloud.firestore {
           'ownerLocation', 'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone',
           'cooldownMs', 'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
           'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
-          'groupCooldownMs', 'groupAiGroups', 'createdAt', 'updatedAt'
+          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'configUpdatedAt',
+          'createdAt', 'updatedAt'
         ]);
       allow delete: if isValidId(settingId) && isOwnerResource();
     }

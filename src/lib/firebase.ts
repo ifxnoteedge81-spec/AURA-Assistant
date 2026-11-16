@@ -103,44 +103,47 @@ export async function saveCloudSettings(uid: string, config: BotConfig) {
   const path = 'bot_settings/primary';
   try {
     const ref = doc(db, 'bot_settings', 'primary');
-    let hasCreatedAt = false;
+    let existingCreatedAt: unknown = null;
     try {
       const snap = await getDocFromServer(ref);
-      hasCreatedAt = snap.exists() && Boolean(snap.data()?.createdAt);
+      if (snap.exists()) {
+        existingCreatedAt = snap.data()?.createdAt || null;
+      }
     } catch {
-      hasCreatedAt = false;
+      existingCreatedAt = null;
     }
 
     const payload: Record<string, unknown> = {
       ownerId: uid,
-      autoreply: config.autoreply,
-      aiAssistantEnabled: config.aiAssistantEnabled,
-      autoreplyMessage: config.autoreplyMessage,
-      firstGreetingTemplate: config.firstGreetingTemplate,
-      ownerName: config.ownerName,
-      ownerProfession: config.ownerProfession,
-      ownerLocation: config.ownerLocation,
-      ownerBio: config.ownerBio,
-      ownerBoundaries: config.ownerBoundaries,
-      strictLogicRules: config.strictLogicRules || '',
-      assistantTone: config.assistantTone,
-      cooldownMs: config.cooldownMs,
-      takeoverPauseMs: config.takeoverPauseMs,
-      humanTypingEnabled: config.humanTypingEnabled,
-      dailyReplyLimit: config.dailyReplyLimit,
-      antilinkGroups: config.antilinkGroups,
+      autoreply: Boolean(config.autoreply),
+      aiAssistantEnabled: Boolean(config.aiAssistantEnabled),
+      autoreplyMessage: (config.autoreplyMessage || '').slice(0, 2000) || 'Auto-reply enabled.',
+      firstGreetingTemplate: (config.firstGreetingTemplate || '').slice(0, 1500),
+      ownerName: (config.ownerName || '').slice(0, 120),
+      ownerProfession: (config.ownerProfession || '').slice(0, 200),
+      ownerLocation: (config.ownerLocation || '').slice(0, 200),
+      ownerBio: (config.ownerBio || '').slice(0, 4000),
+      ownerBoundaries: (config.ownerBoundaries || '').slice(0, 4000),
+      strictLogicRules: (config.strictLogicRules || '').slice(0, 4000),
+      assistantTone: config.assistantTone || 'witty_flirty',
+      cooldownMs: typeof config.cooldownMs === 'number' ? config.cooldownMs : 0,
+      takeoverPauseMs: typeof config.takeoverPauseMs === 'number' ? config.takeoverPauseMs : 1800000,
+      humanTypingEnabled: config.humanTypingEnabled !== false,
+      dailyReplyLimit: Math.max(1, Math.min(2000, Number(config.dailyReplyLimit || 120))),
+      antilinkGroups: config.antilinkGroups || {},
       groupAiEnabled: Boolean(config.groupAiEnabled),
       groupAiMode: config.groupAiMode || 'smart_blend',
       groupReactionEnabled: config.groupReactionEnabled !== false,
       groupCooldownMs: typeof config.groupCooldownMs === 'number' ? config.groupCooldownMs : 6000,
       groupAiGroups: config.groupAiGroups || {},
+      groupDirectives: config.groupDirectives || {},
+      configUpdatedAt: (config.configUpdatedAt || new Date().toISOString()).slice(0, 64),
+      createdAt: existingCreatedAt || serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
 
-    if (!hasCreatedAt) {
-      payload.createdAt = serverTimestamp();
-    }
-    await setDoc(ref, payload, { merge: true });
+    // Replace full settings document cleanly so deleted group keys never persist via nested map merge
+    await setDoc(ref, payload);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -255,12 +258,20 @@ export async function fetchAllCloudData(uid: string): Promise<{
       query(collection(db, 'bot_settings'), where('ownerId', '==', uid))
     );
     if (!settingsSnap.empty) {
-      settings = settingsSnap.docs[0].data() as Partial<BotConfig>;
+      const raw = settingsSnap.docs[0].data() as Partial<BotConfig> & { updatedAt?: unknown };
+      settings = {
+        ...raw,
+        configUpdatedAt: raw.configUpdatedAt || (raw.updatedAt ? toIsoString(raw.updatedAt) : undefined),
+      };
     } else {
       try {
         const primarySnap = await getDocFromServer(doc(db, 'bot_settings', 'primary'));
         if (primarySnap.exists()) {
-          settings = primarySnap.data() as Partial<BotConfig>;
+          const raw = primarySnap.data() as Partial<BotConfig> & { updatedAt?: unknown };
+          settings = {
+            ...raw,
+            configUpdatedAt: raw.configUpdatedAt || (raw.updatedAt ? toIsoString(raw.updatedAt) : undefined),
+          };
         }
       } catch {
         // non-admin or offline

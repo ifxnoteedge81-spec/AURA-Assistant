@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BookOpen,
   Cloud,
@@ -89,6 +89,13 @@ const DEFAULT_STATUS: BotStatusResponse = {
     humanTypingEnabled: true,
     dailyReplyLimit: 120,
     antilinkGroups: {},
+    groupAiEnabled: false,
+    groupAiMode: 'smart_blend',
+    groupReactionEnabled: true,
+    groupCooldownMs: 6000,
+    groupAiGroups: {},
+    groupDirectives: {},
+    configUpdatedAt: '',
   },
   logs: [],
 };
@@ -107,6 +114,8 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [cloudStatusMsg, setCloudStatusMsg] = useState<string | null>(null);
 
+  const configMutationVersionRef = useRef(0);
+
   const handleLockDashboard = useCallback(() => {
     clearStoredSession();
     setUnlockedEmail(null);
@@ -122,17 +131,35 @@ export default function App() {
 
   const fetchStatus = useCallback(async () => {
     if (!getStoredSessionToken()) return;
+    const startMutationVersion = configMutationVersionRef.current;
     try {
       const res = await authFetch('/api/bot/status');
       if (res.ok) {
         const data = (await res.json()) as BotStatusResponse;
-        setBotState((prev) => ({
-          ...data,
-          config:
-            JSON.stringify(prev.config) === JSON.stringify(data.config)
-              ? prev.config
-              : data.config,
-        }));
+        setBotState((prev) => {
+          // Never let a stale status poll revert an in-flight or newer config save
+          if (configMutationVersionRef.current !== startMutationVersion) {
+            return {
+              ...data,
+              config: prev.config,
+            };
+          }
+          const incomingTs = Date.parse(data.config?.configUpdatedAt || '') || 0;
+          const prevTs = Date.parse(prev.config?.configUpdatedAt || '') || 0;
+          if (prevTs > incomingTs && incomingTs > 0) {
+            return {
+              ...data,
+              config: prev.config,
+            };
+          }
+          return {
+            ...data,
+            config:
+              JSON.stringify(prev.config) === JSON.stringify(data.config)
+                ? prev.config
+                : data.config,
+          };
+        });
       }
     } catch {
       // keep existing state on transient errors
@@ -159,7 +186,7 @@ export default function App() {
     };
   }, [unlockedEmail, fetchStatus]);
 
-  // Listen for Firebase Google Sign-In and hydrate cloud data -> server once unlocked
+  // Listen for Firebase Google Sign-In and reconcile cloud data <-> server once unlocked
   useEffect(() => {
     const unsubscribe = subscribeAuthState(async (user) => {
       setFirebaseUser(user);
@@ -172,11 +199,25 @@ export default function App() {
             cloudData.memories.length > 0 ||
             cloudData.notes.length > 0
           ) {
-            await authFetch('/api/cloud/sync', {
+            const syncRes = await authFetch('/api/cloud/sync', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ ownerId: user.uid, ...cloudData }),
             });
+            if (syncRes.ok) {
+              const syncJson = await syncRes.json().catch(() => ({}));
+              const serverConfig = syncJson?.config as BotConfig | undefined;
+              if (serverConfig) {
+                configMutationVersionRef.current += 1;
+                setBotState((prev) => ({ ...prev, config: serverConfig }));
+                const serverTs = Date.parse(serverConfig.configUpdatedAt || '') || 0;
+                const cloudTs = Date.parse(cloudData.settings?.configUpdatedAt || '') || 0;
+                // Push newer server config back up to Firestore so cloud never stays stale
+                if (serverTs > cloudTs) {
+                  await saveCloudSettings(user.uid, serverConfig).catch(() => {});
+                }
+              }
+            }
             await fetchStatus();
             setCloudStatusMsg('Firestore synced');
           } else {
@@ -237,6 +278,17 @@ export default function App() {
   }
 
   async function handleUpdateConfig(patch: Partial<BotConfig>) {
+    configMutationVersionRef.current += 1;
+    const optimisticTs = new Date().toISOString();
+    setBotState((prev) => ({
+      ...prev,
+      config: {
+        ...prev.config,
+        ...patch,
+        configUpdatedAt: optimisticTs,
+      },
+    }));
+
     const res = await authFetch('/api/bot/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -244,9 +296,12 @@ export default function App() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      // Revert back to authoritative server status if save failed
+      await fetchStatus();
       throw new Error(data.error || 'Failed to save configuration to bot server.');
     }
     if (data.config) {
+      configMutationVersionRef.current += 1;
       setBotState((prev) => ({ ...prev, config: data.config as BotConfig }));
       if (firebaseUser) {
         try {
@@ -257,7 +312,6 @@ export default function App() {
         }
       }
     }
-    await fetchStatus();
   }
 
   async function handleSyncDictionaryEntry(entry: DictionaryEntry) {
