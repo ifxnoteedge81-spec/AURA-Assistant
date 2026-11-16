@@ -21,6 +21,7 @@ export interface KeyRotationEvent {
 
 export interface RotationOptions {
   maxTotalMs?: number;
+  channel?: string;
 }
 
 function isRealApiKey(candidate: string | undefined | null): candidate is string {
@@ -65,7 +66,7 @@ export function collectConfiguredGeminiKeys(): string[] {
 
 export class GeminiKeyPool {
   private readonly clients: GoogleGenAI[];
-  private readonly cooldownUntil: number[];
+  private readonly cooldownsByChannel = new Map<string, number[]>();
   private activeIndex = 0;
   private lastRotationReason: string | null = null;
   private lastRotatedAt: string | null = null;
@@ -82,7 +83,15 @@ export class GeminiKeyPool {
           },
         })
     );
-    this.cooldownUntil = new Array(this.clients.length).fill(0);
+  }
+
+  private getCooldownArray(channel: string): number[] {
+    let arr = this.cooldownsByChannel.get(channel);
+    if (!arr || arr.length !== this.clients.length) {
+      arr = new Array(this.clients.length).fill(0);
+      this.cooldownsByChannel.set(channel, arr);
+    }
+    return arr;
   }
 
   public hasKeys(): boolean {
@@ -99,11 +108,10 @@ export class GeminiKeyPool {
   }
 
   /**
-   * Executes a Gemini API task using the current active key slot.
+   * Executes a Gemini API task using the current active key slot for a given model channel.
    * On any quota/rate-limit/API error, automatically rotates sequentially
    * through Key #1 -> #2 -> #3 -> #4 -> #5 and wraps back around to Key #1.
-   * Skips keys currently in short failure cooldown unless all keys are cooled down,
-   * and enforces a hard total time budget so replies never stall.
+   * Preserves per-channel cooldowns so exhausted models fail over in 0ms.
    */
   public async executeWithRotation<T>(
     task: (ai: GoogleGenAI, keySlot: number) => Promise<T>,
@@ -115,6 +123,8 @@ export class GeminiKeyPool {
       throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
     }
 
+    const channel = options?.channel || 'primary';
+    const cooldownUntil = this.getCooldownArray(channel);
     const now = Date.now();
     const maxTotalMs = options?.maxTotalMs ?? 9_000;
     const deadline = now + maxTotalMs;
@@ -122,18 +132,23 @@ export class GeminiKeyPool {
     // Build ordered candidate indices starting from activeIndex, prioritizing non-cooled-down slots
     const startIdx = this.activeIndex % total;
     const readyOrder: number[] = [];
-    const cooledOrder: number[] = [];
 
     for (let offset = 0; offset < total; offset += 1) {
       const idx = (startIdx + offset) % total;
-      if (this.cooldownUntil[idx] <= now) {
+      if (cooldownUntil[idx] <= now) {
         readyOrder.push(idx);
-      } else {
-        cooledOrder.push(idx);
       }
     }
 
-    const attemptOrder = readyOrder.length > 0 ? readyOrder : cooledOrder;
+    if (readyOrder.length === 0) {
+      const earliestUnlockMs = Math.min(...cooldownUntil);
+      const waitSec = Math.max(1, Math.ceil((earliestUnlockMs - now) / 1000));
+      throw new Error(
+        `All ${total} Gemini API key(s) on [${channel}] are in cooldown (~${waitSec}s left); instant fail-over.`
+      );
+    }
+
+    const attemptOrder = readyOrder;
     let lastError: Error = new Error('Unknown Gemini API error');
 
     for (let i = 0; i < attemptOrder.length; i += 1) {
@@ -146,27 +161,39 @@ export class GeminiKeyPool {
 
       try {
         const value = await task(this.clients[idx], keySlot);
-        // Keep activeIndex pinned on the healthy key that succeeded and clear its cooldown
+        // Keep activeIndex pinned on the healthy key that succeeded and clear its cooldown on this channel
         this.activeIndex = idx;
-        this.cooldownUntil[idx] = 0;
+        cooldownUntil[idx] = 0;
         return { value, keySlot };
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         lastError = err instanceof Error ? err : new Error(reason);
 
-        // Apply short cooldown on failing key so subsequent messages don't stall re-testing it
+        // Apply accurate cooldown per error type so exhausted/rate-limited keys are skipped quickly
         const lowerReason = reason.toLowerCase();
         const isHardAuthError =
           lowerReason.includes('api_key_invalid') ||
           lowerReason.includes('permission_denied') ||
           lowerReason.includes('403') ||
           lowerReason.includes('401');
-        const cooldownMs = isHardAuthError ? 120_000 : 20_000;
-        this.cooldownUntil[idx] = Date.now() + cooldownMs;
+        const isQuotaError =
+          lowerReason.includes('429') ||
+          lowerReason.includes('resource_exhausted') ||
+          lowerReason.includes('quota') ||
+          lowerReason.includes('rate limit');
+        const isTimeoutError = lowerReason.includes('timed out') || lowerReason.includes('timeout');
+        const cooldownMs = isHardAuthError
+          ? 120_000
+          : isQuotaError
+            ? 45_000
+            : isTimeoutError
+              ? 25_000
+              : 20_000;
+        cooldownUntil[idx] = Date.now() + cooldownMs;
 
         const nextIdx = (idx + 1) % total;
         this.activeIndex = nextIdx;
-        this.lastRotationReason = `Key #${keySlot}: ${reason.slice(0, 140)}`;
+        this.lastRotationReason = `[${channel}] Key #${keySlot}: ${reason.slice(0, 130)}`;
         this.lastRotatedAt = new Date().toISOString();
 
         if (total > 1) {
@@ -180,15 +207,10 @@ export class GeminiKeyPool {
       }
     }
 
-    // All attempted keys failed -> wrap cycle cleanly back to Key #1 for the next cycle
+    // Keep cooldown timestamps intact so the next message fails over in 0ms until keys recover
     this.activeIndex = 0;
-    for (let i = 0; i < this.cooldownUntil.length; i += 1) {
-      if (this.cooldownUntil[i] <= Date.now() + 20_000) {
-        this.cooldownUntil[i] = 0;
-      }
-    }
     throw new Error(
-      `All ${total} Gemini API key(s) failed in this rotation cycle. Last error: ${lastError.message}`
+      `All ${total} Gemini API key(s) failed on [${channel}]. Last error: ${lastError.message}`
     );
   }
 }

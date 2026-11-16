@@ -116,6 +116,15 @@ const botConfig = loadConfig();
 // Runtime caches & guards
 const groupMetadataCache = new Map(); // jid -> { metadata, expiresAt }
 const autoReplyCooldowns = new Map(); // senderJid -> lastRepliedTimestamp
+setInterval(() => {
+  const now = Date.now();
+  for (const [jid, entry] of groupMetadataCache.entries()) {
+    if (entry.expiresAt <= now) groupMetadataCache.delete(jid);
+  }
+  for (const [jid, ts] of autoReplyCooldowns.entries()) {
+    if (now - ts > 60 * 60 * 1000) autoReplyCooldowns.delete(jid);
+  }
+}, 10 * 60 * 1000).unref?.();
 let reconnectAttempts = 0;
 let isShuttingDown = false;
 let currentSocket = null;
@@ -337,14 +346,15 @@ async function handleIncomingMessage(sock, msg) {
   const remoteJid = msg.key.remoteJid;
   if (!remoteJid) return;
 
-  // Ignore status broadcasts and channels/newsletters
-  if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
+  // Ignore status broadcasts, broadcast lists, and channels/newsletters
+  if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@broadcast') || remoteJid.endsWith('@newsletter')) {
     return;
   }
 
   const isGroup = isJidGroup(remoteJid);
   const text = extractMessageText(msg.message);
   const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
+  const senderAlt = msg.key.participantAlt;
 
   // --------------------------------------------------------------------------
   // A. GROUP ANTI-LINK PROTECTION (Runs before commands so links are caught fast)
@@ -357,7 +367,7 @@ async function handleIncomingMessage(sock, msg) {
       try {
         const metadata = await getCachedGroupMetadata(sock, remoteJid);
         const botIsAdmin = isParticipantAdmin(metadata, sock.user?.id, sock.user?.lid);
-        const senderIsAdmin = isParticipantAdmin(metadata, senderJid);
+        const senderIsAdmin = isParticipantAdmin(metadata, senderJid, senderAlt);
 
         if (botIsAdmin && !senderIsAdmin) {
           // Immediately delete the violating message
@@ -426,7 +436,7 @@ async function handleIncomingMessage(sock, msg) {
 
       try {
         const metadata = await getCachedGroupMetadata(sock, remoteJid);
-        const senderIsAdmin = isParticipantAdmin(metadata, senderJid) || isOwnerOrSelf(msg, sock);
+        const senderIsAdmin = isParticipantAdmin(metadata, senderJid, senderAlt) || isOwnerOrSelf(msg, sock);
 
         if (!senderIsAdmin) {
           await sock.sendMessage(
@@ -628,7 +638,7 @@ async function startWhatsAppBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
     },
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   });

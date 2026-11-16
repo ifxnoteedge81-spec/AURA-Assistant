@@ -23,6 +23,7 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import type {
   BotConfig,
   ChatMemoryRecord,
+  ClientBotItem,
   DictionaryEntry,
   InboxNoteRecord,
 } from '../types';
@@ -82,17 +83,6 @@ export function handleFirestoreError(
   console.error('Firestore Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
 }
-
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
-  }
-}
-void testConnection();
 
 export function subscribeAuthState(cb: (user: User | null) => void) {
   return onAuthStateChanged(auth, cb);
@@ -160,20 +150,27 @@ export async function saveCloudDictionaryEntry(uid: string, entry: DictionaryEnt
   const path = `dictionary_entries/${entry.id}`;
   try {
     const ref = doc(db, 'dictionary_entries', entry.id);
-    await setDoc(
-      ref,
-      {
-        ownerId: uid,
-        term: entry.term,
-        meaning: entry.meaning,
-        district: entry.district,
-        language: entry.language,
-        replyStyleHint: entry.replyStyleHint || '',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
+    let hasCreatedAt = false;
+    try {
+      const snap = await getDocFromServer(ref);
+      hasCreatedAt = snap.exists() && Boolean(snap.data()?.createdAt);
+    } catch {
+      hasCreatedAt = false;
+    }
+
+    const payload: Record<string, unknown> = {
+      ownerId: uid,
+      term: entry.term,
+      meaning: entry.meaning,
+      district: entry.district,
+      language: entry.language,
+      replyStyleHint: entry.replyStyleHint || '',
+      updatedAt: serverTimestamp(),
+    };
+    if (!hasCreatedAt) {
+      payload.createdAt = serverTimestamp();
+    }
+    await setDoc(ref, payload, { merge: true });
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -183,6 +180,52 @@ export async function deleteCloudDictionaryEntry(id: string) {
   const path = `dictionary_entries/${id}`;
   try {
     await deleteDoc(doc(db, 'dictionary_entries', id));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export async function saveCloudClientBot(uid: string, bot: ClientBotItem) {
+  const path = `client_bots/${bot.botId}`;
+  try {
+    const ref = doc(db, 'client_bots', bot.botId);
+    let hasCreatedAt = false;
+    try {
+      const snap = await getDocFromServer(ref);
+      hasCreatedAt = snap.exists() && Boolean(snap.data()?.createdAt);
+    } catch {
+      hasCreatedAt = false;
+    }
+
+    const payload: Record<string, unknown> = {
+      ownerId: uid,
+      botId: bot.botId,
+      clientName: bot.clientName.slice(0, 120),
+      phoneNumber: (bot.phoneNumber || '').slice(0, 32),
+      active: Boolean(bot.active),
+      clientAccessKey: bot.clientAccessKey,
+      moderateAllGroups: Boolean(bot.moderateAllGroups),
+      defaultModeration: bot.defaultModeration,
+      groupRules: bot.groupRules,
+      savedReplyEnabled: Boolean(bot.savedReplyEnabled),
+      savedReplyMessage: (bot.savedReplyMessage || '').slice(0, 2000),
+      savedReplyCooldownMs: Math.max(0, Math.min(86400000, bot.savedReplyCooldownMs || 0)),
+      keywordReplies: Array.isArray(bot.keywordReplies) ? bot.keywordReplies.slice(0, 50) : [],
+      updatedAt: serverTimestamp(),
+    };
+    if (!hasCreatedAt) {
+      payload.createdAt = serverTimestamp();
+    }
+    await setDoc(ref, payload, { merge: true });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteCloudClientBot(botId: string) {
+  const path = `client_bots/${botId}`;
+  try {
+    await deleteDoc(doc(db, 'client_bots', botId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }

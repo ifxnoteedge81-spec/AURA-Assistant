@@ -140,6 +140,37 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidClientBot(data) {
+      return data.keys().hasAll([
+          'ownerId', 'botId', 'clientName', 'active', 'clientAccessKey',
+          'moderateAllGroups', 'defaultModeration', 'groupRules',
+          'savedReplyEnabled', 'savedReplyMessage', 'savedReplyCooldownMs',
+          'keywordReplies', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'botId', 'clientName', 'phoneNumber', 'active', 'clientAccessKey',
+          'moderateAllGroups', 'defaultModeration', 'groupRules',
+          'savedReplyEnabled', 'savedReplyMessage', 'savedReplyCooldownMs',
+          'keywordReplies', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128
+        && data.botId is string && isValidId(data.botId)
+        && data.clientName is string && data.clientName.size() >= 1 && data.clientName.size() <= 120
+        && (!('phoneNumber' in data) || (data.phoneNumber is string && data.phoneNumber.size() <= 32))
+        && data.active is bool
+        && data.clientAccessKey is string && data.clientAccessKey.size() >= 16 && data.clientAccessKey.size() <= 128
+        && data.moderateAllGroups is bool
+        && data.defaultModeration is map && data.defaultModeration.size() <= 20
+        && data.groupRules is map && data.groupRules.size() <= 200
+        && data.savedReplyEnabled is bool
+        && data.savedReplyMessage is string && data.savedReplyMessage.size() <= 2000
+        && data.savedReplyCooldownMs is number && data.savedReplyCooldownMs >= 0 && data.savedReplyCooldownMs <= 86400000
+        && data.keywordReplies is list && data.keywordReplies.size() <= 50
+        && (data.keywordReplies.size() == 0 || data.keywordReplies[0] is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // ------------------------------------------------------------------------
     // Collection Rules
     // ------------------------------------------------------------------------
@@ -280,6 +311,32 @@ service cloud.firestore {
           'phoneNumber', 'credsData', 'updatedAt'
         ]);
       allow delete: if isValidId(sessionId) && isOwnerResource();
+    }
+
+    match /client_bots/{botId} {
+      allow get: if isValidId(botId) && isOwnerResource();
+      allow list: if isSignedIn() && (existing().ownerId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn()
+        && isValidId(botId)
+        && isValidClientBot(incoming())
+        && incoming().botId == botId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(botId)
+        && isValidClientBot(incoming())
+        && isOwnerResource()
+        && incoming().botId == existing().botId
+        && (incoming().ownerId == existing().ownerId || (existing().ownerId == 'server_admin' && isAdmin()))
+        && (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt)
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'ownerId', 'clientName', 'phoneNumber', 'active', 'clientAccessKey',
+          'moderateAllGroups', 'defaultModeration', 'groupRules',
+          'savedReplyEnabled', 'savedReplyMessage', 'savedReplyCooldownMs',
+          'keywordReplies', 'updatedAt'
+        ]);
+      allow delete: if isValidId(botId) && isOwnerResource();
     }
   }
 }

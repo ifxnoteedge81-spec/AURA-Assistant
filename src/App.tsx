@@ -11,9 +11,12 @@ import {
   MessageSquare,
   Shield,
   ShieldCheck,
+  Smartphone,
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import { AssistantBrainPanel } from './components/AssistantBrainPanel';
+import { ClientBotsPanel } from './components/ClientBotsPanel';
+import { ClientPortalView } from './components/ClientPortalView';
 import { CommandSimulator } from './components/CommandSimulator';
 import { InboxMemoryPanel } from './components/InboxMemoryPanel';
 import { LockScreen } from './components/LockScreen';
@@ -28,8 +31,10 @@ import {
   getStoredSessionToken,
 } from './lib/api';
 import {
+  deleteCloudClientBot,
   deleteCloudDictionaryEntry,
   fetchAllCloudData,
+  saveCloudClientBot,
   saveCloudDictionaryEntry,
   saveCloudSettings,
   signInWithGoogle,
@@ -50,6 +55,7 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: typeof LayoutDashboard }
   { id: 'inbox', label: 'Notes & Chat Memory', icon: Inbox },
   { id: 'simulator', label: 'Command Simulator', icon: MessageSquare },
   { id: 'rules', label: 'Anti-Link & Auto-Reply', icon: Shield },
+  { id: 'clients', label: 'Client Bots (Multi)', icon: Smartphone },
   { id: 'security', label: 'Security & Anti-Ban', icon: ShieldCheck },
   { id: 'source', label: 'Render Source Code', icon: Code2 },
 ];
@@ -88,6 +94,11 @@ const DEFAULT_STATUS: BotStatusResponse = {
 };
 
 export default function App() {
+  const portalParams =
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const portalBotId = portalParams?.get('portal')?.trim() || '';
+  const portalAccessKey = portalParams?.get('access')?.trim() || '';
+
   const [unlockedEmail, setUnlockedEmail] = useState<string | null>(() =>
     getStoredSessionToken() ? getStoredSessionEmail() || 'ifxnoteedge81@gmail.com' : null
   );
@@ -169,7 +180,13 @@ export default function App() {
             await fetchStatus();
             setCloudStatusMsg('Firestore synced');
           } else {
-            await saveCloudSettings(user.uid, botState.config);
+            const liveRes = await authFetch('/api/bot/status');
+            if (liveRes.ok) {
+              const liveStatus = await liveRes.json();
+              if (liveStatus?.config) {
+                await saveCloudSettings(user.uid, liveStatus.config);
+              }
+            }
             setCloudStatusMsg('Firestore connected');
           }
         } catch (err) {
@@ -181,6 +198,10 @@ export default function App() {
     });
     return () => unsubscribe();
   }, [unlockedEmail, fetchStatus]);
+
+  if (portalBotId && portalAccessKey) {
+    return <ClientPortalView botId={portalBotId} accessKey={portalAccessKey} />;
+  }
 
   if (!unlockedEmail) {
     return (
@@ -420,6 +441,17 @@ export default function App() {
             <ModerationRules
               config={botState.config}
               onUpdateConfig={handleUpdateConfig}
+            />
+          )}
+
+          {section === 'clients' && (
+            <ClientBotsPanel
+              onCloudSyncBot={
+                firebaseUser ? (bot) => saveCloudClientBot(firebaseUser.uid, bot) : undefined
+              }
+              onCloudDeleteBot={
+                firebaseUser ? (botId) => deleteCloudClientBot(botId) : undefined
+              }
             />
           )}
 

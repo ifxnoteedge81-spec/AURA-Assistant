@@ -174,80 +174,311 @@ export function sanitizeId(raw: string): string {
   return cleaned || `id_${Date.now()}`;
 }
 
+function detectDictionaryLanguage(term: string, meaning: string, explicitLang?: string): DictionaryEntry['language'] {
+  if (explicitLang === 'bn_dialect' || explicitLang === 'bn_en' || explicitLang === 'en_slang') {
+    return explicitLang;
+  }
+  const hasBanglaTerm = /[\u0980-\u09FF]/.test(term);
+  const hasBanglaMeaning = /[\u0980-\u09FF]/.test(meaning);
+  if (!hasBanglaTerm && hasBanglaMeaning) return 'bn_en';
+  if (!hasBanglaTerm && !hasBanglaMeaning) return 'en_slang';
+  return 'bn_dialect';
+}
+
+function normalizeParsedDictItem(
+  rawTerm: string,
+  rawMeaning: string,
+  rawDistrict = 'General',
+  rawHint = '',
+  explicitLang?: string
+): Omit<DictionaryEntry, 'id'> | null {
+  const term = rawTerm.replace(/\s+/g, ' ').trim();
+  const meaning = rawMeaning.replace(/\s+/g, ' ').trim();
+  if (!term || !meaning || term.length > 200) return null;
+  const district = (rawDistrict || 'General').trim().slice(0, 100) || 'General';
+  const replyStyleHint = (rawHint || '').trim().slice(0, 300);
+  return {
+    term: term.slice(0, 200),
+    meaning: meaning.slice(0, 500),
+    district,
+    language: detectDictionaryLanguage(term, meaning, explicitLang),
+    replyStyleHint,
+  };
+}
+
+function mapJsonObjectToEntry(item: Record<string, unknown>): Omit<DictionaryEntry, 'id'> | null {
+  const primaryTerm = String(
+    item.term ||
+      item.word ||
+      item.english ||
+      item.en ||
+      item.headword ||
+      item.phrase ||
+      item.key ||
+      ''
+  ).trim();
+  const term = primaryTerm || String(item.bangla || '').trim();
+
+  const rawMeaningField =
+    item.meaning ??
+    item.meanings ??
+    item.definition ??
+    item.definitions ??
+    item.translation ??
+    item.bangla_meaning ??
+    item.bn_meaning ??
+    item.bn ??
+    (primaryTerm ? item.bangla : undefined) ??
+    item.english_meaning ??
+    item.value ??
+    item.ans ??
+    '';
+
+  const meaning = Array.isArray(rawMeaningField)
+    ? rawMeaningField.map((v) => String(v || '').trim()).filter(Boolean).join(', ')
+    : String(rawMeaningField || '').trim();
+
+  const district = String(item.district || item.region || item.zilla || item.category || 'General').trim();
+  const hint = String(item.replyStyleHint || item.hint || item.example || item.note || '').trim();
+  const explicitLang = typeof item.language === 'string' ? item.language : undefined;
+  return normalizeParsedDictItem(term, meaning, district, hint, explicitLang);
+}
+
+function splitCsvLineSmart(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      out.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out.map((col) => col.replace(/^["']|["']$/g, '').trim());
+}
+
 export function parseUploadedDictionary(
   rawText: string,
   fileName: string
 ): Array<Omit<DictionaryEntry, 'id'>> {
   const lowerName = fileName.toLowerCase();
-  const trimmed = rawText.trim();
+  const trimmed = rawText.replace(/^\uFEFF/, '').trim();
   if (!trimmed) return [];
 
-  if (lowerName.endsWith('.json') || trimmed.startsWith('[') || trimmed.startsWith('{')) {
-    const parsed = JSON.parse(trimmed);
-    const items = Array.isArray(parsed) ? parsed : Array.isArray(parsed.entries) ? parsed.entries : [parsed];
-    const results: Array<Omit<DictionaryEntry, 'id'>> = [];
+  // 1. Try full JSON / Key-Value JSON Object / JSON Array
+  if (lowerName.endsWith('.json') || trimmed.startsWith('[') || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      const results: Array<Omit<DictionaryEntry, 'id'>> = [];
 
-    for (const item of items) {
-      if (!item || typeof item !== 'object') continue;
-      const term = String(item.term || item.word || item.bangla || item.phrase || '').trim();
-      const meaning = String(item.meaning || item.english || item.translation || item.definition || '').trim();
-      if (!term || !meaning) continue;
-      const district = String(item.district || item.region || item.zilla || 'General').trim();
-      const rawLang = String(item.language || 'bn_dialect');
-      const language: DictionaryEntry['language'] =
-        rawLang === 'bn_en' || rawLang === 'en_slang' ? rawLang : 'bn_dialect';
-      const replyStyleHint = String(item.replyStyleHint || item.hint || item.example || '').trim();
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (!item || typeof item !== 'object') continue;
+          const mapped = mapJsonObjectToEntry(item as Record<string, unknown>);
+          if (mapped) results.push(mapped);
+        }
+        return results;
+      }
 
-      results.push({
-        term: term.slice(0, 200),
-        meaning: meaning.slice(0, 500),
-        district: district.slice(0, 100),
-        language,
-        replyStyleHint: replyStyleHint.slice(0, 300),
-      });
+      if (parsed && typeof parsed === 'object') {
+        const obj = parsed as Record<string, unknown>;
+        const nestedArray =
+          (Array.isArray(obj.entries) && obj.entries) ||
+          (Array.isArray(obj.words) && obj.words) ||
+          (Array.isArray(obj.data) && obj.data) ||
+          (Array.isArray(obj.dictionary) && obj.dictionary);
+
+        if (nestedArray) {
+          for (const item of nestedArray) {
+            if (!item || typeof item !== 'object') continue;
+            const mapped = mapJsonObjectToEntry(item as Record<string, unknown>);
+            if (mapped) results.push(mapped);
+          }
+          return results;
+        }
+
+        // Single structured entry vs Key-Value dictionary {"abandon": "ত্যাগ করা"}
+        if ('term' in obj || 'word' in obj || 'meaning' in obj) {
+          const single = mapJsonObjectToEntry(obj);
+          if (single) return [single];
+        }
+
+        for (const [k, v] of Object.entries(obj)) {
+          if (typeof v === 'string') {
+            const mapped = normalizeParsedDictItem(k, v);
+            if (mapped) results.push(mapped);
+          } else if (v && typeof v === 'object') {
+            const vObj = v as Record<string, unknown>;
+            const meaning = String(vObj.meaning || vObj.bn || vObj.definition || vObj.translation || '').trim();
+            const district = String(vObj.district || vObj.region || 'General').trim();
+            const hint = String(vObj.hint || vObj.replyStyleHint || vObj.example || '').trim();
+            const mapped = normalizeParsedDictItem(k, meaning, district, hint);
+            if (mapped) results.push(mapped);
+          }
+        }
+        return results;
+      }
+    } catch {
+      // Fall through to line-by-line JSONL / smart text parser (e.g. chunked JSON fragments!)
     }
-    return results;
   }
 
-  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  // 2. Line-by-line Smart Parser (JSONL, Pipe, Tab, Semicolon, Arrow, Colon, Dash, Equals, CSV, English->Bangla)
+  const lines = trimmed.split(/\r?\n/);
   const results: Array<Omit<DictionaryEntry, 'id'>> = [];
 
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (line.startsWith('#') || line.startsWith('//')) continue;
-
-    let parts: string[];
-    if (line.includes('|')) {
-      parts = line.split('|').map((s) => s.trim());
-    } else if (line.includes('\t')) {
-      parts = line.split('\t').map((s) => s.trim());
-    } else {
-      parts = line.split(',').map((s) => s.trim().replace(/^["']|["']$/g, ''));
-    }
-
-    if (
-      i === 0 &&
-      parts[0]?.toLowerCase().includes('term') &&
-      parts[1]?.toLowerCase().includes('meaning')
-    ) {
+    let line = lines[i].trim();
+    if (!line || line === '[' || line === ']' || line === '{' || line === '}') continue;
+    if (line.startsWith('#') || line.startsWith('//') || line.startsWith('/*') || line.startsWith('-- ')) {
       continue;
     }
 
-    if (parts.length < 2) continue;
-    const term = parts[0];
-    const meaning = parts[1];
-    if (!term || !meaning) continue;
+    // Remove trailing comma from partial JSON chunk lines
+    if (line.endsWith(',')) {
+      const noComma = line.slice(0, -1).trim();
+      if (noComma.startsWith('{') && noComma.endsWith('}')) {
+        line = noComma;
+      }
+    }
 
-    const district = parts[2] || 'General';
-    const hint = parts[3] || '';
+    // Handle JSONL object per line
+    if (line.startsWith('{') && line.endsWith('}')) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        const mapped = mapJsonObjectToEntry(obj);
+        if (mapped) results.push(mapped);
+        continue;
+      } catch {
+        // continue to text parsing
+      }
+    }
 
-    results.push({
-      term: term.slice(0, 200),
-      meaning: meaning.slice(0, 500),
-      district: district.slice(0, 100),
-      language: 'bn_dialect',
-      replyStyleHint: hint.slice(0, 300),
-    });
+    // Handle JSON key-value line like: "abandon": "ত্যাগ করা, ছেড়ে দেওয়া।",
+    const jsonKvMatch = line.match(/^"([^"]{1,180})"\s*:\s*"([^"]{1,480})"\s*,?$/);
+    if (jsonKvMatch) {
+      const mapped = normalizeParsedDictItem(jsonKvMatch[1], jsonKvMatch[2]);
+      if (mapped) results.push(mapped);
+      continue;
+    }
+
+    // Strip common markdown/wordlist bullets or numbering: "- word", "1. word", "• word"
+    line = line.replace(/^(?:\d+[.)]\s+|[-*•]\s+)/, '').trim();
+    if (!line) continue;
+
+    const isHeaderTuple = (c0?: string, c1?: string) => {
+      const a = (c0 || '').trim().toLowerCase();
+      const b = (c1 || '').trim().toLowerCase();
+      return (
+        (a === 'term' || a === 'word' || a === 'phrase' || a === 'english') &&
+        (b === 'meaning' || b === 'definition' || b === 'bangla' || b === 'translation')
+      );
+    };
+
+    // A. Pipe-delimited: term | meaning | district | hint
+    if (line.includes('|')) {
+      const parts = line.split('|').map((s) => s.trim());
+      if (isHeaderTuple(parts[0], parts[1])) continue;
+      if (parts.length >= 2) {
+        const mapped = normalizeParsedDictItem(parts[0], parts[1], parts[2], parts[3]);
+        if (mapped) results.push(mapped);
+        continue;
+      }
+    }
+
+    // B. Tab-delimited: term \t meaning \t district \t hint
+    if (line.includes('\t')) {
+      const parts = line.split('\t').map((s) => s.trim());
+      if (isHeaderTuple(parts[0], parts[1])) continue;
+      if (parts.length >= 2) {
+        const mapped = normalizeParsedDictItem(parts[0], parts[1], parts[2], parts[3]);
+        if (mapped) results.push(mapped);
+        continue;
+      }
+    }
+
+    // C. Arrow / Double-Colon / Equals / Spaced Dash / Colon (split ONLY on first match so commas & । inside meaning stay intact!)
+    const firstDelimMatch = line.match(
+      /^(.{1,120}?)\s*(?:=>|->|::|\s=\s|\s:\s|\s[—–-]\s|:\s+|=\s*)(.+)$/
+    );
+    if (firstDelimMatch && !/^https?$/i.test(firstDelimMatch[1].trim())) {
+      let termPart = firstDelimMatch[1].trim();
+      const meaningPart = firstDelimMatch[2].trim();
+      let districtPart = 'General';
+
+      // Optional trailing [District] or (District) on termPart: e.g. "কেনে আছো (চট্টগ্রাম) : কেমন আছো"
+      const termDistrictMatch = termPart.match(/^(.+?)\s*[\[(]([^\])]{2,40})[\])]$/);
+      if (termDistrictMatch && /[\u0980-\u09FF]/.test(termDistrictMatch[1])) {
+        termPart = termDistrictMatch[1].trim();
+        districtPart = termDistrictMatch[2].trim();
+      }
+
+      const mapped = normalizeParsedDictItem(termPart, meaningPart, districtPart);
+      if (mapped) results.push(mapped);
+      continue;
+    }
+
+    // D. Semicolon-delimited: term ; meaning ; district ; hint
+    if (line.includes(';')) {
+      const idx = line.indexOf(';');
+      const termPart = line.slice(0, idx).trim();
+      const rest = line.slice(idx + 1).trim();
+      const mapped = normalizeParsedDictItem(termPart, rest);
+      if (mapped) results.push(mapped);
+      continue;
+    }
+
+    // E. Natural English Headword -> Bangla Meaning without delimiter (runs BEFORE comma CSV so commas in Bangla meaning stay intact!)
+    //    e.g. "achieve (v.) অর্জন করা, সফল হওয়া।"
+    if (!line.startsWith('"')) {
+      const enBnMatch = line.match(
+        /^([a-zA-Z0-9][a-zA-Z0-9' _.-]{0,60}?)\s+(\([^)]{1,16}\)\s+)?([\u0980-\u09FF].+)$/
+      );
+      if (enBnMatch && !enBnMatch[1].includes(',')) {
+        const cleanTerm = enBnMatch[1].trim();
+        const posPrefix = enBnMatch[2] ? `${enBnMatch[2].trim()} ` : '';
+        const mapped = normalizeParsedDictItem(cleanTerm, `${posPrefix}${enBnMatch[3].trim()}`);
+        if (mapped) results.push(mapped);
+        continue;
+      }
+    }
+
+    // F. Comma-separated / Quoted CSV: "word","meaning, with comma এবং দাড়ি।",District,Hint
+    if (line.includes(',')) {
+      const parts = splitCsvLineSmart(line);
+      if (isHeaderTuple(parts[0], parts[1])) continue;
+      if (parts.length >= 2) {
+        const isQuotedCsv = line.includes('"');
+        if (isQuotedCsv || parts.length === 2) {
+          const mapped = normalizeParsedDictItem(parts[0], parts[1], parts[2], parts[3]);
+          if (mapped) results.push(mapped);
+          continue;
+        }
+        // Unquoted 3+ columns: if col[2] looks like a short District tag without ।, treat as district; otherwise join meanings!
+        const col2 = parts[2] || '';
+        const looksLikeMeaningList =
+          col2.includes('।') || col2.length > 35 || /[\u0980-\u09FF]/.test(col2);
+        if (looksLikeMeaningList && !parts[3]) {
+          const mapped = normalizeParsedDictItem(parts[0], parts.slice(1).join(', '));
+          if (mapped) results.push(mapped);
+          continue;
+        }
+        const mapped = normalizeParsedDictItem(parts[0], parts[1], parts[2], parts[3]);
+        if (mapped) results.push(mapped);
+        continue;
+      }
+    }
   }
 
   return results;
@@ -270,7 +501,7 @@ export function findRelevantDictionaryEntries(
     const hits = subTerms.some((token) => lower.includes(token));
     if (hits) {
       matched.push(entry);
-      if (matched.length >= 5) break;
+      if (matched.length >= 8) break;
     }
   }
   return matched;
@@ -592,12 +823,19 @@ export async function generateExecutiveAssistantReply(params: {
   const matchedDict = findRelevantDictionaryEntries(incomingText, dictionaryEntries);
   const logicRules = settings.strictLogicRules?.trim() || DEFAULT_STRICT_LOGIC_RULES;
   const inboxSummary = memory?.lastSummary?.trim();
+  const hasPriorMemory = existingTurns.length > 0 || archivedMatches.length > 0 || Boolean(inboxSummary);
+
+  const identityRule = hasPriorMemory
+    ? `IDENTITY & MEMORY VERIFICATION: You ALREADY KNOW "${contactName || 'this contact'}" from the saved inbox summary, recent messages, and archive below. Verify who they are and reply seamlessly with full continuity of your past relationship & discussions.`
+    : `IDENTITY & MEMORY VERIFICATION: "${contactName || 'this contact'}" is a FIRST-TIME or unrecognized contact with NO saved prior chat history yet. Do NOT invent or assume fake past conversations! Greet warmly, introduce yourself naturally as Sir's personal assistant, and ask/verify who they are or what they need so their profile is saved from now on.`;
 
   const systemInstruction = [
     `You are the emotionally expressive, logically sharp, human-like 24/7 WhatsApp Personal Assistant for "${settings.ownerName || 'Sir'}" (${settings.ownerProfession || 'Professional'}, ${settings.ownerLocation || 'Bangladesh'}).`,
     `Bio about Sir: ${settings.ownerBio || DEFAULT_OWNER_BIO}`,
     `Strict Boundaries (refuse politely yet firmly if asked): ${settings.ownerBoundaries || DEFAULT_OWNER_BOUNDARIES}`,
     `Personality & Emotional Tone: ${getToneInstruction(settings.assistantTone)}`,
+    '',
+    identityRule,
     '',
     'STRICT LOGIC, DEBATE, EMOTION & CONTINUITY RULES:',
     logicRules,
@@ -607,7 +845,7 @@ export async function generateExecutiveAssistantReply(params: {
     `- Time-Lapse Guidance: ${timeLapse.guidance}`,
     '',
     inboxSummary
-      ? `DEEP INBOX MEMORY SUMMARY (Generated from full prior chat & Sir's manual messages — use this context naturally):\n${inboxSummary}`
+      ? `DEEP INBOX MEMORY SUMMARY (Auto-saved from full prior chat & Sir's manual messages — use this context naturally):\n${inboxSummary}`
       : '',
     archivedMatches.length > 0
       ? `LONG-TERM ARCHIVE RECALL (Relevant older messages from full chat history):\n${archivedMatches
@@ -663,39 +901,52 @@ export async function generateExecutiveAssistantReply(params: {
   let primaryFailed = false;
 
   if (canUseGemini) {
-    try {
+    const runGeminiModel = async (
+      modelName: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
+      channel: 'primary' | 'lite'
+    ) => {
       const exec = async (client: GoogleGenAI) =>
         withTimeout(
           client.models.generateContent({
-            model: 'gemini-4-hydrogen',
+            model: modelName,
             contents: promptContent,
             config: {
               systemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              ...(modelName === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
               responseMimeType: 'application/json',
               responseSchema,
             },
           }),
-          7_500,
-          'Expressive Assistant Gemini call'
+          5_500,
+          `Expressive Assistant ${modelName} call`
         );
 
-      const { value: response, keySlot } =
-        keyPool && keyPool.hasKeys()
-          ? await keyPool.executeWithRotation(exec, onKeyRotate, { maxTotalMs: 12_000 })
-          : { value: await exec(ai!), keySlot: 1 };
+      return keyPool && keyPool.hasKeys()
+        ? await keyPool.executeWithRotation(exec, onKeyRotate, { maxTotalMs: 8_000, channel })
+        : { value: await exec(ai!), keySlot: 1 };
+    };
 
+    try {
+      const { value: response, keySlot } = await runGeminiModel('gemini-4-hydrogen', 'primary');
       rawOutputText = response.text || '';
       keySlotUsed = keySlot;
       providerUsed = 'gemini';
-    } catch (geminiErr) {
-      primaryFailed = true;
-      if (!canUseOpenRouter) {
-        throw geminiErr;
+    } catch {
+      try {
+        const { value: liteResponse, keySlot } = await runGeminiModel('gemini-3.1-flash-lite', 'lite');
+        rawOutputText = liteResponse.text || '';
+        keySlotUsed = keySlot;
+        providerUsed = 'gemini';
+      } catch {
+        primaryFailed = true;
+        providerUsed = 'offline_emotion';
       }
     }
   } else {
     primaryFailed = true;
+    providerUsed = 'offline_emotion';
   }
 
   // Secondary AI Fail-Safe: If all 5 Gemini keys fail/exhaust, fall back to OpenRouter
@@ -994,7 +1245,20 @@ export async function generateGroupCloneAction(params: {
     };
   }
 
-  if (!settings.aiAssistantEnabled || (!canUseGemini && !canUseOpenRouter)) {
+  // Zero-API quota saver: handle 1-word filler or cooldown chatter without calling Gemini/OpenRouter
+  const trimmedLower = incomingText.toLowerCase().trim();
+  const isFillerOrEmojiOnly =
+    trimmedLower.length <= 3 ||
+    /^(ok|okay|hmm+|hm+|ha+|haa+|ji|achha|accha|lol|lmao|haha+|k|kk|nice|thik ase|ঠিক আছে|হুম+|ওকে|হাহা+)$/i.test(
+      trimmedLower
+    ) ||
+    /^[\p{Emoji}\s]+$/u.test(trimmedLower);
+
+  if (
+    !settings.aiAssistantEnabled ||
+    (!canUseGemini && !canUseOpenRouter) ||
+    (!isDirectlyAddressed && ((mode === 'smart_blend' && isFillerOrEmojiOnly) || !canTextReply))
+  ) {
     return pickOfflineGroupAction({
       incomingText,
       senderName,
@@ -1047,11 +1311,14 @@ export async function generateGroupCloneAction(params: {
     '- Keep replies SHORT & PUNCHY (1–2 natural WhatsApp lines, never essays).',
     '- NEVER repeat or copy previous lines you sent.',
     '',
-    'LOGIC & TIME CONTEXT:',
+    'LOGIC, IDENTITY & MEMORY VERIFICATION:',
+    existingTurns.length > 0 || archivedMatches.length > 0 || Boolean(groupSummary)
+      ? `You ALREADY KNOW this group ("${groupName}") and prior chatter—verify who "${senderName}" is from the saved thread/summary below before replying so you sound 100% familiar.`
+      : `First recorded turn in "${groupName}"—observe "${senderName}" naturally without pretending fake prior group events.`,
     logicRules,
     `- Current BD Time: ${timeLapse.bdTimeLabel}`,
     `- Group Activity Rhythm: ${timeLapse.guidance}`,
-    groupSummary ? `GROUP MEMORY SUMMARY:\n${groupSummary}` : '',
+    groupSummary ? `GROUP MEMORY SUMMARY (Auto-saved zero-token memory):\n${groupSummary}` : '',
     archivedMatches.length > 0
       ? `OLDER GROUP ARCHIVE RECALL:\n${archivedMatches
           .map((t) => `- [${(t.timestamp || '').slice(0, 10)}] ${t.role === 'user' ? 'Member' : ownerDisplay}: ${t.text}`)
@@ -1102,33 +1369,47 @@ export async function generateGroupCloneAction(params: {
   let primaryFailed = false;
 
   if (canUseGemini) {
-    try {
+    const runGroupGeminiModel = async (
+      modelName: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
+      channel: 'primary' | 'lite'
+    ) => {
       const exec = async (client: GoogleGenAI) =>
         withTimeout(
           client.models.generateContent({
-            model: 'gemini-4-hydrogen',
+            model: modelName,
             contents: promptContent,
             config: {
               systemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              ...(modelName === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
               responseMimeType: 'application/json',
               responseSchema,
             },
           }),
-          7_500,
-          'Group Clone Gemini call'
+          5_500,
+          `Group Clone ${modelName} call`
         );
 
-      const { value: response, keySlot } =
-        keyPool && keyPool.hasKeys()
-          ? await keyPool.executeWithRotation(exec, onKeyRotate, { maxTotalMs: 12_000 })
-          : { value: await exec(ai!), keySlot: 1 };
+      return keyPool && keyPool.hasKeys()
+        ? await keyPool.executeWithRotation(exec, onKeyRotate, { maxTotalMs: 8_000, channel })
+        : { value: await exec(ai!), keySlot: 1 };
+    };
 
+    try {
+      const { value: response, keySlot } = await runGroupGeminiModel('gemini-4-hydrogen', 'primary');
       rawOutputText = response.text || '';
       keySlotUsed = keySlot;
       providerUsed = 'gemini';
     } catch {
-      primaryFailed = true;
+      try {
+        const { value: liteResponse, keySlot } = await runGroupGeminiModel('gemini-3.1-flash-lite', 'lite');
+        rawOutputText = liteResponse.text || '';
+        keySlotUsed = keySlot;
+        providerUsed = 'gemini';
+      } catch {
+        primaryFailed = true;
+      }
     }
   } else {
     primaryFailed = true;

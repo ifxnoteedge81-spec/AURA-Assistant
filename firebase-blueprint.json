@@ -363,6 +363,88 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ClientBot": {
+      "title": "ClientBot",
+      "description": "Independent Zero-AI client WhatsApp bot instance with active kill-switch, per-group custom moderation, and saved auto-reply SMS rules.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "botId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clientName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "phoneNumber": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "clientAccessKey": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 128
+        },
+        "moderateAllGroups": {
+          "type": "boolean"
+        },
+        "defaultModeration": {
+          "type": "object"
+        },
+        "groupRules": {
+          "type": "object"
+        },
+        "savedReplyEnabled": {
+          "type": "boolean"
+        },
+        "savedReplyMessage": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "savedReplyCooldownMs": {
+          "type": "number"
+        },
+        "keywordReplies": {
+          "type": "array"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "botId",
+        "clientName",
+        "active",
+        "clientAccessKey",
+        "moderateAllGroups",
+        "defaultModeration",
+        "groupRules",
+        "savedReplyEnabled",
+        "savedReplyMessage",
+        "savedReplyCooldownMs",
+        "keywordReplies",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -401,6 +483,12 @@
         "$ref": "#/entities/BotSessionBackup"
       },
       "description": "Stores Baileys credentials backup."
+    },
+    "/client_bots/{botId}": {
+      "schema": {
+        "$ref": "#/entities/ClientBot"
+      },
+      "description": "Stores Zero-AI multi-number client bot configurations, active kill-switches, and per-group moderation rules."
     }
   }
 }

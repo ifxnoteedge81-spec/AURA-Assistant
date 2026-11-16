@@ -1,9 +1,12 @@
+import { OpenRouterDynamicPool, type DynamicFreePoolStats } from './openRouterDynamicModels.ts';
+
 export interface OpenRouterStats {
   configuredKeysCount: number;
   primaryModel: string;
   lastSummaryAt: string | null;
   lastFallbackAt: string | null;
   lastError: string | null;
+  dynamicPool?: DynamicFreePoolStats;
 }
 
 export interface OpenRouterTurnInput {
@@ -13,9 +16,9 @@ export interface OpenRouterTurnInput {
 }
 
 const DEFAULT_OPENROUTER_MODELS = [
+  'openrouter/free',
   'meta-llama/llama-3.3-70b-instruct:free',
   'google/gemma-3-27b-it:free',
-  'openrouter/free',
 ];
 
 function isRealOpenRouterKey(raw: string | undefined | null): raw is string {
@@ -55,7 +58,7 @@ export function collectConfiguredOpenRouterKeys(): string[] {
 export class OpenRouterReader {
   private readonly keys: string[];
   private readonly models: string[];
-  private activeKeyIndex = 0;
+  private readonly dynamicPool: OpenRouterDynamicPool;
   private lastSummaryAt: string | null = null;
   private lastFallbackAt: string | null = null;
   private lastError: string | null = null;
@@ -66,6 +69,12 @@ export class OpenRouterReader {
     this.models = customModel
       ? [customModel, ...DEFAULT_OPENROUTER_MODELS.filter((m) => m !== customModel)]
       : DEFAULT_OPENROUTER_MODELS;
+    this.dynamicPool = new OpenRouterDynamicPool(customModel);
+
+    // Pre-warm live free model catalog from https://openrouter.ai/api/v1/models
+    if (this.keys.length > 0) {
+      void this.dynamicPool.getFreeModels(this.keys[0]);
+    }
   }
 
   public hasKeys(): boolean {
@@ -73,13 +82,19 @@ export class OpenRouterReader {
   }
 
   public getStats(): OpenRouterStats {
+    const poolStats = this.dynamicPool.getStats();
     return {
       configuredKeysCount: this.keys.length,
-      primaryModel: this.models[0],
+      primaryModel: poolStats.activeFreeModel || this.models[0],
       lastSummaryAt: this.lastSummaryAt,
       lastFallbackAt: this.lastFallbackAt,
       lastError: this.lastError,
+      dynamicPool: poolStats,
     };
+  }
+
+  public async refreshFreeModelsCatalog(): Promise<string[]> {
+    return this.dynamicPool.getFreeModels(this.keys[0], true);
   }
 
   private async callChatCompletion(params: {
@@ -92,63 +107,21 @@ export class OpenRouterReader {
       throw new Error('OPENROUTER_API_KEY is not configured.');
     }
 
-    const totalKeys = this.keys.length;
-    const startIdx = this.activeKeyIndex % totalKeys;
-    const model = this.models[0];
-    let lastErr: Error = new Error('OpenRouter request failed');
-
-    for (let i = 0; i < totalKeys; i += 1) {
-      const idx = (startIdx + i) % totalKeys;
-      const apiKey = this.keys[idx];
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), params.timeoutMs);
-
-      try {
-        const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': process.env.APP_URL || 'https://aura-assistant-8y1z.onrender.com',
-            'X-Title': 'Aura Assistant Executive Brain',
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: params.systemPrompt },
-              { role: 'user', content: params.userPrompt },
-            ],
-            max_tokens: params.maxTokens ?? 320,
-            temperature: 0.75,
-          }),
-        });
-
-        if (!resp.ok) {
-          const errText = await resp.text().catch(() => '');
-          throw new Error(`OpenRouter HTTP ${resp.status}: ${errText.slice(0, 140)}`);
-        }
-
-        const data = (await resp.json()) as {
-          choices?: Array<{ message?: { content?: string | null } }>;
-        };
-        const content = data?.choices?.[0]?.message?.content?.trim();
-        if (!content) {
-          throw new Error('OpenRouter returned an empty completion.');
-        }
-        this.activeKeyIndex = idx;
-        this.lastError = null;
-        return content;
-      } catch (err) {
-        lastErr = err instanceof Error ? err : new Error(String(err));
-        this.lastError = lastErr.message.slice(0, 160);
-        this.activeKeyIndex = (idx + 1) % totalKeys;
-      } finally {
-        clearTimeout(timer);
-      }
+    try {
+      const result = await this.dynamicPool.executeWithModelRotation({
+        keys: this.keys,
+        systemPrompt: params.systemPrompt,
+        userPrompt: params.userPrompt,
+        timeoutMs: params.timeoutMs,
+        maxTokens: params.maxTokens,
+      });
+      this.lastError = null;
+      return result.content;
+    } catch (err) {
+      const lastErr = err instanceof Error ? err : new Error(String(err));
+      this.lastError = lastErr.message.slice(0, 160);
+      throw lastErr;
     }
-
-    throw lastErr;
   }
 
   /**

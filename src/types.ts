@@ -4,6 +4,7 @@ export type NavSection =
   | 'inbox'
   | 'simulator'
   | 'rules'
+  | 'clients'
   | 'security'
   | 'source';
 
@@ -120,6 +121,13 @@ export interface BotStatusResponse {
     lastSummaryAt: string | null;
     lastFallbackAt: string | null;
     lastError: string | null;
+    dynamicPool?: {
+      discoveredFreeModelsCount: number;
+      activeFreeModel: string;
+      lastModelsSyncAt: string | null;
+      lastModelRotationReason: string | null;
+      freeModelsSample: string[];
+    };
   };
   firestoreAdminMode?: string;
   config: BotConfig;
@@ -134,6 +142,86 @@ export interface BotStatusResponse {
 export interface SourceFileItem {
   name: string;
   content: string;
+}
+
+export type ClientConnectionStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'awaiting_pairing'
+  | 'connected'
+  | 'suspended';
+
+export interface ClientGroupRule {
+  groupJid: string;
+  groupName: string;
+  enabled: boolean;
+  deleteLinks: boolean;
+  deleteStickers: boolean;
+  deleteMedia: boolean;
+  warnEnabled: boolean;
+  maxWarnings: number;
+  kickOnLimit: boolean;
+  warningTemplate: string;
+  kickTemplate: string;
+  userWarnings: Record<string, number>;
+}
+
+export interface ClientKeywordReply {
+  id: string;
+  keyword: string;
+  reply: string;
+  enabled: boolean;
+}
+
+export interface ClientBotStats {
+  deletedCount: number;
+  warnedCount: number;
+  kickedCount: number;
+  savedRepliesSent: number;
+  lastActivityAt: string | null;
+}
+
+export interface ClientBotLogEntry {
+  id: string;
+  timestamp: string;
+  category: 'pairing' | 'moderation' | 'savedreply' | 'command' | 'system';
+  actor: string;
+  summary: string;
+  outcome: 'success' | 'blocked' | 'info' | 'error';
+}
+
+export interface ClientKnownGroup {
+  jid: string;
+  name: string;
+  participantCount: number;
+  botIsAdmin: boolean;
+}
+
+export interface ClientBotItem {
+  botId: string;
+  ownerId: string;
+  clientName: string;
+  phoneNumber: string;
+  active: boolean;
+  clientAccessKey: string;
+  moderateAllGroups: boolean;
+  defaultModeration: Omit<ClientGroupRule, 'groupJid' | 'groupName' | 'userWarnings'>;
+  groupRules: Record<string, ClientGroupRule>;
+  savedReplyEnabled: boolean;
+  savedReplyMessage: string;
+  savedReplyCooldownMs: number;
+  keywordReplies: ClientKeywordReply[];
+  stats: ClientBotStats;
+  createdAt: string;
+  updatedAt: string;
+  status: ClientConnectionStatus;
+  connectedUser: string | null;
+  pairingCode: string | null;
+  pairingPhone: string | null;
+  sessionExists: boolean;
+  lastError: string | null;
+  logs: ClientBotLogEntry[];
+  knownGroups: ClientKnownGroup[];
 }
 
 export const BENGALI_AUTOREPLY_EXACT =

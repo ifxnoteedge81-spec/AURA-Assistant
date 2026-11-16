@@ -20,6 +20,7 @@ import {
   DEFAULT_OWNER_BOUNDARIES,
   DEFAULT_STRICT_LOGIC_RULES,
   STARTER_REGIONAL_DICTIONARY,
+  findRelevantDictionaryEntries,
   generateExecutiveAssistantReply,
   generateGroupCloneAction,
   parseUploadedDictionary,
@@ -34,6 +35,7 @@ import {
 } from './server/assistantEngine.ts';
 import { GeminiKeyPool } from './server/geminiKeyPool.ts';
 import { OpenRouterReader } from './server/openRouterReader.ts';
+import { buildZeroTokenMemorySummary } from './server/localMemorySummarizer.ts';
 import {
   appendArchiveTurn,
   clearArchiveTurns,
@@ -53,18 +55,24 @@ import {
 import {
   getPostgresStatus,
   isPostgresConfigured,
+  pgBulkInsertDictionaryEntries,
+  pgClearDictionary,
   pgClosePool,
   pgDeleteChatMemory,
   pgDeleteDictionaryEntry,
   pgDeleteNote,
   pgDeleteSessionBackup,
+  pgFindRelevantDictionaryEntries,
   pgGetChatArchive,
+  pgGetDictionaryCount,
   pgLoadDictionary,
   pgLoadNotes,
   pgLoadRecentMemories,
   pgLoadSessionBackup,
   pgLoadSettings,
+  pgLoadSingleContact,
   pgLogAiUsage,
+  pgQueryDictionaryPage,
   pgRecallOlderMessages,
   pgSaveChatMemory,
   pgSaveDictionaryEntries,
@@ -91,6 +99,7 @@ import {
   verifyMathChallenge,
   verifyPreAuthToken,
 } from './server/authSecurity.ts';
+import { ClientBotManager, type ClientBotPatchInput } from './server/clientBotManager.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = '.';
@@ -269,11 +278,21 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
   };
 }
 
+const MAX_RAM_DICTIONARY_ITEMS = 500;
 let botConfig: BotConfig = normalizeConfig(loadJsonFile<Partial<BotConfig>>(CONFIG_FILE, {}));
-let dictionaryEntries: DictionaryEntry[] = loadJsonFile<DictionaryEntry[]>(DICTIONARY_FILE, []);
+let dictionaryEntries: DictionaryEntry[] = loadJsonFile<DictionaryEntry[]>(DICTIONARY_FILE, []).slice(
+  0,
+  MAX_RAM_DICTIONARY_ITEMS
+);
+let totalDictionaryCount: number = dictionaryEntries.length;
 let chatMemories: Record<string, ChatMemoryRecord> = loadJsonFile<Record<string, ChatMemoryRecord>>(MEMORIES_FILE, {});
 let inboxNotes: InboxNoteRecord[] = loadJsonFile<InboxNoteRecord[]>(NOTES_FILE, []);
 let activeCloudOwnerId: string = process.env.FIREBASE_OWNER_UID || 'server_admin';
+
+const clientBotManager = new ClientBotManager({
+  getOwnerId: () => activeCloudOwnerId,
+  onEvent: (summary, outcome) => pushLog('system', 'Client Bots', summary, outcome || 'info'),
+});
 
 function persistConfig() {
   saveJsonFile(CONFIG_FILE, botConfig);
@@ -285,7 +304,36 @@ function persistConfig() {
 }
 
 function persistDictionary() {
+  if (dictionaryEntries.length > MAX_RAM_DICTIONARY_ITEMS) {
+    dictionaryEntries = dictionaryEntries.slice(0, MAX_RAM_DICTIONARY_ITEMS);
+  }
   saveJsonFileAsync(DICTIONARY_FILE, dictionaryEntries);
+}
+
+async function resolveRelevantDictionaryForText(incomingText: string): Promise<DictionaryEntry[]> {
+  const localMatches = findRelevantDictionaryEntries(incomingText, dictionaryEntries);
+  if (!isPostgresConfigured()) {
+    return localMatches;
+  }
+
+  const pgMatches = await withTimeout(
+    pgFindRelevantDictionaryEntries(incomingText, 8),
+    350,
+    'Postgres dictionary lookup'
+  ).catch(() => [] as DictionaryEntry[]);
+
+  if (pgMatches.length === 0) return localMatches;
+
+  const merged: DictionaryEntry[] = [];
+  const seen = new Set<string>();
+  for (const item of [...pgMatches, ...localMatches]) {
+    const key = item.term.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+    if (merged.length >= 10) break;
+  }
+  return merged;
 }
 
 function persistMemories() {
@@ -400,6 +448,7 @@ function pruneRuntimeCaches() {
     }
   }
   pruneExpiredRateLimits();
+  clientBotManager.pruneCaches();
 }
 
 function enqueuePrivateReply(chatJid: string, task: () => Promise<void>) {
@@ -606,44 +655,182 @@ async function sendTrackedMessage(
   return sent;
 }
 
+async function ensureChatMemoryHydrated(
+  chatId: string,
+  contactJid: string,
+  contactName: string
+): Promise<ChatMemoryRecord | null> {
+  const existing = chatMemories[chatId];
+  if (existing && existing.turns.length > 0) {
+    return existing;
+  }
+
+  // 1. Check local unlimited archive first (0ms)
+  const localArchive = getArchiveTurns(chatId);
+  if (localArchive.length > 0) {
+    const hydrated: ChatMemoryRecord = {
+      chatId,
+      contactJid,
+      contactName: existing?.contactName || contactName || 'Contact',
+      detectedDistrict: existing?.detectedDistrict || 'Standard',
+      lastSummary:
+        existing?.lastSummary ||
+        buildZeroTokenMemorySummary({
+          contactName: existing?.contactName || contactName || 'Contact',
+          contactJid,
+          isGroup: Boolean(isJidGroup(contactJid)),
+          turns: localArchive.slice(-20),
+          archiveCount: localArchive.length,
+          ownerName: botConfig.ownerName,
+        }),
+      turns: localArchive.slice(-20),
+      updatedAt: localArchive[localArchive.length - 1]?.timestamp || new Date().toISOString(),
+    };
+    chatMemories[chatId] = hydrated;
+    return hydrated;
+  }
+
+  // 2. Check Neon PostgreSQL on demand (bounded 450ms so replies never stall)
+  if (isPostgresConfigured()) {
+    const pgRecord = await withTimeout(pgLoadSingleContact(chatId), 450, 'Postgres contact load').catch(
+      () => null
+    );
+    if (pgRecord && (pgRecord.turns.length > 0 || pgRecord.lastSummary)) {
+      const hydrated: ChatMemoryRecord = {
+        ...pgRecord,
+        contactJid: pgRecord.contactJid || contactJid,
+        contactName: pgRecord.contactName || contactName || 'Contact',
+        lastSummary:
+          pgRecord.lastSummary ||
+          buildZeroTokenMemorySummary({
+            contactName: pgRecord.contactName || contactName || 'Contact',
+            contactJid,
+            isGroup: Boolean(isJidGroup(contactJid)),
+            turns: pgRecord.turns,
+            ownerName: botConfig.ownerName,
+          }),
+      };
+      chatMemories[chatId] = hydrated;
+      return hydrated;
+    }
+  }
+
+  // 3. Check Firestore chat_memories on demand (bounded 450ms)
+  const fsDoc = await withTimeout(
+    adminLoadDocument<ChatMemoryRecord>('chat_memories', chatId),
+    450,
+    'Firestore contact load'
+  ).catch(() => null);
+  if (fsDoc && (Array.isArray(fsDoc.turns) && fsDoc.turns.length > 0 || fsDoc.lastSummary)) {
+    const hydrated: ChatMemoryRecord = {
+      chatId,
+      contactJid: fsDoc.contactJid || contactJid,
+      contactName: fsDoc.contactName || contactName || 'Contact',
+      detectedDistrict: fsDoc.detectedDistrict || 'Standard',
+      lastSummary: fsDoc.lastSummary || '',
+      turns: Array.isArray(fsDoc.turns) ? fsDoc.turns.slice(-20) : [],
+      updatedAt: fsDoc.updatedAt || new Date().toISOString(),
+    };
+    chatMemories[chatId] = hydrated;
+    return hydrated;
+  }
+
+  return existing || null;
+}
+
+/**
+ * Zero-Token Automatic Memory Summarizer:
+ * Summarizes and saves conversation history deterministically with 0 AI API tokens,
+ * reserving 100% of Gemini & OpenRouter quota purely for smart replies.
+ */
 function scheduleBackgroundSummaryRefresh(chatId: string) {
-  if (!botConfig.aiAssistantEnabled || !openRouterReader.hasKeys() || isShuttingDown) return;
+  if (isShuttingDown) return;
   const mem = chatMemories[chatId];
-  if (!mem || mem.turns.length < 2) return;
+  if (!mem || mem.turns.length === 0) return;
 
   const now = Date.now();
   const lastRun = lastSummaryRefreshAt.get(chatId) || 0;
-  if (summaryRefreshInFlight.has(chatId) || now - lastRun < 12_000) return;
+  if (summaryRefreshInFlight.has(chatId) || now - lastRun < 4_000) return;
 
   summaryRefreshInFlight.add(chatId);
   lastSummaryRefreshAt.set(chatId, now);
 
-  void openRouterReader
-    .summarizeInboxMemory({
+  try {
+    const newSummary = buildZeroTokenMemorySummary({
       contactName: mem.contactName,
+      contactJid: mem.contactJid,
+      isGroup: Boolean(isJidGroup(mem.contactJid)),
       existingSummary: mem.lastSummary || '',
       turns: mem.turns,
+      archiveCount: getArchiveCount(chatId),
       ownerName: botConfig.ownerName,
-    })
-    .then((newSummary) => {
-      if (!newSummary) return;
-      const latest = chatMemories[chatId];
-      if (!latest) return;
-      latest.lastSummary = newSummary;
-      latest.updatedAt = new Date().toISOString();
+    });
+
+    if (newSummary && newSummary !== mem.lastSummary) {
+      mem.lastSummary = newSummary;
+      mem.updatedAt = new Date().toISOString();
       persistMemories();
       void adminSaveDocument('chat_memories', chatId, {
         ownerId: activeCloudOwnerId,
-        ...latest,
+        ...mem,
       });
-      void pgSaveChatMemory(activeCloudOwnerId, latest, []);
-    })
-    .catch((err) => {
-      pushLog('cloud', 'OpenRouter Reader', `Background summary skipped: ${(err as Error).message.slice(0, 80)}`, 'info');
-    })
-    .finally(() => {
-      summaryRefreshInFlight.delete(chatId);
-    });
+      void pgSaveChatMemory(activeCloudOwnerId, mem, []);
+    }
+  } finally {
+    summaryRefreshInFlight.delete(chatId);
+  }
+}
+
+function recordPassiveIncomingTurn(
+  remoteJid: string,
+  senderOrGroupName: string,
+  incomingText: string,
+  isGroup: boolean,
+  senderNameInGroup?: string
+) {
+  if (!incomingText || !incomingText.trim()) return;
+  const chatId = sanitizeId(remoteJid);
+  const existing = chatMemories[chatId];
+  const nowIso = new Date().toISOString();
+  const turnText = isGroup && senderNameInGroup ? `[${senderNameInGroup}]: ${incomingText}` : incomingText;
+  const lastTurn = existing?.turns?.[existing.turns.length - 1];
+  if (lastTurn && lastTurn.text === turnText && Date.now() - Date.parse(lastTurn.timestamp) < 5_000) {
+    return;
+  }
+
+  const incomingTurn: ChatTurn = { role: 'user', text: turnText, timestamp: nowIso };
+  const nextTurns = [...(existing?.turns || []), incomingTurn].slice(-20);
+  const resolvedName = existing?.contactName || senderOrGroupName || extractDigits(remoteJid) || 'Contact';
+
+  const updatedMemory: ChatMemoryRecord = {
+    chatId,
+    contactJid: remoteJid,
+    contactName: resolvedName,
+    detectedDistrict: existing?.detectedDistrict || 'Standard',
+    lastSummary:
+      buildZeroTokenMemorySummary({
+        contactName: resolvedName,
+        contactJid: remoteJid,
+        isGroup,
+        existingSummary: existing?.lastSummary || '',
+        turns: nextTurns,
+        archiveCount: getArchiveCount(chatId) + 1,
+        ownerName: botConfig.ownerName,
+      }) ||
+      existing?.lastSummary ||
+      '',
+    turns: nextTurns,
+    updatedAt: nowIso,
+  };
+
+  chatMemories[chatId] = updatedMemory;
+  persistMemories();
+  void adminSaveDocument('chat_memories', chatId, {
+    ownerId: activeCloudOwnerId,
+    ...updatedMemory,
+  });
+  void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, [incomingTurn]);
+  archiveTurnToCloud(chatId, incomingTurn);
 }
 
 function archiveTurnToCloud(chatId: string, turn: ChatTurn) {
@@ -714,11 +901,12 @@ function ingestHistoryMessages(messages: WAMessage[]) {
 
   for (const msg of messages) {
     const remoteJid = msg.key?.remoteJid;
-    if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter') || isJidGroup(remoteJid)) {
+    if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
       continue;
     }
+    const isGroup = isJidGroup(remoteJid) ?? false;
     const isPrivate = remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid');
-    if (!isPrivate) continue;
+    if (!isPrivate && !isGroup) continue;
 
     const text = extractMessageText(msg.message);
     if (!text || text.startsWith(PREFIX)) continue;
@@ -726,15 +914,18 @@ function ingestHistoryMessages(messages: WAMessage[]) {
     const chatId = sanitizeId(remoteJid);
     const bucket = grouped.get(chatId) || {
       contactJid: remoteJid,
-      contactName: msg.pushName || extractDigits(remoteJid) || 'Contact',
+      contactName: isGroup
+        ? chatMemories[chatId]?.contactName || extractDigits(remoteJid) || 'WhatsApp Group'
+        : msg.pushName || extractDigits(remoteJid) || 'Contact',
       items: [],
     };
-    if (msg.pushName && !msg.key.fromMe) {
+    if (!isGroup && msg.pushName && !msg.key.fromMe) {
       bucket.contactName = msg.pushName;
     }
+    const senderLabel = msg.pushName || extractDigits(msg.key?.participant) || 'Member';
     bucket.items.push({
       role: msg.key.fromMe ? 'assistant' : 'user',
-      text: msg.key.fromMe ? `[Sir (নিজে)]: ${text}` : text,
+      text: msg.key.fromMe ? `[Sir (নিজে)]: ${text}` : isGroup ? `[${senderLabel}]: ${text}` : text,
       timestamp: toTimestampIso(msg.messageTimestamp),
     });
     grouped.set(chatId, bucket);
@@ -812,7 +1003,7 @@ async function runExecutiveAssistantTurn(params: {
   fallbackReason?: string;
 }> {
   const chatId = sanitizeId(params.contactJid);
-  const memory = chatMemories[chatId] || null;
+  const memory = await ensureChatMemoryHydrated(chatId, params.contactJid, params.contactName);
   const nowIso = new Date().toISOString();
 
   let replyText = botConfig.autoreplyMessage || BENGALI_AUTOREPLY_TEXT;
@@ -840,6 +1031,8 @@ async function runExecutiveAssistantTurn(params: {
     ).catch(() => []);
   }
 
+  const relevantDictionary = await resolveRelevantDictionaryForText(params.incomingText);
+
   try {
     const result = await generateExecutiveAssistantReply({
       keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
@@ -857,7 +1050,7 @@ async function runExecutiveAssistantTurn(params: {
       archivedMatches,
       incomingText: params.incomingText,
       contactName: params.contactName,
-      dictionaryEntries,
+      dictionaryEntries: relevantDictionary,
     });
     replyText = result.replyText;
     detectedDistrict = result.detectedDistrict;
@@ -885,7 +1078,7 @@ async function runExecutiveAssistantTurn(params: {
       archivedMatches,
       incomingText: params.incomingText,
       contactName: params.contactName,
-      dictionaryEntries,
+      dictionaryEntries: relevantDictionary,
     });
     replyText = fallbackResult.replyText;
     providerUsed = fallbackResult.providerUsed || 'offline_emotion';
@@ -1019,7 +1212,7 @@ async function runGroupCloneTurn(params: {
   observeOnly?: boolean;
 }): Promise<GroupCloneResult> {
   const chatId = sanitizeId(params.groupJid);
-  const memory = chatMemories[chatId] || null;
+  const memory = await ensureChatMemoryHydrated(chatId, params.groupJid, params.groupName);
   const nowIso = new Date().toISOString();
   const speakerText = `[${params.senderName}]: ${params.incomingText}`;
   const incomingTurn: ChatTurn = { role: 'user', text: speakerText, timestamp: nowIso };
@@ -1065,6 +1258,8 @@ async function runGroupCloneTurn(params: {
     ).catch(() => []);
   }
 
+  const relevantDictionary = await resolveRelevantDictionaryForText(params.incomingText);
+
   let result: GroupCloneResult;
   try {
     result = await generateGroupCloneAction({
@@ -1086,7 +1281,7 @@ async function runGroupCloneTurn(params: {
       incomingText: params.incomingText,
       isDirectlyAddressed: params.isDirectlyAddressed,
       canTextReply: params.canTextReply,
-      dictionaryEntries,
+      dictionaryEntries: relevantDictionary,
     });
   } catch (err) {
     pushLog('autoreply', params.groupName, `Group clone fallback: ${(err as Error).message}`, 'error');
@@ -1101,7 +1296,7 @@ async function runGroupCloneTurn(params: {
       incomingText: params.incomingText,
       isDirectlyAddressed: params.isDirectlyAddressed,
       canTextReply: params.canTextReply,
-      dictionaryEntries,
+      dictionaryEntries: relevantDictionary,
     });
   }
 
@@ -1161,13 +1356,19 @@ async function runGroupCloneTurn(params: {
 async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   if (!msg.message) return;
   const remoteJid = msg.key.remoteJid;
-  if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
+  if (
+    !remoteJid ||
+    remoteJid === 'status@broadcast' ||
+    remoteJid.endsWith('@broadcast') ||
+    remoteJid.endsWith('@newsletter')
+  ) {
     return;
   }
 
   const isGroup = isJidGroup(remoteJid) ?? false;
   const text = extractMessageText(msg.message);
   const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
+  const senderAlt = (msg.key as { participantAlt?: string }).participantAlt;
 
   // Detect manual human owner reply (in DM OR Group) -> save to memory & pause AI temporarily
   if (msg.key.fromMe) {
@@ -1199,7 +1400,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       try {
         const metadata = await getCachedGroupMetadata(sock, remoteJid);
         const botIsAdmin = isParticipantAdmin(metadata, sock.user?.id, (sock.user as { lid?: string } | undefined)?.lid);
-        const senderIsAdmin = isParticipantAdmin(metadata, senderJid);
+        const senderIsAdmin = isParticipantAdmin(metadata, senderJid, senderAlt);
 
         if (botIsAdmin && !senderIsAdmin) {
           await sock.sendMessage(remoteJid, { delete: msg.key });
@@ -1265,7 +1466,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       }
 
       const metadata = await getCachedGroupMetadata(sock, remoteJid);
-      const senderIsAdmin = isParticipantAdmin(metadata, senderJid) || isOwnerOrSelf(msg, sock);
+      const senderIsAdmin = isParticipantAdmin(metadata, senderJid, senderAlt) || isOwnerOrSelf(msg, sock);
       if (!senderIsAdmin) {
         await sendTrackedMessage(
           sock,
@@ -1372,7 +1573,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       }
 
       const metadata = await getCachedGroupMetadata(sock, remoteJid);
-      const senderIsAdmin = isParticipantAdmin(metadata, senderJid) || isOwnerOrSelf(msg, sock);
+      const senderIsAdmin = isParticipantAdmin(metadata, senderJid, senderAlt) || isOwnerOrSelf(msg, sock);
       if (!senderIsAdmin) {
         await sendTrackedMessage(
           sock,
@@ -1586,28 +1787,35 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     }
 
     const pausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
+    const contactName = msg.pushName || senderDigits || 'Contact';
     if (Date.now() < pausedUntil) {
+      recordPassiveIncomingTurn(remoteJid, contactName, text, false);
       return;
     }
 
     const lastSent = autoReplyCooldowns.get(remoteJid) || 0;
-    if (Date.now() - lastSent < botConfig.cooldownMs) return;
-
-    const contactName = msg.pushName || senderDigits || 'Contact';
+    if (Date.now() - lastSent < botConfig.cooldownMs) {
+      recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+      return;
+    }
 
     // Instant zero-delay enqueue: start AI generation immediately on message arrival
     enqueuePrivateReply(remoteJid, async () => {
       if (!botConfig.autoreply || currentSocket !== sock) return;
 
       const latestPausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
-      if (Date.now() < latestPausedUntil) return;
+      if (Date.now() < latestPausedUntil) {
+        recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+        return;
+      }
 
       const daily = getDailyReplyStats();
       if (daily.count >= daily.limit) {
+        recordPassiveIncomingTurn(remoteJid, contactName, text, false);
         pushLog(
           'autoreply',
           contactName,
-          `Daily safety cap (${daily.limit} replies/day) reached; auto-reply skipped.`,
+          `Daily safety cap (${daily.limit} replies/day) reached; auto-reply skipped (saved passively).`,
           'blocked'
         );
         return;
@@ -1663,6 +1871,27 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         }
       }
     });
+    return;
+  }
+
+  // 3C. Passive Zero-Token Conversation Archival (all non-AI groups & DMs when autoreply is off)
+  if (!msg.key.fromMe && text && !text.startsWith(PREFIX)) {
+    const botDigits = extractDigits(sock.user?.id);
+    const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
+    const senderDigits = extractDigits(senderJid);
+    if ((botDigits && senderDigits === botDigits) || (botLidDigits && senderDigits === botLidDigits)) {
+      return;
+    }
+
+    if (isGroup) {
+      const meta = await getCachedGroupMetadata(sock, remoteJid).catch(() => null);
+      const groupName = meta?.subject || extractDigits(remoteJid) || 'WhatsApp Group';
+      const senderName = msg.pushName || senderDigits || 'Member';
+      recordPassiveIncomingTurn(remoteJid, groupName, text, true, senderName);
+    } else if (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid')) {
+      const contactName = msg.pushName || senderDigits || 'Contact';
+      recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+    }
   }
 }
 
@@ -1932,11 +2161,12 @@ async function hydrateFromCloudAdmin() {
         saveJsonFile(CONFIG_FILE, botConfig);
       }
 
-      const pgDict = await pgLoadDictionary();
+      const pgDict = await pgLoadDictionary(MAX_RAM_DICTIONARY_ITEMS);
       if (pgDict.length > 0) {
         dictionaryEntries = pgDict;
         persistDictionary();
       }
+      totalDictionaryCount = Math.max(dictionaryEntries.length, await pgGetDictionaryCount());
 
       const pgMems = await pgLoadRecentMemories();
       if (pgMems.length > 0) {
@@ -1972,8 +2202,11 @@ async function hydrateFromCloudAdmin() {
     }
 
     const cloudDict = await adminLoadCollection<DictionaryEntry>('dictionary_entries');
-    if (cloudDict.length > 0) {
-      dictionaryEntries = cloudDict;
+    if (cloudDict.length > 0 && (!isPostgresConfigured() || dictionaryEntries.length === 0)) {
+      dictionaryEntries = cloudDict.slice(0, MAX_RAM_DICTIONARY_ITEMS);
+      if (!isPostgresConfigured()) {
+        totalDictionaryCount = cloudDict.length;
+      }
       persistDictionary();
     }
 
@@ -1990,7 +2223,18 @@ async function hydrateFromCloudAdmin() {
 
     const cloudNotes = await adminLoadCollection<InboxNoteRecord>('inbox_notes');
     if (cloudNotes.length > 0) {
-      inboxNotes = cloudNotes.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      const notesById = new Map<string, InboxNoteRecord>();
+      for (const existingNote of inboxNotes) {
+        if (existingNote?.id) notesById.set(existingNote.id, existingNote);
+      }
+      for (const cloudNote of cloudNotes) {
+        if (cloudNote?.id && !notesById.has(cloudNote.id)) {
+          notesById.set(cloudNote.id, cloudNote);
+        }
+      }
+      inboxNotes = Array.from(notesById.values())
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, 200);
       persistNotes();
     }
 
@@ -2161,13 +2405,231 @@ async function bootstrap() {
     });
   });
 
+  // Scoped Client Portal Middleware (strictly isolated to a single botId + valid clientAccessKey + active === true)
+  const requireClientPortalAccess = (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    const botId = String(req.params.botId || '').trim();
+    const key =
+      String(req.headers['x-client-access-key'] || '').trim() ||
+      String(req.query.access || '').trim();
+    const check = clientBotManager.verifyClientAccessKey(botId, key);
+    if (!check.ok) {
+      if (check.reason === 'NOT_FOUND') {
+        res.status(404).json({ error: 'Client bot portal not found.', code: 'NOT_FOUND' });
+        return;
+      }
+      if (check.reason === 'SUSPENDED') {
+        res.status(403).json({
+          error: 'This bot service has been paused/suspended by the administrator.',
+          code: 'SUSPENDED',
+          clientName: check.bot?.clientName || botId,
+        });
+        return;
+      }
+      res.status(401).json({ error: 'Invalid or missing client portal access key.', code: 'INVALID_KEY' });
+      return;
+    }
+    next();
+  };
+
+  app.get('/api/client-portal/:botId', requireClientPortalAccess, (req, res) => {
+    const view = clientBotManager.getBotView(String(req.params.botId));
+    if (!view) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot: view });
+  });
+
+  app.patch('/api/client-portal/:botId', requireClientPortalAccess, (req, res) => {
+    const body = (req.body || {}) as ClientBotPatchInput;
+    const updated = clientBotManager.updateBot(
+      String(req.params.botId),
+      {
+        moderateAllGroups: body.moderateAllGroups,
+        defaultModeration: body.defaultModeration,
+        groupRules: body.groupRules,
+        upsertGroupRule: body.upsertGroupRule,
+        removeGroupJid: body.removeGroupJid,
+        savedReplyEnabled: body.savedReplyEnabled,
+        savedReplyMessage: body.savedReplyMessage,
+        savedReplyCooldownMs: body.savedReplyCooldownMs,
+        keywordReplies: body.keywordReplies,
+      },
+      'Client Portal'
+    );
+    if (!updated) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot: updated });
+  });
+
+  app.post('/api/client-portal/:botId/pair', requireClientPortalAccess, async (req, res) => {
+    try {
+      const bot = await clientBotManager.pairBot(
+        String(req.params.botId),
+        String(req.body?.phoneNumber || '')
+      );
+      res.json({ bot });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/client-portal/:botId/disconnect', requireClientPortalAccess, (req, res) => {
+    const bot = clientBotManager.disconnectBot(String(req.params.botId));
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.post('/api/client-portal/:botId/reset-session', requireClientPortalAccess, async (req, res) => {
+    const bot = await clientBotManager.resetBotSession(String(req.params.botId));
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.get('/api/client-portal/:botId/groups', requireClientPortalAccess, async (req, res) => {
+    const groups = await clientBotManager.fetchLiveGroups(String(req.params.botId));
+    res.json({ groups });
+  });
+
+  app.post(
+    '/api/client-portal/:botId/groups/:groupJid/reset-warnings',
+    requireClientPortalAccess,
+    (req, res) => {
+      const bot = clientBotManager.resetGroupWarnings(
+        String(req.params.botId),
+        decodeURIComponent(String(req.params.groupJid)),
+        req.body?.userKey ? String(req.body.userKey) : undefined
+      );
+      if (!bot) {
+        res.status(404).json({ error: 'Client bot not found.' });
+        return;
+      }
+      res.json({ bot });
+    }
+  );
+
   // Protect ALL other /api/* routes behind authenticated owner session token
   app.use('/api', (req, res, next) => {
-    if (req.path.startsWith('/auth/')) {
+    if (req.path.startsWith('/auth/') || req.path.startsWith('/client-portal/')) {
       next();
       return;
     }
     requireOwnerAuth(req, res, next);
+  });
+
+  // Owner Multi-Number Client Bot Management Endpoints (Unlimited Zero-AI Client Slots)
+  app.get('/api/client-bots', (_req, res) => {
+    res.json({
+      bots: clientBotManager.listBots(),
+      summary: clientBotManager.getSummaryCounts(),
+    });
+  });
+
+  app.post('/api/client-bots', (req, res) => {
+    const clientName = String(req.body?.clientName || '').trim();
+    if (!clientName) {
+      res.status(400).json({ error: 'Client bot name is required.' });
+      return;
+    }
+    const bot = clientBotManager.createBot({
+      clientName,
+      phoneNumber: req.body?.phoneNumber ? String(req.body.phoneNumber) : '',
+      moderateAllGroups: req.body?.moderateAllGroups !== false,
+      savedReplyEnabled: Boolean(req.body?.savedReplyEnabled),
+      savedReplyMessage: req.body?.savedReplyMessage ? String(req.body.savedReplyMessage) : undefined,
+    });
+    res.status(201).json({ bot });
+  });
+
+  app.patch('/api/client-bots/:botId', (req, res) => {
+    const bot = clientBotManager.updateBot(
+      String(req.params.botId),
+      (req.body || {}) as ClientBotPatchInput,
+      'Owner'
+    );
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.post('/api/client-bots/:botId/pair', async (req, res) => {
+    try {
+      const bot = await clientBotManager.pairBot(
+        String(req.params.botId),
+        String(req.body?.phoneNumber || '')
+      );
+      res.json({ bot });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/client-bots/:botId/disconnect', (req, res) => {
+    const bot = clientBotManager.disconnectBot(String(req.params.botId));
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.post('/api/client-bots/:botId/reset-session', async (req, res) => {
+    const bot = await clientBotManager.resetBotSession(String(req.params.botId));
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.post('/api/client-bots/:botId/rotate-key', (req, res) => {
+    const bot = clientBotManager.rotateAccessKey(String(req.params.botId));
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
+  });
+
+  app.delete('/api/client-bots/:botId', async (req, res) => {
+    const deleted = await clientBotManager.deleteBot(String(req.params.botId));
+    if (!deleted) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/client-bots/:botId/groups', async (req, res) => {
+    const groups = await clientBotManager.fetchLiveGroups(String(req.params.botId));
+    res.json({ groups });
+  });
+
+  app.post('/api/client-bots/:botId/groups/:groupJid/reset-warnings', (req, res) => {
+    const bot = clientBotManager.resetGroupWarnings(
+      String(req.params.botId),
+      decodeURIComponent(String(req.params.groupJid)),
+      req.body?.userKey ? String(req.body.userKey) : undefined
+    );
+    if (!bot) {
+      res.status(404).json({ error: 'Client bot not found.' });
+      return;
+    }
+    res.json({ bot });
   });
 
   app.get('/api/security/stats', (_req, res) => {
@@ -2231,7 +2693,7 @@ async function bootstrap() {
       firestoreAdminMode,
       config: botConfig,
       logs: eventLogs,
-      dictionaryCount: dictionaryEntries.length,
+      dictionaryCount: totalDictionaryCount,
       memoryCount: Object.keys(chatMemories).length,
       unreadNotesCount: inboxNotes.filter((n) => !n.resolved).length,
       dailyReplyStats: getDailyReplyStats(),
@@ -2397,17 +2859,37 @@ async function bootstrap() {
       saveJsonFile(CONFIG_FILE, botConfig);
     }
     if (Array.isArray(dictionary) && dictionary.length > 0) {
-      dictionaryEntries = dictionary;
-      persistDictionary();
+      if (!isPostgresConfigured() || dictionaryEntries.length === 0) {
+        dictionaryEntries = dictionary.slice(0, MAX_RAM_DICTIONARY_ITEMS);
+        persistDictionary();
+      }
+      if (!isPostgresConfigured()) {
+        totalDictionaryCount = dictionaryEntries.length;
+      }
     }
     if (Array.isArray(memories) && memories.length > 0) {
       for (const mem of memories) {
-        if (mem?.chatId) chatMemories[mem.chatId] = mem;
+        if (!mem?.chatId) continue;
+        const existing = chatMemories[mem.chatId];
+        if (!existing || Date.parse(mem.updatedAt || '') > Date.parse(existing.updatedAt || '')) {
+          chatMemories[mem.chatId] = mem;
+        }
       }
       persistMemories();
     }
     if (Array.isArray(notes) && notes.length > 0) {
-      inboxNotes = notes;
+      const notesById = new Map<string, InboxNoteRecord>();
+      for (const existingNote of inboxNotes) {
+        if (existingNote?.id) notesById.set(existingNote.id, existingNote);
+      }
+      for (const incomingNote of notes) {
+        if (incomingNote?.id && !notesById.has(incomingNote.id)) {
+          notesById.set(incomingNote.id, incomingNote);
+        }
+      }
+      inboxNotes = Array.from(notesById.values())
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, 200);
       persistNotes();
     }
     pushLog('cloud', 'Browser Sync', 'Synced dashboard & Firestore cloud data with bot server.', 'success');
@@ -2420,13 +2902,52 @@ async function bootstrap() {
   });
 
   // --------------------------------------------------------------------------
-  // 64-District Bangla & English Dictionary Endpoints
+  // 64-District Bangla & English Dictionary Endpoints (Zero-RAM Chunked & Paginated)
   // --------------------------------------------------------------------------
-  app.get('/api/dictionary', (_req, res) => {
-    res.json({ entries: dictionaryEntries });
+  app.get('/api/dictionary', async (req, res) => {
+    const page = Math.max(1, Number(req.query.page || 1) || 1);
+    const limit = Math.max(10, Math.min(100, Number(req.query.limit || 50) || 50));
+    const search = String(req.query.search || '').trim();
+    const district = String(req.query.district || 'ALL').trim();
+
+    if (isPostgresConfigured()) {
+      const result = await pgQueryDictionaryPage({ page, limit, search, district });
+      totalDictionaryCount = Math.max(totalDictionaryCount, result.totalCount);
+      res.json({
+        ...result,
+        storageMode: 'postgres',
+      });
+      return;
+    }
+
+    const qLower = search.toLowerCase();
+    const filtered = dictionaryEntries.filter((entry) => {
+      const matchesDistrict = !district || district === 'ALL' || entry.district === district;
+      const matchesSearch =
+        !qLower ||
+        entry.term.toLowerCase().includes(qLower) ||
+        entry.meaning.toLowerCase().includes(qLower) ||
+        entry.district.toLowerCase().includes(qLower);
+      return matchesDistrict && matchesSearch;
+    });
+    const totalCount = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+    const safePage = Math.min(page, totalPages);
+    const offset = (safePage - 1) * limit;
+    const districts = Array.from(new Set(dictionaryEntries.map((d) => d.district))).sort();
+    totalDictionaryCount = dictionaryEntries.length;
+
+    res.json({
+      entries: filtered.slice(offset, offset + limit),
+      totalCount,
+      page: safePage,
+      totalPages,
+      districts,
+      storageMode: 'local',
+    });
   });
 
-  app.post('/api/dictionary', (req, res) => {
+  app.post('/api/dictionary', async (req, res) => {
     const term = String(req.body?.term || '').trim();
     const meaning = String(req.body?.meaning || '').trim();
     const district = String(req.body?.district || 'All Districts').trim();
@@ -2446,18 +2967,78 @@ async function bootstrap() {
       language,
       replyStyleHint: replyStyleHint.slice(0, 300),
     };
-    dictionaryEntries.unshift(entry);
+    dictionaryEntries = [entry, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
     persistDictionary();
     void adminSaveDocument('dictionary_entries', entry.id, {
       ownerId: activeCloudOwnerId,
       ...entry,
     });
-    void pgSaveDictionaryEntries(activeCloudOwnerId, [entry]);
+    if (isPostgresConfigured()) {
+      await pgSaveDictionaryEntries(activeCloudOwnerId, [entry]);
+      totalDictionaryCount = await pgGetDictionaryCount();
+    } else {
+      totalDictionaryCount = dictionaryEntries.length;
+    }
     pushLog('system', 'Dictionary', `Added term "${entry.term}" (${entry.district})`, 'success');
-    res.json({ entry, entries: dictionaryEntries });
+    res.json({ entry, entries: dictionaryEntries.slice(0, 50), totalCount: totalDictionaryCount });
   });
 
-  app.post('/api/dictionary/import', (req, res) => {
+  app.post('/api/dictionary/import-chunk', async (req, res) => {
+    try {
+      const content = String(req.body?.content || '');
+      const fileName = String(req.body?.fileName || 'dictionary.txt');
+      const chunkIndex = Number(req.body?.chunkIndex || 0);
+      const totalChunks = Number(req.body?.totalChunks || 1);
+
+      const parsed = parseUploadedDictionary(content, fileName);
+      let insertedCount = 0;
+
+      if (parsed.length > 0) {
+        if (isPostgresConfigured()) {
+          insertedCount = await pgBulkInsertDictionaryEntries(activeCloudOwnerId, parsed);
+          if (dictionaryEntries.length < MAX_RAM_DICTIONARY_ITEMS && chunkIndex === 0) {
+            const sample = parsed.slice(0, 50).map((item, idx) => ({
+              ...item,
+              id: sanitizeId(`dict_${Date.now()}_${idx}`),
+            }));
+            dictionaryEntries = [...sample, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
+            persistDictionary();
+          }
+          totalDictionaryCount = await pgGetDictionaryCount();
+        } else {
+          // Local fallback when DATABASE_URL is unavailable: keep safe RAM limit
+          const batch: DictionaryEntry[] = parsed.map((item, idx) => ({
+            ...item,
+            id: sanitizeId(`dict_${Date.now()}_${chunkIndex}_${idx}`),
+          }));
+          dictionaryEntries = [...batch, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
+          persistDictionary();
+          insertedCount = batch.length;
+          totalDictionaryCount = dictionaryEntries.length;
+        }
+      }
+
+      if (chunkIndex === totalChunks - 1) {
+        pushLog(
+          'system',
+          'Dictionary Upload',
+          `Completed streaming upload (${fileName}, ${totalChunks} chunks). Total entries: ${totalDictionaryCount}.`,
+          'success'
+        );
+      }
+
+      res.json({
+        parsedCount: parsed.length,
+        insertedCount,
+        totalCount: totalDictionaryCount,
+        storageMode: isPostgresConfigured() ? 'postgres' : 'local',
+      });
+    } catch (err) {
+      res.status(400).json({ error: `Chunk import failed: ${(err as Error).message}` });
+    }
+  });
+
+  app.post('/api/dictionary/import', async (req, res) => {
     try {
       const content = String(req.body?.content || '');
       const fileName = String(req.body?.fileName || 'dictionary.txt');
@@ -2466,33 +3047,44 @@ async function bootstrap() {
       if (parsed.length === 0) {
         res.status(400).json({
           error:
-            'No valid dictionary entries found. Use JSON array [{term, meaning, district, replyStyleHint}] or CSV/TXT lines: term | meaning | district | hint',
+            'No valid dictionary entries found. Supported formats: JSON, JSONL, CSV, TSV, Pipe (|), Dash (-), Colon (:), Equals (=), or Word + Meaning lines.',
         });
         return;
       }
 
-      const added: DictionaryEntry[] = parsed.map((item, idx) => ({
-        ...item,
-        id: sanitizeId(`dict_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`),
-      }));
-
-      dictionaryEntries = [...added, ...dictionaryEntries].slice(0, 2000);
-      persistDictionary();
-      for (const entry of added.slice(0, 50)) {
-        void adminSaveDocument('dictionary_entries', entry.id, {
-          ownerId: activeCloudOwnerId,
-          ...entry,
-        });
+      let importedCount = 0;
+      if (isPostgresConfigured()) {
+        importedCount = await pgBulkInsertDictionaryEntries(activeCloudOwnerId, parsed);
+        const sample = parsed.slice(0, 50).map((item, idx) => ({
+          ...item,
+          id: sanitizeId(`dict_${Date.now()}_${idx}`),
+        }));
+        dictionaryEntries = [...sample, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
+        persistDictionary();
+        totalDictionaryCount = await pgGetDictionaryCount();
+      } else {
+        const added: DictionaryEntry[] = parsed.map((item, idx) => ({
+          ...item,
+          id: sanitizeId(`dict_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`),
+        }));
+        dictionaryEntries = [...added, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
+        persistDictionary();
+        importedCount = added.length;
+        totalDictionaryCount = dictionaryEntries.length;
       }
-      void pgSaveDictionaryEntries(activeCloudOwnerId, added);
-      pushLog('system', 'Dictionary Upload', `Imported ${added.length} entries from ${fileName}`, 'success');
-      res.json({ importedCount: added.length, added, entries: dictionaryEntries });
+
+      pushLog('system', 'Dictionary Upload', `Imported ${importedCount} entries from ${fileName}`, 'success');
+      res.json({
+        importedCount,
+        totalCount: totalDictionaryCount,
+        entries: dictionaryEntries.slice(0, 50),
+      });
     } catch (err) {
       res.status(400).json({ error: `Failed to parse file: ${(err as Error).message}` });
     }
   });
 
-  app.post('/api/dictionary/starter', (_req, res) => {
+  app.post('/api/dictionary/starter', async (_req, res) => {
     const existingTerms = new Set(dictionaryEntries.map((d) => d.term.toLowerCase()));
     const fresh = STARTER_REGIONAL_DICTIONARY.filter((d) => !existingTerms.has(d.term.toLowerCase())).map(
       (item, idx) => ({
@@ -2500,7 +3092,7 @@ async function bootstrap() {
         id: sanitizeId(`starter_${Date.now()}_${idx}`),
       })
     );
-    dictionaryEntries = [...fresh, ...dictionaryEntries];
+    dictionaryEntries = [...fresh, ...dictionaryEntries].slice(0, MAX_RAM_DICTIONARY_ITEMS);
     persistDictionary();
     for (const entry of fresh) {
       void adminSaveDocument('dictionary_entries', entry.id, {
@@ -2508,18 +3100,42 @@ async function bootstrap() {
         ...entry,
       });
     }
-    void pgSaveDictionaryEntries(activeCloudOwnerId, fresh);
+    if (isPostgresConfigured()) {
+      await pgSaveDictionaryEntries(activeCloudOwnerId, fresh);
+      totalDictionaryCount = await pgGetDictionaryCount();
+    } else {
+      totalDictionaryCount = dictionaryEntries.length;
+    }
     pushLog('system', 'Dictionary', `Loaded ${fresh.length} starter 64-district entries.`, 'success');
-    res.json({ importedCount: fresh.length, added: fresh, entries: dictionaryEntries });
+    res.json({
+      importedCount: fresh.length,
+      added: fresh,
+      entries: dictionaryEntries.slice(0, 50),
+      totalCount: totalDictionaryCount,
+    });
   });
 
-  app.delete('/api/dictionary/:id', (req, res) => {
+  app.delete('/api/dictionary/:id', async (req, res) => {
     const id = req.params.id;
     dictionaryEntries = dictionaryEntries.filter((d) => d.id !== id);
     persistDictionary();
     void adminDeleteDocument('dictionary_entries', id);
-    void pgDeleteDictionaryEntry(id);
-    res.json({ entries: dictionaryEntries });
+    await pgDeleteDictionaryEntry(id);
+    if (isPostgresConfigured()) {
+      totalDictionaryCount = await pgGetDictionaryCount();
+    } else {
+      totalDictionaryCount = dictionaryEntries.length;
+    }
+    res.json({ entries: dictionaryEntries.slice(0, 50), totalCount: totalDictionaryCount });
+  });
+
+  app.delete('/api/dictionary', async (_req, res) => {
+    dictionaryEntries = [];
+    persistDictionary();
+    await pgClearDictionary();
+    totalDictionaryCount = 0;
+    pushLog('system', 'Dictionary', 'Cleared all dictionary entries.', 'info');
+    res.json({ ok: true, totalCount: 0 });
   });
 
   // --------------------------------------------------------------------------
@@ -3047,6 +3663,7 @@ async function bootstrap() {
       geminiKeyPool: geminiPool.getStats(),
       openRouter: openRouterReader.getStats(),
       postgres: getPostgresStatus(),
+      clientBots: clientBotManager.getSummaryCounts(),
       selfPing: {
         enabled: selfPingEnabled,
         intervalMs: SELF_PING_INTERVAL_MS,
@@ -3064,6 +3681,10 @@ async function bootstrap() {
 
   const distDir = path.resolve('./dist');
   const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'API route not found.' });
+  });
 
   if (process.env.NODE_ENV === 'production' && hasBuiltDist) {
     app.use(express.static(distDir));
@@ -3125,6 +3746,9 @@ async function bootstrap() {
         }
       })
       .catch(() => {});
+
+    // Initialize Zero-AI Multi-Number Client Bots independently after primary boot
+    void clientBotManager.init();
   });
 
   function gracefulShutdown(signal: string) {
@@ -3148,6 +3772,7 @@ async function bootstrap() {
       currentSocket = null;
     }
 
+    clientBotManager.shutdown();
     void pgClosePool();
     httpServer.close(() => process.exit(0));
     const forceExit = setTimeout(() => process.exit(0), 3000);
