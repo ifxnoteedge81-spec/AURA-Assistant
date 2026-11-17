@@ -13,13 +13,14 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
-import type { GroupMetadata, proto, WAMessage, WASocket } from '@whiskeysockets/baileys';
+import type { Contact, GroupMetadata, GroupParticipant, proto, WAMessage, WASocket } from '@whiskeysockets/baileys';
 import {
   DEFAULT_FIRST_GREETING,
   DEFAULT_OWNER_BIO,
   DEFAULT_OWNER_BOUNDARIES,
   DEFAULT_STRICT_LOGIC_RULES,
   STARTER_REGIONAL_DICTIONARY,
+  findMatchingGroupTarget,
   findRelevantDictionaryEntries,
   generateExecutiveAssistantReply,
   generateGroupCloneAction,
@@ -37,6 +38,7 @@ import {
 } from './server/assistantEngine.ts';
 import { GeminiKeyPool } from './server/geminiKeyPool.ts';
 import { OpenRouterReader } from './server/openRouterReader.ts';
+import { TokenTelemetryTracker } from './server/tokenTelemetry.ts';
 import { buildZeroTokenMemorySummary } from './server/localMemorySummarizer.ts';
 import {
   appendArchiveTurn,
@@ -111,6 +113,7 @@ const DICTIONARY_FILE = path.resolve('./bot-dictionary.json');
 const MEMORIES_FILE = path.resolve('./bot-memories.json');
 const NOTES_FILE = path.resolve('./bot-notes.json');
 const GROUP_MEMBERS_FILE = path.resolve('./bot-group-members.json');
+const CONTACTS_FILE = path.resolve('./bot-contacts.json');
 const BOT_SOURCE_DIR = path.resolve('./bot');
 
 export const BENGALI_AUTOREPLY_TEXT =
@@ -122,6 +125,14 @@ interface KnownGroupMemberRecord {
   phone: string;
   name: string;
   isAdmin: boolean;
+}
+
+interface KnownContactRecord {
+  jid?: string;
+  lid?: string;
+  phone: string;
+  name: string;
+  updatedAt: string;
 }
 
 interface BotConfig {
@@ -174,6 +185,7 @@ interface SimulatorRequest {
 // ----------------------------------------------------------------------------
 const geminiPool = new GeminiKeyPool();
 const openRouterReader = new OpenRouterReader();
+const tokenTelemetry = new TokenTelemetryTracker('./bot-token-usage.json');
 
 const baileysLogger = pino({ level: 'silent' });
 
@@ -358,12 +370,125 @@ let inboxNotes: InboxNoteRecord[] = loadJsonFile<InboxNoteRecord[]>(NOTES_FILE, 
 let knownGroupMembers: Record<string, Record<string, KnownGroupMemberRecord>> = loadJsonFile<
   Record<string, Record<string, KnownGroupMemberRecord>>
 >(GROUP_MEMBERS_FILE, {});
+let knownContacts: Record<string, KnownContactRecord> = loadJsonFile<Record<string, KnownContactRecord>>(
+  CONTACTS_FILE,
+  {}
+);
+const lidToPhoneCache = new Map<string, string>();
+const phoneToLidCache = new Map<string, string>();
 let activeCloudOwnerId: string = process.env.FIREBASE_OWNER_UID || 'server_admin';
+
+function isPhoneJid(jid: string | undefined | null): boolean {
+  if (!jid) return false;
+  const lower = jid.toLowerCase();
+  return lower.endsWith('@s.whatsapp.net') || lower.endsWith('@c.us');
+}
+
+function isLidJid(jid: string | undefined | null): boolean {
+  if (!jid) return false;
+  return jid.toLowerCase().endsWith('@lid');
+}
+
+function extractPhoneDigitsOnly(jidOrPhone: string | undefined | null): string {
+  if (!jidOrPhone) return '';
+  const trimmed = String(jidOrPhone).trim();
+  if (trimmed.includes('@')) {
+    if (!isPhoneJid(trimmed)) return '';
+    return extractDigits(trimmed);
+  }
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 15) return '';
+  return digits;
+}
+
+function isDefaultNumericLabel(label: string | undefined | null): boolean {
+  if (!label) return true;
+  const trimmed = label.trim();
+  return !trimmed || /^\+?\d{5,}$/.test(trimmed) || /^Member(?:\s+\(LID|\s+•)/i.test(trimmed);
+}
+
+function rebuildContactIndexes() {
+  for (const rec of Object.values(knownContacts)) {
+    const lidDigits = extractDigits(rec.lid);
+    const pnDigits = extractPhoneDigitsOnly(rec.phone || rec.jid);
+    if (lidDigits && pnDigits) {
+      lidToPhoneCache.set(lidDigits, pnDigits);
+      phoneToLidCache.set(pnDigits, lidDigits);
+    }
+  }
+}
+
+function sanitizeKnownGroupMembersOnBoot() {
+  let dirty = false;
+  for (const [groupJid, bucket] of Object.entries(knownGroupMembers)) {
+    if (!bucket || typeof bucket !== 'object') {
+      delete knownGroupMembers[groupJid];
+      dirty = true;
+      continue;
+    }
+    for (const [key, rec] of Object.entries(bucket)) {
+      const cleanJid = (rec.jid || '').split(':')[0];
+      const cleanLid = rec.lid ? rec.lid.split(':')[0] : isLidJid(cleanJid) ? cleanJid : undefined;
+      const lidDigits = extractDigits(cleanLid);
+      const cachedPn = lidDigits ? lidToPhoneCache.get(lidDigits) : undefined;
+      const rawPhone = (rec.phone || '').replace(/\D/g, '');
+
+      // Never treat an opaque @lid ID as a real phone number
+      const isFakeLidPhone =
+        Boolean(rawPhone) &&
+        ((lidDigits && rawPhone === lidDigits && !isPhoneJid(cleanJid)) ||
+          (isLidJid(cleanJid) && rawPhone === extractDigits(cleanJid)));
+
+      const verifiedPhone = cachedPn || (isFakeLidPhone ? '' : extractPhoneDigitsOnly(isPhoneJid(cleanJid) ? cleanJid : rawPhone));
+      const cleanName = (rec.name || '').trim();
+      const nameIsFakeLidNumber =
+        Boolean(cleanName) &&
+        lidDigits &&
+        cleanName.replace(/\D/g, '') === lidDigits &&
+        !verifiedPhone;
+
+      const nextRec: KnownGroupMemberRecord = {
+        jid: verifiedPhone ? `${verifiedPhone}@s.whatsapp.net` : cleanJid,
+        lid: cleanLid,
+        phone: verifiedPhone,
+        name: nameIsFakeLidNumber
+          ? `Member • ${lidDigits.slice(-4)}`
+          : cleanName || (verifiedPhone ? `+${verifiedPhone}` : lidDigits ? `Member • ${lidDigits.slice(-4)}` : 'Member'),
+        isAdmin: Boolean(rec.isAdmin),
+      };
+      if (
+        nextRec.jid !== rec.jid ||
+        nextRec.phone !== rec.phone ||
+        nextRec.name !== rec.name ||
+        nextRec.lid !== rec.lid
+      ) {
+        bucket[key] = nextRec;
+        dirty = true;
+      }
+    }
+  }
+  if (dirty) {
+    scheduleSaveGroupMembers();
+  }
+}
+
+rebuildContactIndexes();
+sanitizeKnownGroupMembersOnBoot();
 
 const clientBotManager = new ClientBotManager({
   getOwnerId: () => activeCloudOwnerId,
   onEvent: (summary, outcome) => pushLog('system', 'Client Bots', summary, outcome || 'info'),
 });
+
+let contactsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSaveContacts() {
+  if (contactsSaveTimer) return;
+  contactsSaveTimer = setTimeout(() => {
+    contactsSaveTimer = null;
+    saveJsonFileAsync(CONTACTS_FILE, knownContacts);
+  }, 1500);
+  contactsSaveTimer.unref?.();
+}
 
 let groupMembersSaveTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleSaveGroupMembers() {
@@ -375,44 +500,244 @@ function scheduleSaveGroupMembers() {
   groupMembersSaveTimer.unref?.();
 }
 
+function findContactForIdentity(params: { jid?: string; lid?: string; phone?: string }): KnownContactRecord | null {
+  const pnDigits =
+    extractPhoneDigitsOnly(params.phone) ||
+    extractPhoneDigitsOnly(isPhoneJid(params.jid) ? params.jid : '');
+  const lidDigits = extractDigits(params.lid || (isLidJid(params.jid) ? params.jid : ''));
+  const mappedPn = !pnDigits && lidDigits ? lidToPhoneCache.get(lidDigits) : undefined;
+  const resolvedPn = pnDigits || mappedPn || '';
+
+  if (resolvedPn && knownContacts[`pn:${resolvedPn}`]) {
+    return knownContacts[`pn:${resolvedPn}`];
+  }
+  if (lidDigits && knownContacts[`lid:${lidDigits}`]) {
+    return knownContacts[`lid:${lidDigits}`];
+  }
+  return null;
+}
+
+function upsertContactRecord(input: {
+  id?: string;
+  lid?: string;
+  phoneNumber?: string;
+  pn?: string;
+  name?: string;
+  notify?: string;
+  verifiedName?: string;
+}): KnownContactRecord | null {
+  const rawId = (input.id || '').split(':')[0];
+  const rawLid = (input.lid || (isLidJid(rawId) ? rawId : '')).split(':')[0];
+  const pnCandidate = input.phoneNumber || input.pn || (isPhoneJid(rawId) ? rawId : '');
+  const phone = extractPhoneDigitsOnly(pnCandidate);
+  const lidDigits = extractDigits(rawLid);
+
+  if (!phone && !lidDigits) return null;
+
+  if (lidDigits && phone) {
+    lidToPhoneCache.set(lidDigits, phone);
+    phoneToLidCache.set(phone, lidDigits);
+  }
+
+  const resolvedPn = phone || (lidDigits ? lidToPhoneCache.get(lidDigits) || '' : '');
+  const primaryKey = resolvedPn ? `pn:${resolvedPn}` : `lid:${lidDigits}`;
+  const lidBucketKey = lidDigits ? `lid:${lidDigits}` : '';
+
+  const existingPrimary = knownContacts[primaryKey];
+  const existingLidOnly = lidBucketKey && lidBucketKey !== primaryKey ? knownContacts[lidBucketKey] : undefined;
+  const existing = existingPrimary || existingLidOnly;
+
+  const candidateNames = [input.name, input.verifiedName, input.notify]
+    .map((v) => (v || '').trim())
+    .filter((v) => Boolean(v) && !isDefaultNumericLabel(v));
+  const bestName =
+    candidateNames[0] ||
+    (existing?.name && !isDefaultNumericLabel(existing.name) ? existing.name : '') ||
+    (resolvedPn ? `+${resolvedPn}` : '');
+
+  const record: KnownContactRecord = {
+    jid: resolvedPn ? `${resolvedPn}@s.whatsapp.net` : existing?.jid,
+    lid: rawLid || (phone && phoneToLidCache.get(phone) ? `${phoneToLidCache.get(phone)}@lid` : existing?.lid),
+    phone: resolvedPn || existing?.phone || '',
+    name: bestName || existing?.name || '',
+    updatedAt: new Date().toISOString(),
+  };
+
+  knownContacts[primaryKey] = record;
+  if (existingLidOnly && lidBucketKey !== primaryKey) {
+    delete knownContacts[lidBucketKey];
+  }
+
+  // Retroactively enrich any cached group member entry matching this contact
+  let membersUpdated = false;
+  for (const bucket of Object.values(knownGroupMembers)) {
+    for (const [mKey, m] of Object.entries(bucket)) {
+      const mLidDigits = extractDigits(m.lid || (isLidJid(m.jid) ? m.jid : ''));
+      const mPnDigits = extractPhoneDigitsOnly(m.phone || (isPhoneJid(m.jid) ? m.jid : ''));
+      const matchesLid = Boolean(lidDigits && mLidDigits && lidDigits === mLidDigits);
+      const matchesPn = Boolean(resolvedPn && mPnDigits && resolvedPn === mPnDigits);
+      if (matchesLid || matchesPn) {
+        const nextPhone = resolvedPn || m.phone;
+        const nextName =
+          record.name && !isDefaultNumericLabel(record.name)
+            ? record.name
+            : m.name && !isDefaultNumericLabel(m.name)
+              ? m.name
+              : nextPhone
+                ? `+${nextPhone}`
+                : m.name;
+        const nextJid = nextPhone ? `${nextPhone}@s.whatsapp.net` : m.jid;
+        if (nextPhone !== m.phone || nextName !== m.name || nextJid !== m.jid || (record.lid && record.lid !== m.lid)) {
+          bucket[mKey] = {
+            ...m,
+            jid: nextJid,
+            lid: m.lid || record.lid,
+            phone: nextPhone,
+            name: nextName,
+          };
+          membersUpdated = true;
+        }
+      }
+    }
+  }
+
+  scheduleSaveContacts();
+  if (membersUpdated) {
+    scheduleSaveGroupMembers();
+  }
+  return record;
+}
+
 function upsertGroupMemberRecord(groupJid: string, member: Partial<KnownGroupMemberRecord> & { jid: string }) {
   if (!groupJid || !member.jid) return;
   const cleanJid = member.jid.split(':')[0];
-  const digits = extractDigits(cleanJid) || member.phone?.replace(/\D/g, '') || '';
-  const lidDigits = extractDigits(member.lid);
+  const cleanLid = (member.lid || (isLidJid(cleanJid) ? cleanJid : '')).split(':')[0] || undefined;
+  const lidDigits = extractDigits(cleanLid);
+
+  let phone = extractPhoneDigitsOnly(member.phone) || extractPhoneDigitsOnly(isPhoneJid(cleanJid) ? cleanJid : '');
+  if (!phone && lidDigits) {
+    phone = lidToPhoneCache.get(lidDigits) || '';
+  }
+  if (phone && lidDigits) {
+    lidToPhoneCache.set(lidDigits, phone);
+    phoneToLidCache.set(phone, lidDigits);
+  }
+
+  const contact = findContactForIdentity({ jid: cleanJid, lid: cleanLid, phone });
+  if (!phone && contact?.phone) {
+    phone = contact.phone;
+  }
+
   const bucket = (knownGroupMembers[groupJid] ||= {});
-  const key = digits || lidDigits || cleanJid;
-  const existing = bucket[key];
-  const cleanName = member.name?.trim();
-  const isDefaultPhoneName = !cleanName || /^\+?\d{6,}$/.test(cleanName);
+  const key = phone || (lidDigits ? `lid:${lidDigits}` : cleanJid);
+  const lidFallbackKey = lidDigits ? `lid:${lidDigits}` : '';
+
+  const existing =
+    bucket[key] ||
+    (lidFallbackKey && bucket[lidFallbackKey]) ||
+    (lidDigits ? bucket[lidDigits] : undefined);
+
+  // Clean up duplicate old LID-keyed entries once resolved to a real phone key
+  if (phone) {
+    if (lidFallbackKey && lidFallbackKey !== key && bucket[lidFallbackKey]) delete bucket[lidFallbackKey];
+    if (lidDigits && lidDigits !== key && bucket[lidDigits]) delete bucket[lidDigits];
+  }
+
+  const incomingName = (member.name || '').trim();
+  const contactName = (contact?.name || '').trim();
+  const existingName = (existing?.name || '').trim();
+
   const resolvedName =
-    !isDefaultPhoneName
-      ? cleanName!
-      : existing?.name || (digits ? `+${digits}` : cleanJid.split('@')[0]);
+    (!isDefaultNumericLabel(contactName) ? contactName : '') ||
+    (!isDefaultNumericLabel(incomingName) ? incomingName : '') ||
+    (!isDefaultNumericLabel(existingName) ? existingName : '') ||
+    (phone ? `+${phone}` : lidDigits ? `Member • ${lidDigits.slice(-4)}` : 'Member');
+
+  const resolvedJid = phone
+    ? `${phone}@s.whatsapp.net`
+    : existing?.jid && isPhoneJid(existing.jid)
+      ? existing.jid
+      : cleanJid;
 
   bucket[key] = {
-    jid: cleanJid.endsWith('@s.whatsapp.net') ? cleanJid : existing?.jid || cleanJid,
-    lid: member.lid ? member.lid.split(':')[0] : existing?.lid,
-    phone: digits || existing?.phone || '',
+    jid: resolvedJid,
+    lid: cleanLid || existing?.lid || contact?.lid,
+    phone: phone || existing?.phone || '',
     name: resolvedName,
     isAdmin: member.isAdmin ?? existing?.isAdmin ?? false,
   };
   scheduleSaveGroupMembers();
 }
 
-function recordParticipantsFromMetadata(groupJid: string, metadata: GroupMetadata | null | undefined) {
+async function resolveLidToPnDigits(sock: WASocket | null | undefined, lidJid: string): Promise<string> {
+  if (!lidJid) return '';
+  const lidDigits = extractDigits(lidJid);
+  if (!lidDigits) return '';
+  const cached = lidToPhoneCache.get(lidDigits);
+  if (cached) return cached;
+
+  const lidMapping = (
+    sock as unknown as {
+      signalRepository?: { lidMapping?: { getPNForLID?: (lid: string) => Promise<string | null> } };
+    } | null | undefined
+  )?.signalRepository?.lidMapping;
+
+  if (lidMapping && typeof lidMapping.getPNForLID === 'function') {
+    try {
+      const normalizedLid = lidJid.includes('@') ? lidJid.split(':')[0] : `${lidDigits}@lid`;
+      const pnRaw = await withTimeout(
+        Promise.resolve(lidMapping.getPNForLID(normalizedLid)),
+        350,
+        'Baileys getPNForLID'
+      ).catch(() => null);
+      const pnDigits = extractPhoneDigitsOnly(pnRaw);
+      if (pnDigits) {
+        lidToPhoneCache.set(lidDigits, pnDigits);
+        phoneToLidCache.set(pnDigits, lidDigits);
+        return pnDigits;
+      }
+    } catch {
+      // ignore mapping miss
+    }
+  }
+  return '';
+}
+
+async function recordParticipantsFromMetadataAsync(
+  sock: WASocket | null | undefined,
+  groupJid: string,
+  metadata: GroupMetadata | null | undefined
+) {
   if (!groupJid || !metadata || !Array.isArray(metadata.participants)) return;
-  for (const p of metadata.participants) {
-    const rawId = p.id || '';
-    const rawLid = (p as { lid?: string }).lid;
-    const rawNotify = (p as { notify?: string; name?: string }).notify || (p as { name?: string }).name || '';
-    const primaryJid = rawId.endsWith('@s.whatsapp.net') ? rawId : rawLid && rawLid.endsWith('@s.whatsapp.net') ? rawLid : rawId;
-    const digits = extractDigits(primaryJid);
+  for (const p of metadata.participants as Array<
+    GroupParticipant & { lid?: string; phoneNumber?: string; notify?: string; name?: string }
+  >) {
+    const rawId = (p.id || '').split(':')[0];
+    const rawLid = (p.lid || (isLidJid(rawId) ? rawId : '')).split(':')[0];
+    const rawPhoneJid = p.phoneNumber || (isPhoneJid(rawId) ? rawId : '');
+    let phoneDigits = extractPhoneDigitsOnly(rawPhoneJid);
+    if (!phoneDigits && rawLid && sock) {
+      phoneDigits = await resolveLidToPnDigits(sock, rawLid);
+    }
+
+    const primaryJid = phoneDigits ? `${phoneDigits}@s.whatsapp.net` : rawId;
+    const rawNotify = (p.notify || p.name || '').trim();
+
+    if (phoneDigits && (rawLid || rawNotify)) {
+      upsertContactRecord({
+        id: primaryJid,
+        lid: rawLid || undefined,
+        phoneNumber: primaryJid,
+        name: p.name,
+        notify: p.notify,
+      });
+    }
+
     upsertGroupMemberRecord(groupJid, {
       jid: primaryJid,
-      lid: rawId.endsWith('@lid') ? rawId : rawLid,
-      phone: digits,
-      name: rawNotify || (digits ? `+${digits}` : primaryJid.split('@')[0]),
+      lid: rawLid || undefined,
+      phone: phoneDigits,
+      name: rawNotify,
       isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
     });
   }
@@ -729,7 +1054,7 @@ async function getCachedGroupMetadata(sock: WASocket, groupJid: string): Promise
     metadata,
     expiresAt: Date.now() + 30_000,
   });
-  recordParticipantsFromMetadata(groupJid, metadata);
+  void recordParticipantsFromMetadataAsync(sock, groupJid, metadata);
   return metadata;
 }
 
@@ -757,7 +1082,7 @@ async function askGemini(query: string): Promise<string> {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
 
-  const { value: response } = await geminiPool.executeWithRotation(
+  const { value: response, keySlot } = await geminiPool.executeWithRotation(
     (client) =>
       withTimeout(
         client.models.generateContent({
@@ -773,6 +1098,7 @@ async function askGemini(query: string): Promise<string> {
         'Gemini .ai command'
       ),
     (rot) => {
+      tokenTelemetry.markGeminiSlotError(rot.fromSlot, rot.reason);
       pushLog(
         'gemini',
         `Key #${rot.fromSlot}->#${rot.toSlot}`,
@@ -782,6 +1108,21 @@ async function askGemini(query: string): Promise<string> {
     },
     { maxTotalMs: 12_000 }
   );
+
+  const um = response?.usageMetadata;
+  if (um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)) {
+    tokenTelemetry.recordUsage({
+      provider: 'gemini',
+      model: 'gemini-4-hydrogen',
+      keySlot,
+      category: 'command',
+      promptTokens: Number(um.promptTokenCount || 0),
+      completionTokens: Number(um.candidatesTokenCount || 0),
+      totalTokens: Number(
+        um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+      ),
+    });
+  }
 
   const text = response?.text?.trim();
   return text || 'I could not generate a response for that query. Please try rephrasing.';
@@ -1188,6 +1529,7 @@ async function runExecutiveAssistantTurn(params: {
       keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
       openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
       onKeyRotate: (rot) => {
+        tokenTelemetry.markGeminiSlotError(rot.fromSlot, rot.reason);
         pushLog(
           'gemini',
           `Key #${rot.fromSlot}->#${rot.toSlot}`,
@@ -1209,6 +1551,17 @@ async function runExecutiveAssistantTurn(params: {
     usedFallback = Boolean(result.usedFallback);
     providerUsed = result.providerUsed || (usedFallback ? 'offline_emotion' : 'gemini');
     keySlotUsed = result.keySlotUsed;
+    if (result.tokenUsage && (providerUsed === 'gemini' || providerUsed === 'openrouter')) {
+      tokenTelemetry.recordUsage({
+        provider: providerUsed,
+        model: result.tokenUsage.model,
+        keySlot: keySlotUsed,
+        category: 'dm',
+        promptTokens: result.tokenUsage.promptTokens,
+        completionTokens: result.tokenUsage.completionTokens,
+        totalTokens: result.tokenUsage.totalTokens,
+      });
+    }
   } catch (err) {
     const errMsg = (err as Error).message;
     usedFallback = true;
@@ -1419,6 +1772,7 @@ async function runGroupCloneTurn(params: {
       keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
       openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
       onKeyRotate: (rot) => {
+        tokenTelemetry.markGeminiSlotError(rot.fromSlot, rot.reason);
         pushLog(
           'gemini',
           `Key #${rot.fromSlot}->#${rot.toSlot}`,
@@ -1456,6 +1810,18 @@ async function runGroupCloneTurn(params: {
       isDirectlyAddressed: params.isDirectlyAddressed,
       canTextReply: params.canTextReply,
       dictionaryEntries: relevantDictionary,
+    });
+  }
+
+  if (result.tokenUsage && (result.providerUsed === 'gemini' || result.providerUsed === 'openrouter')) {
+    tokenTelemetry.recordUsage({
+      provider: result.providerUsed,
+      model: result.tokenUsage.model,
+      keySlot: result.keySlotUsed,
+      category: 'group',
+      promptTokens: result.tokenUsage.promptTokens,
+      completionTokens: result.tokenUsage.completionTokens,
+      totalTokens: result.tokenUsage.totalTokens,
     });
   }
 
@@ -1807,12 +2173,38 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   }
 
   // 3A. Smart Group AI Clone ("আমার কপি" — Observe, React, Debate, Roast, Flirt in Enabled Groups)
+  const resolvedSenderLid = isLidJid(senderJid)
+    ? senderJid
+    : isLidJid(senderAlt)
+      ? senderAlt
+      : undefined;
+  let resolvedSenderPnJid = isPhoneJid(senderJid)
+    ? senderJid
+    : isPhoneJid(senderAlt)
+      ? senderAlt
+      : undefined;
+  if (!resolvedSenderPnJid && resolvedSenderLid) {
+    const mappedPnDigits = await resolveLidToPnDigits(sock, resolvedSenderLid);
+    if (mappedPnDigits) {
+      resolvedSenderPnJid = `${mappedPnDigits}@s.whatsapp.net`;
+    }
+  }
+  const resolvedSenderPhone = extractPhoneDigitsOnly(resolvedSenderPnJid);
+
   if (isGroup && !msg.key.fromMe) {
+    if (resolvedSenderPnJid || resolvedSenderLid || msg.pushName) {
+      upsertContactRecord({
+        id: resolvedSenderPnJid || resolvedSenderLid,
+        lid: resolvedSenderLid,
+        phoneNumber: resolvedSenderPnJid,
+        notify: msg.pushName || undefined,
+      });
+    }
     upsertGroupMemberRecord(remoteJid, {
-      jid: senderAlt && senderAlt.endsWith('@s.whatsapp.net') ? senderAlt : senderJid,
-      lid: senderJid.endsWith('@lid') ? senderJid : senderAlt?.endsWith('@lid') ? senderAlt : undefined,
-      phone: extractDigits(senderAlt) || extractDigits(senderJid),
-      name: msg.pushName || extractDigits(senderAlt) || extractDigits(senderJid) || 'Member',
+      jid: resolvedSenderPnJid || senderJid,
+      lid: resolvedSenderLid,
+      phone: resolvedSenderPhone,
+      name: msg.pushName || '',
     });
   }
 
@@ -1826,7 +2218,15 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       return;
     }
 
-    const senderName = msg.pushName || senderDigits || 'Member';
+    const contactInfo = findContactForIdentity({
+      jid: resolvedSenderPnJid || senderJid,
+      lid: resolvedSenderLid,
+      phone: resolvedSenderPhone,
+    });
+    const senderName =
+      (msg.pushName && !isDefaultNumericLabel(msg.pushName) ? msg.pushName.trim() : '') ||
+      (contactInfo?.name && !isDefaultNumericLabel(contactInfo.name) ? contactInfo.name : '') ||
+      (resolvedSenderPhone ? `+${resolvedSenderPhone}` : 'Member');
     const isDirectlyAddressed = isDirectlyAddressedInGroup(msg, sock, text, botConfig.ownerName);
 
     enqueuePrivateReply(remoteJid, async () => {
@@ -1843,8 +2243,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           groupJid: remoteJid,
           groupName,
           senderName,
-          senderJid,
-          senderAlt,
+          senderJid: resolvedSenderPnJid || senderJid,
+          senderAlt: resolvedSenderPnJid || senderAlt,
           incomingText: text,
           isDirectlyAddressed,
           canTextReply: false,
@@ -1859,8 +2259,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           groupJid: remoteJid,
           groupName,
           senderName,
-          senderJid,
-          senderAlt,
+          senderJid: resolvedSenderPnJid || senderJid,
+          senderAlt: resolvedSenderPnJid || senderAlt,
           incomingText: text,
           isDirectlyAddressed,
           canTextReply: false,
@@ -1869,16 +2269,27 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         return;
       }
 
-      const lastGroupSent = autoReplyCooldowns.get(remoteJid) || 0;
-      const canTextReply = Date.now() - lastGroupSent >= (botConfig.groupCooldownMs ?? 6000);
+      // Separate cooldown buckets so targeted member missions NEVER starve or block normal members
+      const { matchedTarget } = findMatchingGroupTarget(
+        botConfig.groupDirectives?.[remoteJid],
+        resolvedSenderPnJid || senderJid,
+        resolvedSenderPnJid || senderAlt,
+        senderName
+      );
+      const cooldownBucketKey = matchedTarget ? `grp_tgt:${remoteJid}:${matchedTarget.id}` : remoteJid;
+      const cooldownWindowMs = matchedTarget
+        ? Math.min(botConfig.groupCooldownMs ?? 6000, 3000)
+        : (botConfig.groupCooldownMs ?? 6000);
+      const lastGroupSent = autoReplyCooldowns.get(cooldownBucketKey) || 0;
+      const canTextReply = Date.now() - lastGroupSent >= cooldownWindowMs;
 
       const startedAt = Date.now();
       const decision = await runGroupCloneTurn({
         groupJid: remoteJid,
         groupName,
         senderName,
-        senderJid,
-        senderAlt,
+        senderJid: resolvedSenderPnJid || senderJid,
+        senderAlt: resolvedSenderPnJid || senderAlt,
         incomingText: text,
         isDirectlyAddressed,
         canTextReply,
@@ -1903,8 +2314,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
         }
         try {
-          if (botConfig.groupCooldownMs > 0) {
-            autoReplyCooldowns.set(remoteJid, Date.now());
+          if (cooldownWindowMs > 0) {
+            autoReplyCooldowns.set(cooldownBucketKey, Date.now());
           }
           const quoteOrMention = decision.shouldQuote ? { quoted: msg } : undefined;
           await sendTrackedMessage(
@@ -2277,12 +2688,108 @@ async function startBaileysConnection(phoneNumber?: string): Promise<{ pairingCo
     }
   });
 
-  sock.ev.on('messaging-history.set', ({ messages }) => {
+  sock.ev.on('messaging-history.set', ({ messages, contacts, lidPnMappings }) => {
     if (currentSocket !== sock || isShuttingDown) return;
     try {
+      if (Array.isArray(lidPnMappings)) {
+        for (const m of lidPnMappings) {
+          if (m?.lid && m?.pn) {
+            upsertContactRecord({ lid: m.lid, pn: m.pn });
+          }
+        }
+      }
+      if (Array.isArray(contacts)) {
+        for (const c of contacts as Contact[]) {
+          upsertContactRecord({
+            id: c.id,
+            lid: c.lid,
+            phoneNumber: c.phoneNumber,
+            name: c.name,
+            notify: c.notify,
+            verifiedName: c.verifiedName,
+          });
+        }
+      }
       ingestHistoryMessages(messages);
     } catch (err) {
       pushLog('cloud', 'Inbox Sync', `History ingest warning: ${(err as Error).message}`, 'info');
+    }
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    if (currentSocket !== sock || isShuttingDown || !Array.isArray(contacts)) return;
+    for (const c of contacts) {
+      upsertContactRecord({
+        id: c.id,
+        lid: c.lid,
+        phoneNumber: c.phoneNumber,
+        name: c.name,
+        notify: c.notify,
+        verifiedName: c.verifiedName,
+      });
+    }
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    if (currentSocket !== sock || isShuttingDown || !Array.isArray(updates)) return;
+    for (const c of updates) {
+      upsertContactRecord({
+        id: c.id,
+        lid: c.lid,
+        phoneNumber: c.phoneNumber,
+        name: c.name,
+        notify: c.notify,
+        verifiedName: c.verifiedName,
+      });
+    }
+  });
+
+  sock.ev.on('lid-mapping.update', (mapping) => {
+    if (currentSocket !== sock || isShuttingDown || !mapping) return;
+    upsertContactRecord({ lid: mapping.lid, pn: mapping.pn });
+  });
+
+  sock.ev.on('groups.upsert', (groups) => {
+    if (currentSocket !== sock || isShuttingDown || !Array.isArray(groups)) return;
+    for (const meta of groups) {
+      if (meta?.id) {
+        void recordParticipantsFromMetadataAsync(sock, meta.id, meta);
+      }
+    }
+  });
+
+  sock.ev.on('groups.update', (updates) => {
+    if (currentSocket !== sock || isShuttingDown || !Array.isArray(updates)) return;
+    for (const upd of updates) {
+      if (upd?.id) {
+        groupMetadataCache.delete(upd.id);
+      }
+    }
+  });
+
+  sock.ev.on('group-participants.update', async (ev) => {
+    if (currentSocket !== sock || isShuttingDown || !ev?.id) return;
+    groupMetadataCache.delete(ev.id);
+    if (Array.isArray(ev.participants)) {
+      for (const p of ev.participants as Array<
+        GroupParticipant & { lid?: string; phoneNumber?: string; notify?: string; name?: string }
+      >) {
+        const rawId = (p?.id || '').split(':')[0];
+        if (!rawId) continue;
+        const rawLid = (p.lid || (isLidJid(rawId) ? rawId : '')).split(':')[0];
+        const rawPhoneJid = p.phoneNumber || (isPhoneJid(rawId) ? rawId : '');
+        let phoneDigits = extractPhoneDigitsOnly(rawPhoneJid);
+        if (!phoneDigits && rawLid) {
+          phoneDigits = await resolveLidToPnDigits(sock, rawLid);
+        }
+        upsertGroupMemberRecord(ev.id, {
+          jid: phoneDigits ? `${phoneDigits}@s.whatsapp.net` : rawId,
+          lid: rawLid || undefined,
+          phone: phoneDigits,
+          name: (p.notify || p.name || '').trim(),
+          isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
+        });
+      }
     }
   });
 
@@ -2881,6 +3388,21 @@ async function bootstrap() {
   app.get('/api/bot/status', (_req, res) => {
     const sessionExists = fs.existsSync(path.join(AUTH_DIR, 'creds.json'));
     const { mode: firestoreAdminMode } = getAdminFirestore();
+    const dailyStats = getDailyReplyStats();
+    const geminiStats = geminiPool.getStats();
+    const openRouterStats = openRouterReader.getStats();
+    void tokenTelemetry.maybeRefreshOpenRouterKeyMeta(openRouterReader.getPrimaryKey());
+    const tokenTelemetrySnapshot = tokenTelemetry.getSnapshot({
+      whatsappUsedToday: dailyStats.count,
+      whatsappDailyLimit: dailyStats.limit,
+      configuredGeminiKeys: geminiStats.configuredKeysCount,
+      geminiSlotCooldowns: geminiPool.getSlotCooldownStats(),
+      openRouterConfiguredKeys: openRouterStats.configuredKeysCount,
+      openRouterFreeModelsCount: openRouterStats.dynamicPool?.discoveredFreeModelsCount || 0,
+      openRouterActiveModel:
+        openRouterStats.dynamicPool?.activeFreeModel || openRouterStats.primaryModel,
+    });
+
     res.json({
       status: botStatus,
       connectedUser: currentSocket?.user?.id || null,
@@ -2889,9 +3411,10 @@ async function bootstrap() {
       sessionExists,
       lastError: lastBotError,
       geminiConfigured: geminiPool.hasKeys(),
-      geminiKeyPool: geminiPool.getStats(),
+      geminiKeyPool: geminiStats,
       openRouterConfigured: openRouterReader.hasKeys(),
-      openRouterStats: openRouterReader.getStats(),
+      openRouterStats,
+      tokenTelemetry: tokenTelemetrySnapshot,
       postgres: getPostgresStatus(),
       firestoreAdminMode,
       config: botConfig,
@@ -2899,7 +3422,7 @@ async function bootstrap() {
       dictionaryCount: totalDictionaryCount,
       memoryCount: Object.keys(chatMemories).length,
       unreadNotesCount: inboxNotes.filter((n) => !n.resolved).length,
-      dailyReplyStats: getDailyReplyStats(),
+      dailyReplyStats: dailyStats,
       activeTakeoversCount: getActiveTakeovers().length,
     });
   });
@@ -3052,16 +3575,17 @@ async function bootstrap() {
       }
     }
 
-    // 2. Enrich with live WhatsApp participating groups & participants when connected
+    // 2. Enrich with live WhatsApp participating groups & resolved participants when connected
+    let liveFetchError: string | null = null;
     if (currentSocket && botStatus === 'connected') {
       try {
         const participating = await withTimeout(
           currentSocket.groupFetchAllParticipating(),
-          4_000,
+          10_000,
           'Fetch participating groups'
         );
         for (const [jid, meta] of Object.entries(participating || {})) {
-          recordParticipantsFromMetadata(jid, meta);
+          await recordParticipantsFromMetadataAsync(currentSocket, jid, meta);
           const existing = map.get(jid);
           const members = getMembersForGroup(jid);
           map.set(jid, {
@@ -3073,14 +3597,15 @@ async function bootstrap() {
             members,
           });
         }
-      } catch {
-        // Return cached/known groups safely
+      } catch (err) {
+        liveFetchError = (err as Error).message;
       }
     }
 
     const groups = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
     res.json({
       connected: botStatus === 'connected',
+      liveFetchError,
       groups,
     });
   });

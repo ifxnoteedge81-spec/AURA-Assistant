@@ -107,6 +107,25 @@ export class GeminiKeyPool {
     };
   }
 
+  public getSlotCooldownStats(): Array<{
+    slot: number;
+    primaryCooldownSec: number;
+    liteCooldownSec: number;
+  }> {
+    const now = Date.now();
+    const primaryArr = this.getCooldownArray('primary');
+    const liteArr = this.getCooldownArray('lite');
+    const results: Array<{ slot: number; primaryCooldownSec: number; liteCooldownSec: number }> = [];
+    for (let i = 0; i < this.clients.length; i += 1) {
+      results.push({
+        slot: i + 1,
+        primaryCooldownSec: Math.max(0, Math.ceil((primaryArr[i] - now) / 1000)),
+        liteCooldownSec: Math.max(0, Math.ceil((liteArr[i] - now) / 1000)),
+      });
+    }
+    return results;
+  }
+
   /**
    * Executes a Gemini API task using the current active key slot for a given model channel.
    * On any quota/rate-limit/API error, automatically rotates sequentially

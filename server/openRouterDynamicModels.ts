@@ -46,6 +46,11 @@ export interface DynamicCompletionResult {
   modelUsed: string;
   keyIndexUsed: number;
   attemptsUsed: number;
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
 }
 
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
@@ -381,6 +386,11 @@ export class OpenRouterDynamicPool {
         const data = (await resp.json()) as {
           model?: string;
           choices?: Array<{ message?: { content?: string | null } }>;
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+          };
         };
         const content = data?.choices?.[0]?.message?.content?.trim();
         if (!content) {
@@ -397,11 +407,16 @@ export class OpenRouterDynamicPool {
         this.modelCooldownUntil.delete(model);
         this.lastSucceededModel = data?.model || model;
 
+        const promptTokens = Number(data?.usage?.prompt_tokens || 0);
+        const completionTokens = Number(data?.usage?.completion_tokens || 0);
+        const totalTokens = Number(data?.usage?.total_tokens || promptTokens + completionTokens);
+
         return {
           content,
           modelUsed: this.lastSucceededModel,
           keyIndexUsed: keyIdx,
           attemptsUsed,
+          usage: totalTokens > 0 ? { promptTokens, completionTokens, totalTokens } : undefined,
         };
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));

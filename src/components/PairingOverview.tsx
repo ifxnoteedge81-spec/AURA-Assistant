@@ -340,6 +340,161 @@ export function PairingOverview({
         </section>
       </div>
 
+      {/* Live AI Token & Remaining Capacity Monitor (100% Real API Telemetry) */}
+      {botState.tokenTelemetry && (
+        <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">
+                Live AI Token &amp; Remaining Messages Monitor
+              </h2>
+              <p className="text-xs text-slate-500">
+                Real measured API tokens (<span className="font-mono">@google/genai</span> + OpenRouter) for{' '}
+                <span className="font-mono">{botState.tokenTelemetry.date}</span> (BD Time) — zero dummy estimates.
+              </p>
+            </div>
+            {botState.tokenTelemetry.lastCall ? (
+              <div className="text-xs font-mono text-slate-600 tabular-nums">
+                Last call: {botState.tokenTelemetry.lastCall.provider} ({botState.tokenTelemetry.lastCall.category}) ·{' '}
+                {botState.tokenTelemetry.lastCall.totalTokens.toLocaleString()} tok
+              </div>
+            ) : (
+              <div className="text-xs font-mono text-slate-500">
+                Awaiting first AI call today
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border-b border-slate-200">
+            <div className="p-5">
+              <div className="text-xs font-medium text-slate-500">Tokens Used Today</div>
+              <div className="mt-1.5 text-xl font-semibold text-slate-900 font-mono tabular-nums">
+                {botState.tokenTelemetry.todayTotalTokens.toLocaleString()}
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                In: {botState.tokenTelemetry.todayPromptTokens.toLocaleString()} · Out:{' '}
+                {botState.tokenTelemetry.todayCompletionTokens.toLocaleString()} ({botState.tokenTelemetry.todayTotalCalls}{' '}
+                calls)
+              </div>
+            </div>
+
+            <div className="p-5">
+              <div className="text-xs font-medium text-slate-500">Avg Tokens / Message</div>
+              <div className="mt-1.5 text-xl font-semibold text-slate-900 font-mono tabular-nums">
+                {botState.tokenTelemetry.avgTokensOverall !== null
+                  ? `${botState.tokenTelemetry.avgTokensOverall.toLocaleString()} tok`
+                  : '—'}
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                Group:{' '}
+                {botState.tokenTelemetry.avgTokensPerGroupMsg !== null
+                  ? `${botState.tokenTelemetry.avgTokensPerGroupMsg} tok`
+                  : 'n/a'}{' '}
+                · DM:{' '}
+                {botState.tokenTelemetry.avgTokensPerDmMsg !== null
+                  ? `${botState.tokenTelemetry.avgTokensPerDmMsg} tok`
+                  : 'n/a'}
+              </div>
+            </div>
+
+            <div className="p-5">
+              <div className="text-xs font-medium text-slate-500">WhatsApp Anti-Ban Safe Cap</div>
+              <div className="mt-1.5 text-xl font-semibold text-emerald-700 font-mono tabular-nums">
+                {botState.tokenTelemetry.whatsappSafeCap.remaining.toLocaleString()} msgs left
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                Sent today: {botState.tokenTelemetry.whatsappSafeCap.usedToday} /{' '}
+                {botState.tokenTelemetry.whatsappSafeCap.limit} replies
+              </div>
+            </div>
+
+            <div className="p-5">
+              <div className="text-xs font-medium text-slate-500">Gemini Pool Est. Capacity Left</div>
+              <div className="mt-1.5 text-xl font-semibold text-slate-900 font-mono tabular-nums">
+                ~{botState.tokenTelemetry.geminiPool.estimatedGroupMsgsLeft.toLocaleString()} group msgs
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                ~{botState.tokenTelemetry.geminiPool.estimatedDmMsgsLeft.toLocaleString()} DM ·{' '}
+                {botState.tokenTelemetry.geminiPool.readyKeysCount}/
+                {botState.tokenTelemetry.geminiPool.configuredKeysCount} keys ready
+              </div>
+            </div>
+          </div>
+
+          <div className="px-6 py-4 bg-slate-50/60 grid grid-cols-1 lg:grid-cols-12 gap-4 items-start text-xs">
+            <div className="lg:col-span-7 space-y-2">
+              <div className="font-medium text-slate-700">
+                Gemini Key Slots ({botState.tokenTelemetry.geminiPool.remainingTokensToday.toLocaleString()} est. tokens /{' '}
+                {botState.tokenTelemetry.geminiPool.remainingRpdToday.toLocaleString()} RPD left)
+              </div>
+              {botState.tokenTelemetry.geminiPool.slots.length === 0 ? (
+                <div className="text-slate-500">No Gemini API keys configured.</div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
+                  {botState.tokenTelemetry.geminiPool.slots.map((s) => (
+                    <div
+                      key={s.slot}
+                      className="px-3 py-2 bg-white border border-slate-200 rounded-lg space-y-0.5"
+                      title={s.lastError || undefined}
+                    >
+                      <div className="flex items-center justify-between font-mono text-[11px]">
+                        <span className="font-semibold text-slate-800">Key #{s.slot}</span>
+                        <span
+                          className={
+                            s.status === 'ready'
+                              ? 'text-emerald-700'
+                              : s.status === 'cooldown'
+                                ? 'text-amber-700'
+                                : 'text-red-700'
+                          }
+                        >
+                          {s.status === 'ready'
+                            ? 'Ready'
+                            : s.status === 'cooldown'
+                              ? `${Math.max(s.primaryCooldownSec, s.liteCooldownSec)}s`
+                              : 'Exhausted'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500 tabular-nums">
+                        {s.requestsToday} req · {s.tokensToday.toLocaleString()} tok
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="lg:col-span-5 space-y-2">
+              <div className="font-medium text-slate-700">OpenRouter Failover Reserve</div>
+              <div className="p-3 bg-white border border-slate-200 rounded-lg space-y-1 font-mono text-[11px] text-slate-600 tabular-nums">
+                <div className="flex justify-between gap-2">
+                  <span>Active Free Model</span>
+                  <span className="text-slate-900 truncate max-w-[200px]">
+                    {botState.tokenTelemetry.openRouter.activeFreeModel}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span>Pool / Usage Today</span>
+                  <span className="text-slate-900">
+                    {botState.tokenTelemetry.openRouter.discoveredFreeModelsCount} models ·{' '}
+                    {botState.tokenTelemetry.openRouter.requestsToday} req (
+                    {botState.tokenTelemetry.openRouter.tokensToday.toLocaleString()} tok)
+                  </span>
+                </div>
+                {botState.tokenTelemetry.openRouter.keyMeta.limitRemaining !== null && (
+                  <div className="flex justify-between gap-2">
+                    <span>OpenRouter Limit Remaining</span>
+                    <span className="text-emerald-700">
+                      ${botState.tokenTelemetry.openRouter.keyMeta.limitRemaining.toFixed(4)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Live Event Log Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">

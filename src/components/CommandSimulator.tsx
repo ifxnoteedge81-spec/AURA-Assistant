@@ -323,7 +323,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                         key={`m-${m.jid}`}
                         value={JSON.stringify({ name: m.name, jid: m.jid })}
                       >
-                        Member: {m.name} {m.phone ? `(+${m.phone})` : ''}
+                        Member: {m.name} {m.phone ? `(+${m.phone})` : '(LID)'}
                       </option>
                     ))}
                   </select>

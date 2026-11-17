@@ -646,6 +646,13 @@ function getToneInstruction(tone: AssistantTone): string {
   }
 }
 
+export interface TokenUsageInfo {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+}
+
 export interface AssistantGenerationResult {
   replyText: string;
   detectedDistrict: string;
@@ -654,6 +661,7 @@ export interface AssistantGenerationResult {
   usedFallback?: boolean;
   providerUsed?: 'gemini' | 'openrouter' | 'offline_emotion';
   keySlotUsed?: number;
+  tokenUsage?: TokenUsageInfo;
 }
 
 function normalizeForComparison(text: string): string {
@@ -915,6 +923,7 @@ export async function generateExecutiveAssistantReply(params: {
   let providerUsed: 'gemini' | 'openrouter' | 'offline_emotion' = 'gemini';
   let keySlotUsed: number | undefined;
   let primaryFailed = false;
+  let tokenUsage: TokenUsageInfo | undefined;
 
   if (canUseGemini) {
     const runGeminiModel = async (
@@ -949,12 +958,34 @@ export async function generateExecutiveAssistantReply(params: {
       rawOutputText = response.text || '';
       keySlotUsed = keySlot;
       providerUsed = 'gemini';
+      const um = response.usageMetadata;
+      if (um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)) {
+        tokenUsage = {
+          promptTokens: Number(um.promptTokenCount || 0),
+          completionTokens: Number(um.candidatesTokenCount || 0),
+          totalTokens: Number(
+            um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+          ),
+          model: 'gemini-4-hydrogen',
+        };
+      }
     } catch {
       try {
         const { value: liteResponse, keySlot } = await runGeminiModel('gemini-3.1-flash-lite', 'lite');
         rawOutputText = liteResponse.text || '';
         keySlotUsed = keySlot;
         providerUsed = 'gemini';
+        const um = liteResponse.usageMetadata;
+        if (um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)) {
+          tokenUsage = {
+            promptTokens: Number(um.promptTokenCount || 0),
+            completionTokens: Number(um.candidatesTokenCount || 0),
+            totalTokens: Number(
+              um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+            ),
+            model: 'gemini-3.1-flash-lite',
+          };
+        }
       } catch {
         primaryFailed = true;
         providerUsed = 'offline_emotion';
@@ -968,11 +999,18 @@ export async function generateExecutiveAssistantReply(params: {
   // Secondary AI Fail-Safe: If all 5 Gemini keys fail/exhaust, fall back to OpenRouter
   if (primaryFailed && canUseOpenRouter && openRouterReader) {
     try {
-      rawOutputText = await openRouterReader.generateFallbackReply({
+      const detailed = await openRouterReader.generateFallbackReplyDetailed({
         systemInstruction,
         promptContent,
       });
+      rawOutputText = detailed.content;
       providerUsed = 'openrouter';
+      if (detailed.usage) {
+        tokenUsage = {
+          ...detailed.usage,
+          model: detailed.modelUsed,
+        };
+      }
     } catch {
       rawOutputText = '';
       providerUsed = 'offline_emotion';
@@ -1012,6 +1050,7 @@ export async function generateExecutiveAssistantReply(params: {
     usedFallback,
     providerUsed,
     keySlotUsed,
+    tokenUsage,
   };
 }
 
@@ -1027,6 +1066,7 @@ export interface GroupCloneResult {
   usedFallback?: boolean;
   providerUsed?: 'gemini' | 'openrouter' | 'offline_emotion';
   keySlotUsed?: number;
+  tokenUsage?: TokenUsageInfo;
 }
 
 const VALID_GROUP_REACTIONS = new Set(['😂', '🤣', '🔥', '💀', '❤️', '😏', '👀', '👏', '💯', '🙌', '😭', '😎', '🤭', '👍']);
@@ -1130,7 +1170,7 @@ function pickOfflineGroupAction(params: {
     };
   }
 
-  if (isDirectlyAddressed || mode === 'active_chat') {
+  if (isDirectlyAddressed || mode === 'active_chat' || (mode === 'smart_blend' && canTextReply)) {
     if (/(miss|ভালোবাস|cute|sweet|flirt|jaan|baby|sundor|সুন্দর|চিল)/i.test(lower)) {
       const reply =
         pickUnused([
@@ -1153,7 +1193,7 @@ function pickOfflineGroupAction(params: {
     if (/(kothay|koi|কোথায়|কই|আছো|aco|achi|kmn|কেমন|ki khobor|কি খবর)/i.test(lower)) {
       const reply =
         pickUnused([
-          `এই তো আছি রে ভাই, চিল মুডে তোমাদের নাটক দেখতেসি 😎`,
+          `এই তো আছি রে ভাই, তোমাদের নাটক আর চাপা মারা দেখতেসি 😎`,
           `আছি তো এখানেই! তোমাদের গ্রুপের ক্যাচাল ছাড়া কি থাকা যায়? 😂`,
           `বিন্দাস আছি বস, তোর কী অবস্থা? 👀`,
         ]) || `এই তো আছি! কী চলছে গ্রুপে? 😄`;
@@ -1177,9 +1217,10 @@ function pickOfflineGroupAction(params: {
               `এই লেভেলের গাঁজাখুরি গল্প শুনলে মাথা ঘুরে যায় ভাই 😂`,
             ]
           : [
-              `হাহা ${senderName}, তোমার এই ডায়লগ শুনে তো পুরা গ্রুপ হাসতে হাসতে শেষ 😂🔥`,
+              `হাহা ${senderName}, এত বড় চাপা মারলে গ্রুপের ছাদ ভেঙে পড়বে তো 😂🔥`,
               `ভাই তুমি যেভাবে বললা, মনে হলো একদম অস্কার পাবে আজ 💀😂`,
-              `আরে চুপচাপ দেখতেসিলাম কে কী বলে—তুমি দেখি একাই মঞ্চ দখল করলা! 😎`,
+              `আরে দেখো দেখো, ${senderName} আবার ফর্মে ফিরে এসেছে—থামাও ওকে কেউ! 😎`,
+              `${senderName}, তোর এই যুক্তি শুনলে আইনস্টাইনও রিজাইন দিত ভাই 🤣`,
             ]
       ) || `সত্যি নাকি ${senderName}? আরেকটু শুনি তো ব্যাপারটা 👀😂`;
 
@@ -1189,7 +1230,7 @@ function pickOfflineGroupAction(params: {
       reactionEmoji: '',
       shouldQuote: isDirectlyAddressed,
       detectedDistrict: 'Standard',
-      reason: 'Offline clone group reply',
+      reason: 'Offline clone group banter & roast',
       usedFallback: true,
       providerUsed: 'offline_emotion',
     };
@@ -1399,13 +1440,14 @@ export async function generateGroupCloneAction(params: {
 
   const modeInstruction =
     mode === 'active_chat'
-      ? 'MODE: active_chat — Participate actively like a lively group member. Reply with wit, teasing, debate, or flirting on meaningful messages; stay "silent" ONLY on pure 1-word noise like "ok/hmm".'
+      ? 'MODE: active_chat — Participate actively like a lively group member. Reply with wit, roasting ("পচানো"), debate, or flirting on meaningful messages; stay "silent" ONLY on pure 1-word noise like "ok/hmm".'
       : mode === 'mention_only'
-        ? 'MODE: mention_only — You were directly addressed/mentioned. Reply naturally in 1st person as the group member/owner!'
-        : 'MODE: smart_blend (HUMAN BLEND) — You are watching the group chat live. Act 100% like a real human friend:\n' +
-          '  * Choose "silent" when people are chatting 1-word filler ("ok", "hmm", "k") or talking between two others where interrupting feels unnatural—just quietly absorb the context.\n' +
-          '  * Choose "react" (with a fitting emoji like 😂, 🔥, 💀, ❤️, 😏, 👀) on brief jokes, memes, or good lines where a real friend just taps an emoji reaction.\n' +
-          '  * Choose "reply" or "reply_and_react" when directly mentioned/replied to, when someone asks a question, when there is a fun debate/argument to counter, a juicy opportunity to playfully roast/tease ("কাউকে পাচানো"), or playful flirting.';
+        ? 'MODE: mention_only — You were directly addressed/mentioned (or speaking to a targeted member). Reply naturally in 1st person as the group member/owner!'
+        : 'MODE: smart_blend (HUMAN BLEND — ACTIVE FRIEND) — You are watching and hanging out in the group chat live. Act 100% like a sharp, social human friend:\n' +
+          '  * Choose "reply" or "reply_and_react" on most meaningful messages, questions, opinions, bragging, or funny slips—NEVER stay silently aloof just because another member has a target mission!\n' +
+          '  * Roast & Tease naturally ("পচানোর সময় পচাবে, রোস্ট করার সময় রোস্ট করবে"): Do NOT give generic empty jokes; if a friend brags, makes weak excuses, or says something funny/illogical, roast them sharply yet affectionately like a close Bangladeshi friend!\n' +
+          '  * Choose "react" (e.g. 😂, 🔥, 💀, ❤️, 😏, 👀) on very short punchlines or memes.\n' +
+          '  * Choose "silent" ONLY on 1-word filler ("ok", "hmm", "k") or back-to-back chatter where chiming in immediately would look spammy.';
 
   const groupPromptText = groupDirective?.groupPrompt?.trim() || '';
   const directiveInstructions: string[] = [];
@@ -1423,7 +1465,7 @@ export async function generateGroupCloneAction(params: {
     );
   } else if (otherTargets.length > 0) {
     directiveInstructions.push(
-      `NORMAL MEMBER BOUNDARY: "${senderName}" is NOT a targeted member (specific missions exist only for: ${otherTargets.map((t) => `@${t.targetName}`).join(', ')}). Treat "${senderName}" completely NORMALLY like any regular group friend—do NOT apply the secret persuasion missions of other members onto "${senderName}".`
+      `NORMAL MEMBER BOUNDARY & ACTIVE SOCIAL RULE: "${senderName}" is NOT a targeted member (special persuasion missions apply ONLY when ${otherTargets.map((t) => `@${t.targetName}`).join(', ')} speak). DO NOT apply those secret persuasion missions onto "${senderName}", AND DO NOT ignore "${senderName}" because of those targets! Talk with "${senderName}" actively and completely NORMALLY like any group friend—normal adda, witty logic, and sharp roasting/teasing ("পচানো") whenever appropriate.`
     );
   }
 
@@ -1446,8 +1488,8 @@ export async function generateGroupCloneAction(params: {
     ...(directiveInstructions.length > 0 ? [...directiveInstructions, ''] : []),
     'HUMAN GROUP TEXTING SKILLS:',
     '- Read the whole recent group conversation carefully before deciding.',
-    '- Tease & Roast ("পাচানো"): Spot funny slips, bragging, or excuses in the group and roast friends playfully like a witty close friend.',
-    '- Logic & Debate: Counter silly claims with sharp, funny logic.',
+    '- Tease & Roast ("পচানো ও রোস্ট"): Do not force fake ha-ha jokes; instead catch funny slips, exaggerated claims, or excuses and roast/troll friends sharply with natural humor like a real Bangladeshi friend.',
+    '- Logic & Debate: Counter silly claims with sharp, witty logic.',
     '- Playful Flirt: Match warm/flirty energy smoothly without sounding cringey or robotic.',
     '- Language Mirroring: Write in natural casual Bangla, Banglish (e.g. "bhai ki obostha", "ei to achi"), or English matching the group.',
     '- Keep replies SHORT & PUNCHY (1–2 natural WhatsApp lines, never essays).',
@@ -1511,6 +1553,7 @@ export async function generateGroupCloneAction(params: {
   let providerUsed: 'gemini' | 'openrouter' | 'offline_emotion' = 'gemini';
   let keySlotUsed: number | undefined;
   let primaryFailed = false;
+  let tokenUsage: TokenUsageInfo | undefined;
 
   if (canUseGemini) {
     const runGroupGeminiModel = async (
@@ -1545,12 +1588,34 @@ export async function generateGroupCloneAction(params: {
       rawOutputText = response.text || '';
       keySlotUsed = keySlot;
       providerUsed = 'gemini';
+      const um = response.usageMetadata;
+      if (um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)) {
+        tokenUsage = {
+          promptTokens: Number(um.promptTokenCount || 0),
+          completionTokens: Number(um.candidatesTokenCount || 0),
+          totalTokens: Number(
+            um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+          ),
+          model: 'gemini-4-hydrogen',
+        };
+      }
     } catch {
       try {
         const { value: liteResponse, keySlot } = await runGroupGeminiModel('gemini-3.1-flash-lite', 'lite');
         rawOutputText = liteResponse.text || '';
         keySlotUsed = keySlot;
         providerUsed = 'gemini';
+        const um = liteResponse.usageMetadata;
+        if (um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)) {
+          tokenUsage = {
+            promptTokens: Number(um.promptTokenCount || 0),
+            completionTokens: Number(um.candidatesTokenCount || 0),
+            totalTokens: Number(
+              um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+            ),
+            model: 'gemini-3.1-flash-lite',
+          };
+        }
       } catch {
         primaryFailed = true;
       }
@@ -1561,11 +1626,18 @@ export async function generateGroupCloneAction(params: {
 
   if (primaryFailed && canUseOpenRouter && openRouterReader) {
     try {
-      rawOutputText = await openRouterReader.generateGroupFallbackReply({
+      const detailed = await openRouterReader.generateGroupFallbackReplyDetailed({
         systemInstruction,
         promptContent,
       });
+      rawOutputText = detailed.content;
       providerUsed = 'openrouter';
+      if (detailed.usage) {
+        tokenUsage = {
+          ...detailed.usage,
+          model: detailed.modelUsed,
+        };
+      }
     } catch {
       rawOutputText = '';
       providerUsed = 'offline_emotion';
@@ -1617,6 +1689,7 @@ export async function generateGroupCloneAction(params: {
       ...offline,
       matchedTargetName: matchedTarget?.targetName,
       mentionTarget: isTargetedSpeaker && (offline.action === 'reply' || offline.action === 'reply_and_react'),
+      tokenUsage,
     };
   }
   if ((action === 'react' || action === 'reply_and_react') && !reactionEmoji) {
@@ -1644,6 +1717,7 @@ export async function generateGroupCloneAction(params: {
     usedFallback: providerUsed === 'offline_emotion',
     providerUsed,
     keySlotUsed,
+    tokenUsage,
   };
 }
 

@@ -494,6 +494,8 @@ export default function App() {
           {section === 'rules' && (
             <ModerationRules
               config={botState.config}
+              botStatus={botState.status}
+              tokenTelemetry={botState.tokenTelemetry}
               onUpdateConfig={handleUpdateConfig}
             />
           )}

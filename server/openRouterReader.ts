@@ -62,6 +62,12 @@ export class OpenRouterReader {
   private lastSummaryAt: string | null = null;
   private lastFallbackAt: string | null = null;
   private lastError: string | null = null;
+  private onUsageHook?: (info: {
+    model: string;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  }) => void;
 
   constructor(keys: string[] = collectConfiguredOpenRouterKeys()) {
     this.keys = keys;
@@ -75,6 +81,21 @@ export class OpenRouterReader {
     if (this.keys.length > 0) {
       void this.dynamicPool.getFreeModels(this.keys[0]);
     }
+  }
+
+  public setUsageHook(
+    hook: (info: {
+      model: string;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    }) => void
+  ) {
+    this.onUsageHook = hook;
+  }
+
+  public getPrimaryKey(): string | undefined {
+    return this.keys[0];
   }
 
   public hasKeys(): boolean {
@@ -102,7 +123,11 @@ export class OpenRouterReader {
     userPrompt: string;
     timeoutMs: number;
     maxTokens?: number;
-  }): Promise<string> {
+  }): Promise<{
+    content: string;
+    modelUsed: string;
+    usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  }> {
     if (this.keys.length === 0) {
       throw new Error('OPENROUTER_API_KEY is not configured.');
     }
@@ -116,7 +141,17 @@ export class OpenRouterReader {
         maxTokens: params.maxTokens,
       });
       this.lastError = null;
-      return result.content;
+      if (result.usage) {
+        this.onUsageHook?.({
+          model: result.modelUsed,
+          ...result.usage,
+        });
+      }
+      return {
+        content: result.content,
+        modelUsed: result.modelUsed,
+        usage: result.usage,
+      };
     } catch (err) {
       const lastErr = err instanceof Error ? err : new Error(String(err));
       this.lastError = lastErr.message.slice(0, 160);
@@ -161,7 +196,7 @@ export class OpenRouterReader {
       .filter(Boolean)
       .join('\n\n');
 
-    const summary = await this.callChatCompletion({
+    const { content: summary } = await this.callChatCompletion({
       systemPrompt,
       userPrompt,
       timeoutMs: 6_500,
@@ -181,14 +216,26 @@ export class OpenRouterReader {
     systemInstruction: string;
     promptContent: string;
   }): Promise<string> {
-    const raw = await this.callChatCompletion({
+    const detailed = await this.generateFallbackReplyDetailed(params);
+    return detailed.content;
+  }
+
+  public async generateFallbackReplyDetailed(params: {
+    systemInstruction: string;
+    promptContent: string;
+  }): Promise<{
+    content: string;
+    modelUsed: string;
+    usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  }> {
+    const result = await this.callChatCompletion({
       systemPrompt: `${params.systemInstruction}\n\nRespond ONLY with valid JSON: {"replyText":"...","detectedDistrict":"Standard","noteSummary":"","noteUrgency":"normal"}`,
       userPrompt: params.promptContent,
       timeoutMs: 6_500,
       maxTokens: 280,
     });
     this.lastFallbackAt = new Date().toISOString();
-    return raw;
+    return result;
   }
 
   /**
@@ -200,13 +247,25 @@ export class OpenRouterReader {
     systemInstruction: string;
     promptContent: string;
   }): Promise<string> {
-    const raw = await this.callChatCompletion({
+    const detailed = await this.generateGroupFallbackReplyDetailed(params);
+    return detailed.content;
+  }
+
+  public async generateGroupFallbackReplyDetailed(params: {
+    systemInstruction: string;
+    promptContent: string;
+  }): Promise<{
+    content: string;
+    modelUsed: string;
+    usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  }> {
+    const result = await this.callChatCompletion({
       systemPrompt: `${params.systemInstruction}\n\nRespond ONLY with valid JSON: {"action":"reply|react|reply_and_react|silent","replyText":"...","reactionEmoji":"😂","shouldQuote":false,"detectedDistrict":"Standard","reason":"short reason"}`,
       userPrompt: params.promptContent,
       timeoutMs: 6_500,
       maxTokens: 260,
     });
     this.lastFallbackAt = new Date().toISOString();
-    return raw;
+    return result;
   }
 }

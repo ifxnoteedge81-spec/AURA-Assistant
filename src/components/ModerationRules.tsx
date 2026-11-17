@@ -22,15 +22,19 @@ import { authFetch } from '../lib/api';
 import {
   BENGALI_AUTOREPLY_EXACT,
   type BotConfig,
+  type BotStatusResponse,
   type GroupAiMode,
   type GroupDirectiveConfig,
   type GroupMemberTargetDirective,
   type KnownGroupItem,
   type KnownGroupMemberItem,
+  type TokenTelemetrySnapshot,
 } from '../types';
 
 interface ModerationRulesProps {
   config: BotConfig;
+  botStatus?: BotStatusResponse['status'];
+  tokenTelemetry?: TokenTelemetrySnapshot;
   onUpdateConfig: (patch: Partial<BotConfig>) => Promise<void>;
 }
 
@@ -39,7 +43,7 @@ const EMPTY_DIRECTIVE: GroupDirectiveConfig = {
   targets: [],
 };
 
-export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps) {
+export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateConfig }: ModerationRulesProps) {
   const activeReplyText = config.autoreplyMessage || BENGALI_AUTOREPLY_EXACT;
   const [isEditingReply, setIsEditingReply] = useState(false);
   const [replyDraft, setReplyDraft] = useState(activeReplyText);
@@ -49,6 +53,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
   const [newAiGroupJid, setNewAiGroupJid] = useState('');
   const [knownGroups, setKnownGroups] = useState<KnownGroupItem[]>([]);
   const [groupsConnected, setGroupsConnected] = useState(false);
+  const [groupLoadError, setGroupLoadError] = useState<string | null>(null);
   const [isLoadingGroups, setIsLoadingGroups] = useState(false);
   const [linkProbeText, setLinkProbeText] = useState(
     'Check this out: https://youtube.com/watch?v=dQw4w9WgXcQ or t.me/mychannel'
@@ -111,15 +116,22 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
   async function loadGroups() {
     setIsLoadingGroups(true);
+    setGroupLoadError(null);
     try {
       const res = await authFetch('/api/groups');
-      if (res.ok) {
-        const data = await res.json();
-        setGroupsConnected(Boolean(data.connected));
-        setKnownGroups(Array.isArray(data.groups) ? data.groups : []);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        setGroupLoadError(errData.error || `Failed to refresh groups (HTTP ${res.status}).`);
+        return;
       }
-    } catch {
-      // ignore initial load error
+      const data = await res.json();
+      setGroupsConnected(Boolean(data.connected));
+      setKnownGroups(Array.isArray(data.groups) ? data.groups : []);
+      if (data.liveFetchError) {
+        setGroupLoadError(`Live WhatsApp sync note: ${data.liveFetchError}`);
+      }
+    } catch (err) {
+      setGroupLoadError((err as Error).message || 'Network error while refreshing groups.');
     } finally {
       setIsLoadingGroups(false);
     }
@@ -127,7 +139,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
 
   useEffect(() => {
     void loadGroups();
-  }, []);
+  }, [botStatus]);
 
   const groupEntries = Object.entries(config.antilinkGroups || {});
   const groupAiMap = config.groupAiGroups || {};
@@ -684,6 +696,27 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
           </div>
         </div>
 
+        {tokenTelemetry && (
+          <div className="px-6 py-2.5 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3 text-xs font-mono tabular-nums text-slate-600">
+            <span>
+              Today Tokens: <strong className="text-slate-900">{tokenTelemetry.todayTotalTokens.toLocaleString()}</strong>{' '}
+              ({tokenTelemetry.byCategory.group.calls} group AI calls ·{' '}
+              {tokenTelemetry.avgTokensPerGroupMsg !== null
+                ? `avg ${tokenTelemetry.avgTokensPerGroupMsg} tok/msg`
+                : 'avg pending'}
+              )
+            </span>
+            <span>
+              Remaining Capacity:{' '}
+              <strong className="text-emerald-700">
+                {tokenTelemetry.whatsappSafeCap.remaining} WhatsApp safe replies
+              </strong>{' '}
+              · ~{tokenTelemetry.geminiPool.estimatedGroupMsgsLeft.toLocaleString()} Gemini est. msgs (
+              {tokenTelemetry.geminiPool.readyKeysCount}/{tokenTelemetry.geminiPool.configuredKeysCount} keys ready)
+            </span>
+          </div>
+        )}
+
         <div className="p-6 border-b border-slate-200 bg-slate-50/70 grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
           <div className="md:col-span-5">
             <label className="block text-xs font-medium text-slate-600">
@@ -765,9 +798,22 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
             className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
           >
             <RefreshCw className={`w-3 h-3 ${isLoadingGroups ? 'animate-spin' : ''}`} />
-            Refresh Groups
+            {isLoadingGroups ? 'Refreshing...' : 'Refresh Groups'}
           </button>
         </div>
+
+        {groupLoadError && (
+          <div className="px-6 py-2.5 border-b border-slate-200 bg-amber-50 text-xs text-amber-800 flex items-center justify-between gap-2">
+            <span>{groupLoadError}</span>
+            <button
+              type="button"
+              onClick={() => setGroupLoadError(null)}
+              className="text-amber-700 hover:text-amber-900 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {knownGroups.length === 0 ? (
           <div className="p-8 text-center text-sm text-slate-500">
@@ -969,7 +1015,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
                                             )}
                                           </span>
                                           <span className="font-mono text-[11px] text-slate-500 tabular-nums">
-                                            {m.phone ? `+${m.phone}` : m.jid.split('@')[0]}
+                                            {m.phone ? `+${m.phone}` : 'LID · Hidden Phone'}
                                           </span>
                                         </button>
                                       ))
@@ -1005,7 +1051,7 @@ export function ModerationRules({ config, onUpdateConfig }: ModerationRulesProps
                                     >
                                       {members.map((m) => (
                                         <option key={m.jid} value={m.jid}>
-                                          @{m.name} {m.phone ? `(+${m.phone})` : ''}
+                                          @{m.name} {m.phone ? `(+${m.phone})` : '(LID · Hidden Phone)'}
                                         </option>
                                       ))}
                                       <option value="manual">

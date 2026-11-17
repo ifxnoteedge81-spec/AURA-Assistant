@@ -131,6 +131,84 @@ export interface ActiveTakeoverItem {
   resumeAt: string;
 }
 
+export interface TokenCategoryStats {
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  avgTokensPerMsg: number;
+}
+
+export interface TokenKeySlotTelemetry {
+  slot: number;
+  requestsToday: number;
+  tokensToday: number;
+  primaryCooldownSec: number;
+  liteCooldownSec: number;
+  dailyExhausted: boolean;
+  lastError: string | null;
+  status: 'ready' | 'cooldown' | 'daily_exhausted';
+}
+
+export interface TokenTelemetrySnapshot {
+  date: string;
+  todayTotalTokens: number;
+  todayPromptTokens: number;
+  todayCompletionTokens: number;
+  todayTotalCalls: number;
+  lifetimeTotalTokens: number;
+  lifetimeTotalCalls: number;
+  byCategory: {
+    group: TokenCategoryStats;
+    dm: TokenCategoryStats;
+    command: TokenCategoryStats;
+    summary: TokenCategoryStats;
+  };
+  avgTokensPerGroupMsg: number | null;
+  avgTokensPerDmMsg: number | null;
+  avgTokensOverall: number | null;
+  whatsappSafeCap: {
+    usedToday: number;
+    limit: number;
+    remaining: number;
+  };
+  geminiPool: {
+    configuredKeysCount: number;
+    readyKeysCount: number;
+    exhaustedKeysCount: number;
+    estimatedRpdPerKey: number;
+    totalRpdCapacity: number;
+    usedRpdToday: number;
+    remainingRpdToday: number;
+    estimatedTpdCapacity: number;
+    remainingTokensToday: number;
+    estimatedGroupMsgsLeft: number;
+    estimatedDmMsgsLeft: number;
+    slots: TokenKeySlotTelemetry[];
+  };
+  openRouter: {
+    configuredKeysCount: number;
+    discoveredFreeModelsCount: number;
+    activeFreeModel: string;
+    requestsToday: number;
+    tokensToday: number;
+    keyMeta: {
+      checkedAt: string | null;
+      limitRemaining: number | null;
+      usageDaily: number | null;
+      isFreeTier: boolean | null;
+    };
+  };
+  lastCall: {
+    at: string;
+    provider: 'gemini' | 'openrouter';
+    model: string;
+    category: 'group' | 'dm' | 'command' | 'summary';
+    totalTokens: number;
+    keySlot?: number;
+  } | null;
+}
+
 export interface BotStatusResponse {
   status: 'disconnected' | 'connecting' | 'awaiting_pairing' | 'connected';
   connectedUser: string | null;
@@ -154,6 +232,7 @@ export interface BotStatusResponse {
       freeModelsSample: string[];
     };
   };
+  tokenTelemetry?: TokenTelemetrySnapshot;
   firestoreAdminMode?: string;
   config: BotConfig;
   logs: BotLogEntry[];
