@@ -1,0 +1,63 @@
+{
+  "date": "2026-11-18",
+  "todayPromptTokens": 1010,
+  "todayCompletionTokens": 129,
+  "todayTotalTokens": 1139,
+  "todayTotalCalls": 3,
+  "lifetimeTotalTokens": 1139,
+  "lifetimeTotalCalls": 3,
+  "openRouterRequestsToday": 0,
+  "openRouterTokensToday": 0,
+  "perKeyToday": {
+    "1": {
+      "requests": 3,
+      "tokens": 1139,
+      "exhausted": false,
+      "lastError": null
+    }
+  },
+  "zeroTokenMedia": {
+    "totalReadsToday": 14,
+    "photoReads": 7,
+    "videoReads": 2,
+    "stickerReads": 2,
+    "storyReads": 6,
+    "reactionReads": 2,
+    "zeroTokenRepliesToday": 14,
+    "tokensSpentReadingMedia": 0
+  },
+  "categories": {
+    "group": {
+      "calls": 0,
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0
+    },
+    "dm": {
+      "calls": 0,
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0
+    },
+    "command": {
+      "calls": 3,
+      "promptTokens": 1010,
+      "completionTokens": 129,
+      "totalTokens": 1139
+    },
+    "summary": {
+      "calls": 0,
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0
+    }
+  },
+  "lastCall": {
+    "at": "2026-11-17T22:31:15.226Z",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "category": "command",
+    "totalTokens": 480,
+    "keySlot": 1
+  }
+}

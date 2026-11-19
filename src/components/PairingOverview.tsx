@@ -492,6 +492,31 @@ export function PairingOverview({
               </div>
             </div>
           </div>
+
+          {botState.tokenTelemetry.zeroTokenMedia && (
+            <div className="px-6 py-3.5 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="font-medium text-slate-800">
+                Zero-Token Story, Sticker, Photo &amp; Video Reader
+              </div>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-slate-600 tabular-nums">
+                <span>
+                  Reads today:{' '}
+                  <strong className="text-slate-900">
+                    {botState.tokenTelemetry.zeroTokenMedia.totalReadsToday}
+                  </strong>
+                </span>
+                <span>
+                  Photos: {botState.tokenTelemetry.zeroTokenMedia.photoReads} · Videos:{' '}
+                  {botState.tokenTelemetry.zeroTokenMedia.videoReads} · Stickers:{' '}
+                  {botState.tokenTelemetry.zeroTokenMedia.stickerReads} · Stories:{' '}
+                  {botState.tokenTelemetry.zeroTokenMedia.storyReads}
+                </span>
+                <span className="text-emerald-700 font-semibold">
+                  0 API tokens spent reading media ({botState.tokenTelemetry.zeroTokenMedia.zeroTokenRepliesToday} 0-tok SMS replies)
+                </span>
+              </div>
+            </div>
+          )}
         </section>
       )}
 

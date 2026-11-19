@@ -61,7 +61,29 @@ export interface GroupDirectiveConfig {
   targets: GroupMemberTargetDirective[];
 }
 
+export interface StoryWhitelistContact {
+  id: string;
+  name: string;
+  phone: string;
+  jid?: string;
+  customPrompt?: string;
+  enabled: boolean;
+}
+
+export type ContactPolicyMode = 'normal' | 'long_engage' | 'hold_wait' | 'mute_ai';
+
+export interface ContactPolicyEntry {
+  id: string;
+  name: string;
+  phone: string;
+  jid?: string;
+  mode: ContactPolicyMode;
+  note?: string;
+  updatedAt: string;
+}
+
 export interface AssistantConfigFields {
+  autoreply?: boolean;
   aiAssistantEnabled: boolean;
   autoreplyMessage: string;
   firstGreetingTemplate: string;
@@ -74,11 +96,24 @@ export interface AssistantConfigFields {
   assistantTone: AssistantTone;
   humanTypingEnabled?: boolean;
   dailyReplyLimit?: number;
+  antilinkGroups?: Record<string, boolean>;
   groupAiEnabled?: boolean;
   groupAiMode?: GroupAiMode;
   groupReactionEnabled?: boolean;
   groupCooldownMs?: number;
+  groupAiGroups?: Record<string, boolean>;
   groupDirectives?: Record<string, GroupDirectiveConfig>;
+  mediaIntelligenceEnabled?: boolean;
+  mediaZeroTokenReplyMode?: boolean;
+  storyAutoReadEnabled?: boolean;
+  storyAutoReactEnabled?: boolean;
+  storyAutoReplyEnabled?: boolean;
+  storyCooldownMs?: number;
+  storyWhitelistMode?: 'all' | 'selected_only';
+  storyAllowedContacts?: StoryWhitelistContact[];
+  selfChatCopilotEnabled?: boolean;
+  selfChatZeroTokenOnly?: boolean;
+  contactPolicies?: ContactPolicyEntry[];
   configUpdatedAt?: string;
 }
 
@@ -678,14 +713,47 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+export function generateZeroTokenHoldReply(params: {
+  contactName: string;
+  note?: string;
+  previousAssistantReplies?: string[];
+  ownerName?: string;
+}): string {
+  const { contactName, note = '', previousAssistantReplies = [], ownerName = 'স্যার' } = params;
+  const cleanName = contactName && !contactName.startsWith('+') ? `${contactName}, ` : '';
+  const prevSet = new Set(previousAssistantReplies.map(normalizeForComparison));
+  const cleanNote = note.trim();
+
+  const pool = [
+    ...(cleanNote
+      ? [
+          `${cleanName}একটু হোল্ড করুন প্লিজ—${ownerName} বলেছেন "${cleanNote}"। উনি কাজটা শেষ করেই আপনার সাথে কথা বলবেন।`,
+          `${cleanName}${ownerName} এখনো ব্যস্ত আছেন (${cleanNote})। দয়া করে একটু অপেক্ষা করুন, ফ্রি হওয়ামাত্রই আপডেট পাবেন।`,
+        ]
+      : []),
+    `${cleanName}একটু অপেক্ষা করুন প্লিজ—${ownerName} একটি জরুরি কাজে আটকে আছেন। ফ্রি হলেই নিজে আপনাকে নক করবেন।`,
+    `জি, আপনার কথা নোট করা আছে ${cleanName.replace(/,\s*$/, '')}। ${ownerName} এই মুহূর্তে মিটিং/কাজে ব্যস্ত, একটু সময় দিন—উনি নিজেই দেখছেন।`,
+    `অনুগ্রহ করে একটু ধৈর্য ধরুন ${cleanName.replace(/,\s*$/, '')}—${ownerName} চূড়ান্ত সিদ্ধান্ত ছাড়া এখন কিছু বলতে চাচ্ছেন না, একটু পরেই কথা বলবেন।`,
+    `বুঝেছি! বিষয়টা হোল্ডে রাখা হয়েছে। ${ownerName} অনলাইনে এলেই সিরিয়ালি আপনাকে নক দেবেন।`,
+  ];
+
+  for (const cand of pool) {
+    if (!prevSet.has(normalizeForComparison(cand))) {
+      return cand;
+    }
+  }
+  return pool[0];
+}
+
 function pickSmartOfflineEmotionalReply(params: {
   incomingText: string;
   tone: AssistantTone;
   baseMessage: string;
   previousAssistantReplies: string[];
   timeLapse: TimeLapseContext;
+  contactPolicy?: { mode: ContactPolicyMode; note?: string };
 }): string {
-  const { incomingText, tone, baseMessage, previousAssistantReplies, timeLapse } = params;
+  const { incomingText, tone, baseMessage, previousAssistantReplies, timeLapse, contactPolicy } = params;
   const prevSet = new Set(previousAssistantReplies.map(normalizeForComparison));
   const lower = incomingText.toLowerCase();
 
@@ -695,6 +763,19 @@ function pickSmartOfflineEmotionalReply(params: {
     }
     return null;
   };
+
+  if (contactPolicy?.mode === 'long_engage') {
+    const engageNote = contactPolicy.note ? ` (${contactPolicy.note})` : '';
+    const longEngagePool = [
+      `আরে বাহ, আপনার সাথে গল্প করতে বেশ ভালোই লাগছে!${engageNote ? ` হ্যাঁ,` : ''} তাছাড়া আজকের দিনটা কেমন কাটছে বলুন তো?`,
+      `শুনতে বেশ ইন্টারেস্টিং লাগছে তো! 😌 এই ব্যাপারটা নিয়ে একটু বিস্তারিত বলুন না—আপনার দৃষ্টিভঙ্গিটা জানতে ইচ্ছে করছে।`,
+      `একদম ঠিক বলেছেন, কথাটা কিন্তু বেশ ভাবার মতো! ✨ এর আগেও কি এমন অভিজ্ঞতা হয়েছিল আপনার?`,
+      `বাহ দারুণ! আমি মন দিয়েই শুনছি আপনার কথা—তারপর কী হলো বলুন দেখি? 😊`,
+      `স্যার কাজে থাকলেও আমাদের আড্ডা কিন্তু থামবে না! 😄 এখন কি ব্যস্ত আছেন নাকি একটু ফ্রি সময়ে গল্প চলছে?`,
+    ];
+    const picked = pickUnused(longEngagePool);
+    if (picked) return picked;
+  }
 
   if (/(miss|ভালোবাস|love|jan|jaan|baby|cute|sweet|flirt|মন চায়|ভালো লাগে)/i.test(lower)) {
     const res = pickUnused(
@@ -798,6 +879,7 @@ export async function generateExecutiveAssistantReply(params: {
   incomingText: string;
   contactName: string;
   dictionaryEntries: DictionaryEntry[];
+  contactPolicy?: { mode: ContactPolicyMode; note?: string };
 }): Promise<AssistantGenerationResult> {
   const {
     ai = null,
@@ -810,6 +892,7 @@ export async function generateExecutiveAssistantReply(params: {
     incomingText,
     contactName,
     dictionaryEntries,
+    contactPolicy,
   } = params;
 
   const existingTurns = memory?.turns || [];
@@ -830,6 +913,7 @@ export async function generateExecutiveAssistantReply(params: {
         baseMessage: settings.autoreplyMessage,
         previousAssistantReplies: recentAssistantReplies,
         timeLapse,
+        contactPolicy,
       }),
       detectedDistrict: memory?.detectedDistrict || 'Standard',
       noteSummary: '',
@@ -876,10 +960,15 @@ export async function generateExecutiveAssistantReply(params: {
           .map((t) => `- [${(t.timestamp || '').slice(0, 10)}] ${t.role === 'user' ? contactName || 'Contact' : 'Sir/Assistant'}: ${t.text}`)
           .join('\n')}`
       : '',
+    contactPolicy?.mode === 'long_engage'
+      ? `OWNER SPECIAL DIRECTIVE (LONG ENGAGE MODE): Sir wants you to keep "${contactName || 'this contact'}" engaged in a long, natural, enjoyable conversation!${contactPolicy.note ? ` Focus note: ${contactPolicy.note}.` : ''} Ask 1 thoughtful, inviting follow-up question in every reply and never rush to close the conversation.`
+      : '',
     isNewSession
       ? `CONVERSATION ENTRY RULE: Acknowledge naturally while letting them know Sir is busy/away and you are his personal assistant (general vibe inspiration only, NEVER copy verbatim: "${settings.firstGreetingTemplate || DEFAULT_FIRST_GREETING}").`
       : 'ONGOING CONVERSATION RULE: Do NOT repeat "Sir is busy/offline" boilerplate unless asked. Continue the human conversation seamlessly.',
     'STYLE RULES:',
+    '- Reply strictly using text SMS only — NEVER send or claim to attach images, stickers, videos, or voice notes back.',
+    '- When the incoming message includes a Zero-Token Media Context tag ([ফটো/ছবি...], [ভিডিও...], [স্টিকার...], [স্টোরি/Status...], [রিয়্যাক্ট...]), react completely naturally according to context: praise great scenery/positive posts, honestly critique dark/blurry/bad ones, laugh/tease funny memes or stickers, debate logical screenshots with sharp reasoning, and if it is a personal portrait photo, warmly compliment how genuinely great/stunning they look ("দেখতে ভীষণ সুন্দর").',
     '- Reply in the exact language/script/dialect the sender used (Bengali, Banglish, or English).',
     '- Write 1–3 expressive, witty, emotionally alive WhatsApp sentences. Never sound robotic or generic.',
     '- Never reuse or paraphrase previous replies.',
@@ -1037,6 +1126,7 @@ export async function generateExecutiveAssistantReply(params: {
       baseMessage: settings.autoreplyMessage,
       previousAssistantReplies: recentAssistantReplies,
       timeLapse,
+      contactPolicy,
     });
     usedFallback = true;
     providerUsed = 'offline_emotion';
@@ -1487,6 +1577,8 @@ export async function generateGroupCloneAction(params: {
     '',
     ...(directiveInstructions.length > 0 ? [...directiveInstructions, ''] : []),
     'HUMAN GROUP TEXTING SKILLS:',
+    '- Reply strictly using text SMS (+ optional emoji reaction) — NEVER send or attach stickers, photos, or videos back.',
+    '- When you see a Zero-Token Media tag ([ফটো...], [ভিডিও...], [স্টিকার...], [স্টোরি...], [রিয়্যাক্ট...]), react naturally like a real friend: praise good content, roast or critique bad/dark/blurry uploads, laugh at funny stickers/memes, debate logical points, and genuinely compliment portrait photos ("দেখতে ভীষণ সুন্দর") without sounding creepy.',
     '- Read the whole recent group conversation carefully before deciding.',
     '- Tease & Roast ("পচানো ও রোস্ট"): Do not force fake ha-ha jokes; instead catch funny slips, exaggerated claims, or excuses and roast/troll friends sharply with natural humor like a real Bangladeshi friend.',
     '- Logic & Debate: Counter silly claims with sharp, witty logic.',
@@ -1725,3 +1817,236 @@ function prevSetHas(previousReplies: string[], candidate: string): boolean {
   const norm = normalizeForComparison(candidate);
   return previousReplies.some((r) => normalizeForComparison(r) === norm);
 }
+
+export interface DirectCommandGenerationResult {
+  messageText: string;
+  providerUsed: 'gemini' | 'openrouter' | 'offline_emotion';
+  keySlotUsed?: number;
+  tokenUsage?: TokenUsageInfo;
+}
+
+function buildOfflineDirectCommandMessage(params: {
+  actionType: 'dm_knock' | 'group_mention';
+  targetName: string;
+  mentionTags: string[];
+  instruction: string;
+  useAiCraft: boolean;
+}): string {
+  const { actionType, targetName, mentionTags, instruction, useAiCraft } = params;
+  const cleanInst = instruction.trim();
+  const tagPrefix = mentionTags.length > 0 ? `${mentionTags.join(' ')} ` : '';
+
+  if (!useAiCraft) {
+    if (actionType === 'group_mention' && tagPrefix) {
+      const hasAllTags = mentionTags.every((t) => cleanInst.includes(t));
+      return hasAllTags ? cleanInst : `${tagPrefix}${cleanInst}`;
+    }
+    return cleanInst;
+  }
+
+  // Strip meta-verbs like "ওকে বলো", "নক করে বলো", "মেনশন দিয়ে বলো" so it reads like a real direct message
+  const cleanedTask = cleanInst
+    .replace(/^(?:ওকে|তাকে|উনাকে|এই নাম্বারে|ইনবক্সে|গ্রুপে|মেনশন দিয়ে|নক করে|নক দিয়ে)\s*/giu, '')
+    .replace(/(?:ইনবক্সে নক করে বলো|নক দিয়ে বলো|নক করে বলো|মেনশন দিয়ে বলো|মেনশন দাও আর বলো|মেনশন দিয়ে কথা বলো|কথা বলো|বলো যে|বলে দাও|জানিয়ে দাও|জিজ্ঞেস করো)\s*/giu, '')
+    .trim();
+  const coreBody = cleanedTask || cleanInst;
+
+  if (actionType === 'group_mention') {
+    const body = tagPrefix ? `${tagPrefix}${coreBody}` : coreBody;
+    return body.trim();
+  }
+
+  const friendlyLead = targetName && !targetName.startsWith('+') ? `হাই ${targetName}, ` : '';
+  return `${friendlyLead}${coreBody}`.trim();
+}
+
+function ensureMentionTagsIncluded(text: string, mentionTags: string[]): string {
+  if (mentionTags.length === 0) return text.trim();
+  const missing = mentionTags.filter((tag) => !text.includes(tag));
+  if (missing.length === 0) return text.trim();
+  return `${missing.join(' ')} ${text.trim()}`.trim();
+}
+
+export async function generateDirectCommandText(params: {
+  keyPool?: GeminiKeyPool | null;
+  openRouterReader?: OpenRouterReader | null;
+  onKeyRotate?: (event: KeyRotationEvent) => void;
+  settings: AssistantConfigFields;
+  actionType: 'dm_knock' | 'group_mention';
+  targetName: string;
+  groupName?: string;
+  mentionTags?: string[];
+  instruction: string;
+  memory?: ChatMemoryRecord | null;
+  useAiCraft?: boolean;
+}): Promise<DirectCommandGenerationResult> {
+  const {
+    keyPool = null,
+    openRouterReader = null,
+    onKeyRotate,
+    settings,
+    actionType,
+    targetName,
+    groupName = '',
+    mentionTags = [],
+    instruction,
+    memory = null,
+    useAiCraft = true,
+  } = params;
+
+  const cleanInst = instruction.trim();
+  if (!useAiCraft) {
+    return {
+      messageText: buildOfflineDirectCommandMessage({
+        actionType,
+        targetName,
+        mentionTags,
+        instruction: cleanInst,
+        useAiCraft: false,
+      }),
+      providerUsed: 'offline_emotion',
+    };
+  }
+
+  const canUseGemini = Boolean(keyPool && keyPool.hasKeys());
+  const canUseOpenRouter = Boolean(openRouterReader && openRouterReader.hasKeys());
+
+  if (!canUseGemini && !canUseOpenRouter) {
+    return {
+      messageText: buildOfflineDirectCommandMessage({
+        actionType,
+        targetName,
+        mentionTags,
+        instruction: cleanInst,
+        useAiCraft: true,
+      }),
+      providerUsed: 'offline_emotion',
+    };
+  }
+
+  const tone = settings.assistantTone || 'witty_flirty';
+  const ownerName = settings.ownerName || 'Sir';
+  const recentContext = (memory?.turns || [])
+    .slice(-5)
+    .map((t) => `${t.role === 'user' ? targetName || 'User' : ownerName}: ${t.text}`)
+    .join('\n');
+
+  const systemInstruction = [
+    `You are "${ownerName}" sending an outgoing WhatsApp message on behalf of the owner's direct dashboard command.`,
+    `Tone guide: ${getToneInstruction(tone)}`,
+    'STRICT OUTPUT RULES:',
+    /[অ-হ]/u.test(cleanInst)
+      ? '1. Convert the owner instruction into ONE natural, human-sounding WhatsApp text SMS in natural BENGALI SCRIPT (বাংলা হরফে, যেমন মালিক বাংলায় লিখেছেন).'
+      : '1. Convert the owner instruction into ONE natural, human-sounding WhatsApp text SMS matching the exact language/style (Banglish or English) of the instruction.',
+    '2. NEVER sound like an order repeater (strip phrases like "ওকে বলো যে", "মেনশন দাও", "ইনবক্সে নক করো", phone numbers used for routing). Speak directly TO the recipient as a real person.',
+    '3. Keep it crisp (1-2 sentences, under 320 characters) with zero AI disclaimers and strictly TEXT ONLY (never promise sending media).',
+    mentionTags.length > 0
+      ? `4. CRITICAL WHATSAPP MENTION RULE: You MUST include these exact mention tags verbatim inside the message text: ${mentionTags.join(', ')}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const promptContent = [
+    `ACTION MODE: ${actionType === 'group_mention' ? `Group Mention in "${groupName || 'WhatsApp Group'}"` : 'Direct Private Inbox Knock (DM)'}`,
+    `TARGET RECIPIENT: ${targetName || 'Friend'}`,
+    mentionTags.length > 0 ? `REQUIRED @MENTION TOKENS: ${mentionTags.join(' ')}` : '',
+    recentContext ? `RECENT CHAT CONTEXT:\n${recentContext}` : '',
+    `OWNER COMMAND / WHAT TO SAY:\n${cleanInst}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      messageText: {
+        type: Type.STRING,
+        description: 'Direct outgoing WhatsApp message ready to send.',
+      },
+    },
+    required: ['messageText'],
+  };
+
+  if (canUseGemini && keyPool) {
+    try {
+      const { value: response, keySlot } = await keyPool.executeWithRotation(
+        async (client) =>
+          withTimeout(
+            client.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: promptContent,
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema,
+              },
+            }),
+            5_500,
+            'Direct Command Gemini call'
+          ),
+        onKeyRotate,
+        { maxTotalMs: 7_500, channel: 'lite' }
+      );
+      const parsed = JSON.parse(extractJsonObject(response.text || '{}')) as { messageText?: string };
+      const crafted = (parsed.messageText || '').trim();
+      if (crafted) {
+        const um = response.usageMetadata;
+        const tokenUsage: TokenUsageInfo | undefined =
+          um && (um.totalTokenCount || um.promptTokenCount || um.candidatesTokenCount)
+            ? {
+                promptTokens: Number(um.promptTokenCount || 0),
+                completionTokens: Number(um.candidatesTokenCount || 0),
+                totalTokens: Number(
+                  um.totalTokenCount || (um.promptTokenCount || 0) + (um.candidatesTokenCount || 0)
+                ),
+                model: 'gemini-3.1-flash-lite',
+              }
+            : undefined;
+        return {
+          messageText: ensureMentionTagsIncluded(crafted, mentionTags),
+          providerUsed: 'gemini',
+          keySlotUsed: keySlot,
+          tokenUsage,
+        };
+      }
+    } catch {
+      // fall through to OpenRouter / offline
+    }
+  }
+
+  if (canUseOpenRouter && openRouterReader) {
+    try {
+      const detailed = await openRouterReader.generateFallbackReplyDetailed({
+        systemInstruction: `${systemInstruction}\nReturn JSON {"messageText":"..."}.`,
+        promptContent,
+      });
+      const parsed = JSON.parse(extractJsonObject(detailed.content || '{}')) as {
+        messageText?: string;
+        replyText?: string;
+      };
+      const crafted = (parsed.messageText || parsed.replyText || '').trim();
+      if (crafted) {
+        return {
+          messageText: ensureMentionTagsIncluded(crafted, mentionTags),
+          providerUsed: 'openrouter',
+          tokenUsage: detailed.usage ? { ...detailed.usage, model: detailed.modelUsed } : undefined,
+        };
+      }
+    } catch {
+      // fall through to offline
+    }
+  }
+
+  return {
+    messageText: buildOfflineDirectCommandMessage({
+      actionType,
+      targetName,
+      mentionTags,
+      instruction: cleanInst,
+      useAiCraft: true,
+    }),
+    providerUsed: 'offline_emotion',
+  };
+}
+

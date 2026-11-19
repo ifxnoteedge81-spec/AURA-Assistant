@@ -19,6 +19,39 @@ function loadAppletConfig(): { projectId?: string; firestoreDatabaseId?: string 
   return {};
 }
 
+let lastInitError: string | null = null;
+let loadedServiceAccountProjectId: string | null = null;
+
+export interface FirestoreAdminDiagnostics {
+  configuredProjectId: string;
+  configuredDatabaseId: string;
+  serviceAccountProjectId: string | null;
+  projectMatch: boolean | null;
+  mode: string;
+  hasServiceAccountEnv: boolean;
+  initError: string | null;
+}
+
+export function getFirestoreAdminDiagnostics(): FirestoreAdminDiagnostics {
+  const appletConfig = loadAppletConfig();
+  const configuredProjectId = String(appletConfig.projectId || '').trim();
+  const configuredDatabaseId = String(appletConfig.firestoreDatabaseId || '(default)').trim();
+  const { mode } = getAdminFirestore();
+  const rawSa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  return {
+    configuredProjectId,
+    configuredDatabaseId,
+    serviceAccountProjectId: loadedServiceAccountProjectId,
+    projectMatch:
+      loadedServiceAccountProjectId && configuredProjectId
+        ? loadedServiceAccountProjectId === configuredProjectId
+        : null,
+    mode,
+    hasServiceAccountEnv: Boolean(rawSa),
+    initError: lastInitError,
+  };
+}
+
 export function getAdminFirestore(): { db: Firestore | null; mode: string } {
   if (initAttempted) {
     return { db: adminDb, mode: initMode };
@@ -36,16 +69,18 @@ export function getAdminFirestore(): { db: Firestore | null; mode: string } {
         ? rawSa
         : Buffer.from(rawSa, 'base64').toString('utf8');
       const serviceAccount = JSON.parse(jsonStr);
+      loadedServiceAccountProjectId = String(serviceAccount.project_id || '').trim() || null;
       const app =
         getApps().length > 0
           ? getApps()[0]
           : initializeApp({
               credential: cert(serviceAccount),
-              projectId: serviceAccount.project_id || projectId,
+              projectId: projectId || serviceAccount.project_id,
             });
       adminDb = getFirestore(app, databaseId);
       initMode = 'service_account';
-      console.log(`[Firestore Admin] Connected via Service Account to DB "${databaseId}".`);
+      lastInitError = null;
+      console.log(`[Firestore Admin] Connected via Service Account to DB "${databaseId}" (project: ${projectId || loadedServiceAccountProjectId}).`);
       return { db: adminDb, mode: initMode };
     }
 
@@ -59,11 +94,13 @@ export function getAdminFirestore(): { db: Firestore | null; mode: string } {
             });
       adminDb = getFirestore(app, databaseId);
       initMode = 'adc';
+      lastInitError = null;
       console.log(`[Firestore Admin] Connected via Application Default Credentials to DB "${databaseId}".`);
       return { db: adminDb, mode: initMode };
     }
   } catch (err) {
-    console.warn('[Firestore Admin] Admin SDK unavailable; using local JSON + browser Firestore sync:', (err as Error).message);
+    lastInitError = (err as Error).message.slice(0, 180);
+    console.warn('[Firestore Admin] Admin SDK unavailable; using local JSON + browser Firestore sync:', lastInitError);
     adminDb = null;
     initMode = 'local_only';
   }

@@ -29,7 +29,8 @@ import type {
 } from '../types';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const configuredDbId = (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId;
+export const db = configuredDbId ? getFirestore(app, configuredDbId) : getFirestore(app);
 export const auth = getAuth(app);
 
 export enum OperationType {
@@ -84,8 +85,21 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
+// In-memory Gmail OAuth access token cache (never stored in localStorage/sessionStorage)
+let cachedGmailAccessToken: string | null = null;
+let cachedGmailEmail: string | null = null;
+let isGmailAuthInFlight = false;
+
+export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+
 export function subscribeAuthState(cb: (user: User | null) => void) {
-  return onAuthStateChanged(auth, cb);
+  return onAuthStateChanged(auth, (user) => {
+    if (!user && !isGmailAuthInFlight) {
+      cachedGmailAccessToken = null;
+      cachedGmailEmail = null;
+    }
+    cb(user);
+  });
 }
 
 export async function signInWithGoogle() {
@@ -95,7 +109,48 @@ export async function signInWithGoogle() {
   return result.user;
 }
 
+export async function connectGmailWithGoogle(): Promise<{
+  user: User;
+  accessToken: string;
+  email: string;
+}> {
+  const provider = new GoogleAuthProvider();
+  provider.addScope(GMAIL_SEND_SCOPE);
+  provider.setCustomParameters({ prompt: 'consent select_account' });
+  isGmailAuthInFlight = true;
+  try {
+    const result = await signInWithPopup(auth, provider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    if (!credential?.accessToken) {
+      throw new Error('Could not obtain Gmail authorization token from Google sign-in.');
+    }
+    cachedGmailAccessToken = credential.accessToken;
+    cachedGmailEmail = result.user.email || null;
+    return {
+      user: result.user,
+      accessToken: cachedGmailAccessToken,
+      email: cachedGmailEmail || '',
+    };
+  } finally {
+    isGmailAuthInFlight = false;
+  }
+}
+
+export function getCachedGmailSession(): { accessToken: string | null; email: string | null } {
+  return {
+    accessToken: cachedGmailAccessToken,
+    email: cachedGmailEmail,
+  };
+}
+
+export function clearCachedGmailSession() {
+  cachedGmailAccessToken = null;
+  cachedGmailEmail = null;
+}
+
 export async function signOutFirebase() {
+  cachedGmailAccessToken = null;
+  cachedGmailEmail = null;
   await signOut(auth);
 }
 
@@ -137,6 +192,17 @@ export async function saveCloudSettings(uid: string, config: BotConfig) {
       groupCooldownMs: typeof config.groupCooldownMs === 'number' ? config.groupCooldownMs : 6000,
       groupAiGroups: config.groupAiGroups || {},
       groupDirectives: config.groupDirectives || {},
+      mediaIntelligenceEnabled: config.mediaIntelligenceEnabled !== false,
+      mediaZeroTokenReplyMode: config.mediaZeroTokenReplyMode !== false,
+      storyAutoReadEnabled: config.storyAutoReadEnabled !== false,
+      storyAutoReactEnabled: config.storyAutoReactEnabled !== false,
+      storyAutoReplyEnabled: config.storyAutoReplyEnabled !== false,
+      storyCooldownMs: typeof config.storyCooldownMs === 'number' ? config.storyCooldownMs : 900000,
+      storyWhitelistMode: config.storyWhitelistMode === 'selected_only' ? 'selected_only' : 'all',
+      storyAllowedContacts: Array.isArray(config.storyAllowedContacts) ? config.storyAllowedContacts.slice(0, 200) : [],
+      selfChatCopilotEnabled: config.selfChatCopilotEnabled !== false,
+      selfChatZeroTokenOnly: config.selfChatZeroTokenOnly !== false,
+      contactPolicies: Array.isArray(config.contactPolicies) ? config.contactPolicies.slice(0, 200) : [],
       configUpdatedAt: (config.configUpdatedAt || new Date().toISOString()).slice(0, 64),
       createdAt: existingCreatedAt || serverTimestamp(),
       updatedAt: serverTimestamp(),

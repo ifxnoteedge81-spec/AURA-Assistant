@@ -4,8 +4,11 @@ export type NavSection =
   | 'inbox'
   | 'simulator'
   | 'rules'
+  | 'outreach'
+  | 'agent'
   | 'clients'
   | 'security'
+  | 'settings'
   | 'source';
 
 export type AssistantTone =
@@ -47,6 +50,57 @@ export interface KnownGroupItem {
   members?: KnownGroupMemberItem[];
 }
 
+export interface StoryWhitelistContact {
+  id: string;
+  name: string;
+  phone: string;
+  jid?: string;
+  customPrompt?: string;
+  enabled: boolean;
+}
+
+export interface KnownContactItem {
+  jid: string;
+  lid?: string;
+  phone: string;
+  name: string;
+}
+
+export interface DirectCommandLogItem {
+  id: string;
+  timestamp: string;
+  actionType: 'dm_knock' | 'group_mention';
+  targetLabel: string;
+  targetJid: string;
+  mentionedJids: string[];
+  instruction: string;
+  messageSent: string;
+  deliveredLive: boolean;
+  usedAi: boolean;
+  providerUsed: string;
+}
+
+export type ContactPolicyMode = 'normal' | 'long_engage' | 'hold_wait' | 'mute_ai';
+
+export interface ContactPolicyEntry {
+  id: string;
+  name: string;
+  phone: string;
+  jid?: string;
+  mode: ContactPolicyMode;
+  note?: string;
+  updatedAt: string;
+}
+
+export interface SelfChatTurnItem {
+  id: string;
+  role: 'owner' | 'assistant';
+  text: string;
+  mediaKind?: string;
+  actionSummary?: string;
+  timestamp: string;
+}
+
 export interface BotConfig {
   autoreply: boolean;
   aiAssistantEnabled: boolean;
@@ -70,7 +124,52 @@ export interface BotConfig {
   groupCooldownMs?: number;
   groupAiGroups?: Record<string, boolean>;
   groupDirectives?: Record<string, GroupDirectiveConfig>;
+  mediaIntelligenceEnabled?: boolean;
+  mediaZeroTokenReplyMode?: boolean;
+  storyAutoReadEnabled?: boolean;
+  storyAutoReactEnabled?: boolean;
+  storyAutoReplyEnabled?: boolean;
+  storyCooldownMs?: number;
+  storyWhitelistMode?: 'all' | 'selected_only';
+  storyAllowedContacts?: StoryWhitelistContact[];
+  selfChatCopilotEnabled?: boolean;
+  selfChatZeroTokenOnly?: boolean;
+  contactPolicies?: ContactPolicyEntry[];
   configUpdatedAt?: string;
+}
+
+export interface MediaStoryFeedItem {
+  id: string;
+  timestamp: string;
+  source: 'story' | 'dm' | 'group' | 'simulator';
+  senderName: string;
+  senderJid: string;
+  kind: 'photo' | 'video' | 'gif' | 'sticker' | 'story_text' | 'audio' | 'reaction' | 'text';
+  sentiment:
+    | 'praise_portrait'
+    | 'good_positive'
+    | 'bad_critique'
+    | 'funny_laugh'
+    | 'logical_debate'
+    | 'affection_like'
+    | 'greeting_casual';
+  banglaSceneLabel: string;
+  compactContextLine: string;
+  reactionSent: string;
+  replySent: string;
+  tokensUsedForRead: 0;
+  replyMode: 'zero_token' | 'hybrid_text_ai' | 'read_only';
+}
+
+export interface ZeroTokenMediaStats {
+  totalReadsToday: number;
+  photoReads: number;
+  videoReads: number;
+  stickerReads: number;
+  storyReads: number;
+  reactionReads: number;
+  zeroTokenRepliesToday: number;
+  tokensSpentReadingMedia: 0;
 }
 
 export interface DictionaryEntry {
@@ -158,6 +257,7 @@ export interface TokenTelemetrySnapshot {
   todayTotalCalls: number;
   lifetimeTotalTokens: number;
   lifetimeTotalCalls: number;
+  zeroTokenMedia?: ZeroTokenMediaStats;
   byCategory: {
     group: TokenCategoryStats;
     dm: TokenCategoryStats;
@@ -330,3 +430,227 @@ export interface ClientBotItem {
 
 export const BENGALI_AUTOREPLY_EXACT =
   'ওয়ালাইকুমুস সালাম! আমি ওনার অ্যাসিস্ট্যান্ট বলছিলাম। স্যার তো এই মুহূর্তে ব্যস্ত আছেন বা স্যার এই মুহূর্তে অফলাইনে আছেন বা স্যার এই মুহূর্তে নেই। স্যার আসলে আপনাকে নক করবেন।';
+
+export type OutreachEmailProvider = 'gmail_oauth' | 'smtp_profile' | 'resend_http' | 'brevo_http' | 'custom_http';
+
+export interface PublicEmailSenderProfile {
+  id: string;
+  email: string;
+  label: string;
+  type: 'smtp_gmail' | 'smtp_custom';
+  host: string;
+  port: number;
+  active: boolean;
+  hasSecret: boolean;
+  maskedSecret: string;
+  createdAt: string;
+}
+
+export interface OutreachSafetyPolicy {
+  dailyEmailLimit: number;
+  dailyWhatsappLimit: number;
+  whatsappMinDelayMs: number;
+  whatsappMaxDelayMs: number;
+  emailDelayMs: number;
+  preferredEmailProvider: OutreachEmailProvider;
+  zeroTokenDraftDefault: boolean;
+  defaultLanguage: 'bn' | 'en';
+  defaultOfferPitch: string;
+  crawlContactSubpages: boolean;
+  maxSitesPerSearch: number;
+}
+
+export interface OutreachLeadItem {
+  id: string;
+  name: string;
+  sourceUrl: string;
+  domain: string;
+  topic: string;
+  emails: string[];
+  phones: string[];
+  whatsappVerifiedPhones: string[];
+  whatsappCheckedAt: string | null;
+  snippet: string;
+  emailSentCount: number;
+  lastEmailSentAt: string | null;
+  whatsappSentCount: number;
+  lastWhatsappSentAt: string | null;
+  createdAt: string;
+}
+
+export interface WebResearchHistoryItem {
+  id: string;
+  query: string;
+  providerUsed: 'tavily' | 'serper' | 'duckduckgo' | 'gemini_search' | 'direct_url';
+  tokensSpent: number;
+  summary: string;
+  urls: { title: string; url: string; snippet: string }[];
+  emailsFound: number;
+  phonesFound: number;
+  createdAt: string;
+}
+
+export interface OutreachDispatchLogItem {
+  id: string;
+  timestamp: string;
+  channel: 'email' | 'whatsapp';
+  provider: string;
+  recipient: string;
+  leadName: string;
+  subject?: string;
+  messagePreview: string;
+  status: 'sent' | 'failed' | 'skipped';
+  error?: string;
+  tokensSpent: number;
+}
+
+export interface OutreachStateResponse {
+  memoryRssMb: number;
+  policy: OutreachSafetyPolicy;
+  stats: {
+    date: string;
+    emailsSentToday: number;
+    whatsappSentToday: number;
+    totalLeads: number;
+    whatsappVerifiedCount: number;
+  };
+  capabilities: {
+    tavilyConfigured: boolean;
+    serperConfigured: boolean;
+    geminiSearchConfigured: boolean;
+    openRouterConfigured: boolean;
+    smtpProfileConfigured?: boolean;
+    resendConfigured: boolean;
+    brevoConfigured: boolean;
+    customEmailWebhookConfigured: boolean;
+    whatsappConnected: boolean;
+  };
+  emailSenders?: PublicEmailSenderProfile[];
+  whatsappQueue: {
+    active: boolean;
+    total: number;
+    processed: number;
+    sent: number;
+    failed: number;
+    currentRecipient: string | null;
+    nextSendAt: string | null;
+  };
+  leads: OutreachLeadItem[];
+  researchHistory: WebResearchHistoryItem[];
+  dispatchLogs: OutreachDispatchLogItem[];
+}
+
+export interface AgentExecutionStep {
+  stepNumber: number;
+  toolName: string;
+  argsPreview: string;
+  outcome: 'ok' | 'error';
+  resultSummary: string;
+  timestamp: string;
+}
+
+export interface AgentRunRecord {
+  id: string;
+  source: 'self_chat' | 'dashboard' | 'schedule';
+  goal: string;
+  status: 'running' | 'completed' | 'failed';
+  providerUsed: 'gemini' | 'openrouter' | 'hybrid' | 'zero_token';
+  modelUsed: string;
+  tokensUsed: number;
+  steps: AgentExecutionStep[];
+  finalReport: string;
+  error?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface AgentScheduleItem {
+  id: string;
+  title: string;
+  goal: string;
+  intervalMinutes: number;
+  enabled: boolean;
+  notifySelfChat: boolean;
+  lastRunAt: string | null;
+  nextRunAt: string;
+  lastSummary: string | null;
+  createdAt: string;
+}
+
+export interface WatchdogHealEvent {
+  timestamp: string;
+  trigger: string;
+  actionsTaken: string[];
+  rssBeforeMb: number;
+  rssAfterMb: number;
+  botStatus: string;
+  ok: boolean;
+}
+
+export interface WatchdogStatusSnapshot {
+  enabled: boolean;
+  intervalMs: number;
+  cycleCount: number;
+  totalHealsApplied: number;
+  processErrorsIntercepted: number;
+  lastErrorIntercepted: string | null;
+  recentEvents: WatchdogHealEvent[];
+}
+
+export interface FirestoreAdminDiagnostics {
+  configuredProjectId: string;
+  configuredDatabaseId: string;
+  serviceAccountProjectId: string | null;
+  projectMatch: boolean | null;
+  mode: string;
+  hasServiceAccountEnv: boolean;
+  initError: string | null;
+}
+
+export interface MobileOffloadWorkerInfo {
+  workerId: string;
+  deviceLabel: string;
+  deviceMemoryGb: number | null;
+  networkType: string;
+  lastHeartbeatAt: number;
+  jobsCompleted: number;
+}
+
+export interface MobileOffloadStatusSnapshot {
+  activeWorkers: MobileOffloadWorkerInfo[];
+  queuedCount: number;
+  claimedCount: number;
+  completedCount: number;
+  recentJobs: Array<{
+    id: string;
+    type: string;
+    status: string;
+    createdAt: string;
+    completedAt?: string;
+    error?: string;
+  }>;
+}
+
+export interface SystemEnvStatusResponse {
+  runtime: {
+    platform: string;
+    isTermux: boolean;
+    nodeVersion: string;
+    port: number;
+    nodeEnv: string;
+    memoryMb: number;
+    uptimeSec: number;
+    selfPingEnabled: boolean;
+    ownerEmail: string;
+  };
+  geminiKeysCount: number;
+  openRouterKeysCount: number;
+  firestore: FirestoreAdminDiagnostics;
+  envItems: Array<{
+    key: string;
+    category: string;
+    configured: boolean;
+    detail: string;
+  }>;
+}
+

@@ -340,7 +340,11 @@ export class OpenRouterDynamicPool {
           headers: {
             Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
-            'HTTP-Referer': process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://wanexus.app',
+            'HTTP-Referer':
+              process.env.APP_URL ||
+              (process.env.SPACE_HOST ? `https://${process.env.SPACE_HOST}` : '') ||
+              process.env.RENDER_EXTERNAL_URL ||
+              'https://wanexus.app',
             'X-Title': 'Aura Assistant Executive Brain',
           },
           body: JSON.stringify({

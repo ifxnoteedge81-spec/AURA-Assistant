@@ -51,7 +51,11 @@ service cloud.firestore {
           'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone', 'cooldownMs',
           'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
           'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
-          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'configUpdatedAt',
+          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'mediaIntelligenceEnabled',
+          'mediaZeroTokenReplyMode', 'storyAutoReadEnabled', 'storyAutoReactEnabled',
+          'storyAutoReplyEnabled', 'storyCooldownMs', 'storyWhitelistMode',
+          'storyAllowedContacts', 'selfChatCopilotEnabled', 'selfChatZeroTokenOnly',
+          'contactPolicies', 'configUpdatedAt',
           'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == request.auth.uid && data.ownerId.size() <= 128
@@ -77,6 +81,17 @@ service cloud.firestore {
         && (!('groupCooldownMs' in data) || (data.groupCooldownMs is number && data.groupCooldownMs >= 0 && data.groupCooldownMs <= 3600000))
         && (!('groupAiGroups' in data) || (data.groupAiGroups is map && data.groupAiGroups.size() <= 200))
         && (!('groupDirectives' in data) || (data.groupDirectives is map && data.groupDirectives.size() <= 200))
+        && (!('mediaIntelligenceEnabled' in data) || data.mediaIntelligenceEnabled is bool)
+        && (!('mediaZeroTokenReplyMode' in data) || data.mediaZeroTokenReplyMode is bool)
+        && (!('storyAutoReadEnabled' in data) || data.storyAutoReadEnabled is bool)
+        && (!('storyAutoReactEnabled' in data) || data.storyAutoReactEnabled is bool)
+        && (!('storyAutoReplyEnabled' in data) || data.storyAutoReplyEnabled is bool)
+        && (!('storyCooldownMs' in data) || (data.storyCooldownMs is number && data.storyCooldownMs >= 0 && data.storyCooldownMs <= 86400000))
+        && (!('storyWhitelistMode' in data) || (data.storyWhitelistMode in ['all', 'selected_only']))
+        && (!('storyAllowedContacts' in data) || (data.storyAllowedContacts is list && data.storyAllowedContacts.size() <= 200 && (data.storyAllowedContacts.size() == 0 || data.storyAllowedContacts[0] is map)))
+        && (!('selfChatCopilotEnabled' in data) || data.selfChatCopilotEnabled is bool)
+        && (!('selfChatZeroTokenOnly' in data) || data.selfChatZeroTokenOnly is bool)
+        && (!('contactPolicies' in data) || (data.contactPolicies is list && data.contactPolicies.size() <= 200 && (data.contactPolicies.size() == 0 || data.contactPolicies[0] is map)))
         && (!('configUpdatedAt' in data) || (data.configUpdatedAt is string && data.configUpdatedAt.size() <= 64))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -203,7 +218,11 @@ service cloud.firestore {
           'ownerLocation', 'ownerBio', 'ownerBoundaries', 'strictLogicRules', 'assistantTone',
           'cooldownMs', 'takeoverPauseMs', 'humanTypingEnabled', 'dailyReplyLimit',
           'antilinkGroups', 'groupAiEnabled', 'groupAiMode', 'groupReactionEnabled',
-          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'configUpdatedAt',
+          'groupCooldownMs', 'groupAiGroups', 'groupDirectives', 'mediaIntelligenceEnabled',
+          'mediaZeroTokenReplyMode', 'storyAutoReadEnabled', 'storyAutoReactEnabled',
+          'storyAutoReplyEnabled', 'storyCooldownMs', 'storyWhitelistMode',
+          'storyAllowedContacts', 'selfChatCopilotEnabled', 'selfChatZeroTokenOnly',
+          'contactPolicies', 'configUpdatedAt',
           'createdAt', 'updatedAt'
         ]);
       allow delete: if isValidId(settingId) && isOwnerResource();

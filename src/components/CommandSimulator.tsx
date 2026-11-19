@@ -1,9 +1,30 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Send, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ImagePlus, Send, Trash2 } from 'lucide-react';
 import { authFetch } from '../lib/api';
 import type { BotConfig, KnownGroupItem } from '../types';
 
-type ChatContext = 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self';
+type ChatContext = 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self' | 'story';
+
+interface SimulatedMediaPayload {
+  kind: 'photo' | 'video' | 'gif' | 'sticker' | 'story_photo' | 'story_video' | 'story_text' | 'reaction';
+  caption?: string;
+  visualPreset?: 'portrait_stunning' | 'scenery_beautiful' | 'dark_bad' | 'funny_meme' | 'logical_screenshot';
+  stickerEmojis?: string[];
+  stickerPackName?: string;
+  reactionEmoji?: string;
+  durationSec?: number;
+  imageBase64?: string;
+}
+
+interface MediaInsightSummary {
+  kind: string;
+  isStory: boolean;
+  sentiment: string;
+  recommendedReaction: string;
+  banglaSceneLabel: string;
+  compactContextLine: string;
+  tokensUsedForRead: 0;
+}
 
 interface SimulatedMsg {
   id: string;
@@ -12,6 +33,7 @@ interface SimulatedMsg {
   reaction?: string;
   deleted?: boolean;
   rule?: string;
+  mediaBadge?: string;
   timestamp: string;
 }
 
@@ -24,7 +46,41 @@ const CONTEXT_OPTIONS: { id: ChatContext; label: string }[] = [
   { id: 'private', label: 'প্রাইভেট ইনবক্স (DM)' },
   { id: 'group_bot_admin', label: 'গ্রুপ চ্যাট (বট অ্যাডমিন)' },
   { id: 'group_bot_non_admin', label: 'গ্রুপ চ্যাট (বট সাধারণ সদস্য)' },
+  { id: 'story', label: 'হোয়াটসঅ্যাপ স্টোরি (Status)' },
   { id: 'self', label: 'নিজের নম্বরে মেসেজ' },
+];
+
+const QUICK_MEDIA_TESTS: Array<{ label: string; context?: ChatContext; media: SimulatedMediaPayload; text?: string }> = [
+  {
+    label: '📸 কারো সুন্দর পোর্ট্রেট ছবি (প্রশংসা)',
+    context: 'story',
+    media: { kind: 'story_photo', visualPreset: 'portrait_stunning', caption: '' },
+  },
+  {
+    label: '🌅 প্রকৃতির সুন্দর স্টোরি ফটো (ভালো)',
+    context: 'story',
+    media: { kind: 'story_photo', visualPreset: 'scenery_beautiful', caption: 'সকালের আকাশটা আজ দারুণ ✨' },
+  },
+  {
+    label: '🌑 অন্ধকার ও ঝাপসা ভিডিও (খারাপ/সমালোচনা)',
+    media: { kind: 'video', visualPreset: 'dark_bad', durationSec: 9, caption: '' },
+  },
+  {
+    label: '😂 মজার হাসির স্টিকার (স্টিকার রিড)',
+    media: { kind: 'sticker', stickerEmojis: ['😂', '🤣'], stickerPackName: 'Bangla Funny Pack' },
+  },
+  {
+    label: '🧠 যুক্তির স্ক্রিনশট/তর্ক (লজিক)',
+    media: {
+      kind: 'photo',
+      visualPreset: 'logical_screenshot',
+      caption: 'এই স্ক্রিনশট দেখো, প্রমাণ ছাড়া কথা বললে কি চলে?',
+    },
+  },
+  {
+    label: '❤️ মেসেজে লাভ রিয়্যাকশন',
+    media: { kind: 'reaction', reactionEmoji: '❤️' },
+  },
 ];
 
 const QUICK_COMMANDS = [
@@ -49,11 +105,12 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
   const [senderJidInput, setSenderJidInput] = useState<string>('8801700000000@s.whatsapp.net');
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<SimulatedMsg[]>([
     {
       id: 'init-1',
       sender: 'system',
-      text: 'সিমুলেটর সার্ভার-সাইড @google/genai এবং বট কমান্ড রাউটারের সাথে যুক্ত আছে। উপরের চ্যাট মোড বেছে নিয়ে .ai, .antilink delete on, গ্রুপ কমান্ড বক্স অথবা .autoreply on টেস্ট করুন।',
+      text: 'সিমুলেটর সার্ভার-সাইড জিরো-টোকেন মিডিয়া রিডার, স্টোরি কমেন্ট ও AI ব্রেইনের সাথে যুক্ত। টেক্সট কমান্ড অথবা নিচের ছবি/স্টিকার/ভিডিও/স্টোরি বাটন কিংবা আসল ছবি আপলোড করে ০ টোকেন টেস্ট করুন!',
       timestamp: new Date().toLocaleTimeString(),
     },
   ]);
@@ -119,18 +176,25 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
   const activeGroupDirective = config.groupDirectives?.[activeGroupJid];
   const activeGroupObj = selectableGroups.find((g) => g.jid === activeGroupJid);
 
-  async function sendSimulatedMessage(rawText: string) {
+  async function sendSimulatedMessage(
+    rawText: string,
+    mediaOverride?: SimulatedMediaPayload,
+    chatTypeOverride?: ChatContext,
+    displayLabel?: string
+  ) {
     const text = rawText.trim();
-    if (!text || isSending) return;
+    const effectiveChatType = chatTypeOverride || chatType;
+    if ((!text && !mediaOverride && effectiveChatType !== 'story') || isSending) return;
 
     const userMsgId = `u-${Date.now()}`;
     const now = new Date().toLocaleTimeString();
+    const shownUserText = displayLabel || text || `[Media: ${mediaOverride?.kind}]`;
 
     setMessages((prev) => [
       ...prev,
-      { id: userMsgId, sender: 'user', text, timestamp: now },
+      { id: userMsgId, sender: 'user', text: shownUserText, timestamp: now },
     ]);
-    setInput('');
+    if (!mediaOverride) setInput('');
     setIsSending(true);
 
     try {
@@ -141,12 +205,13 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text,
-          chatType,
+          chatType: effectiveChatType,
           senderIsGroupAdmin: senderIsAdmin,
           groupJid: activeGroupJid,
           contactName: cleanSenderName,
           contactJid: cleanSenderJid,
           senderJid: cleanSenderJid,
+          ...(mediaOverride ? { media: mediaOverride } : {}),
         }),
       });
       const data = await res.json();
@@ -176,6 +241,11 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
         );
       }
 
+      const insight = data.mediaInsight as MediaInsightSummary | undefined;
+      const mediaBadge = insight
+        ? `0 Tokens Read · ${insight.banglaSceneLabel} (${insight.sentiment})`
+        : undefined;
+
       if (data.reply) {
         setMessages((prev) => [
           ...prev,
@@ -184,6 +254,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
             sender: 'bot',
             text: data.reply,
             rule: data.ruleTriggered,
+            mediaBadge,
             timestamp: new Date().toLocaleTimeString(),
           },
         ]);
@@ -195,6 +266,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
             sender: 'system',
             text: data.note,
             rule: data.ruleTriggered,
+            mediaBadge,
             timestamp: new Date().toLocaleTimeString(),
           },
         ]);
@@ -216,6 +288,42 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
     }
   }
 
+  function handleImageUploadTest(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 4.5 * 1024 * 1024) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          sender: 'system',
+          text: 'ছবির সাইজ ৪.৫ এমবি-র নিচে হতে হবে।',
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      if (!dataUrl) return;
+      const isStoryMode = chatType === 'story';
+      void sendSimulatedMessage(
+        input,
+        {
+          kind: isStoryMode ? 'story_photo' : 'photo',
+          caption: input.trim(),
+          imageBase64: dataUrl,
+        },
+        chatType,
+        `📷 Uploaded ${file.name}${input.trim() ? `: ${input.trim()}` : ''}`
+      );
+      setInput('');
+    };
+    reader.readAsDataURL(file);
+  }
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
       {/* Left: Chat Context & Quick Test Prompts */}
@@ -224,7 +332,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
           <div>
             <h2 className="text-base font-semibold text-slate-900">Chat Environment</h2>
             <p className="mt-1 text-xs text-slate-600">
-              Switch contexts to verify group admin permissions, Group AI Command Box targeting, and private auto-replies.
+              Switch contexts to verify DM replies, Group AI, WhatsApp Stories, and 0-token Media recognition.
             </p>
           </div>
 
@@ -344,6 +452,12 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
 
           <div className="pt-3 border-t border-slate-200 text-xs text-slate-600 space-y-1">
             <div className="flex justify-between">
+              <span>Zero-Token Media Reader</span>
+              <span className="font-mono font-medium text-emerald-700">
+                {config.mediaIntelligenceEnabled !== false ? 'ON (0 Tok Read)' : 'OFF'}
+              </span>
+            </div>
+            <div className="flex justify-between">
               <span>Auto-Reply Mode</span>
               <span className="font-mono font-medium text-slate-900">
                 {config.autoreply ? 'ON' : 'OFF'}
@@ -363,24 +477,45 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                 {config.antilinkGroups[activeGroupJid] ? 'ON' : 'OFF'}
               </span>
             </div>
-            <div className="flex justify-between">
-              <span>Targeted Members</span>
-              <span className="font-mono font-medium text-slate-900 tabular-nums">
-                {(activeGroupDirective?.targets || []).filter((t) => t.enabled).length}
-              </span>
-            </div>
           </div>
         </section>
 
         <section className="bg-white border border-slate-200 rounded-xl p-5">
-          <h3 className="text-sm font-semibold text-slate-900">Sample Commands</h3>
+          <h3 className="text-sm font-semibold text-slate-900">Zero-Token Media &amp; Story Tests</h3>
+          <p className="mt-0.5 text-[11px] text-slate-500">
+            ০ টোকেনে ছবি, ভিডিও, স্টিকার ও স্টোরি পড়ে শুধু টেক্সট SMS-এ রিপ্লাই দিবে:
+          </p>
+          <div className="mt-3 space-y-1.5">
+            {QUICK_MEDIA_TESTS.map((sample) => (
+              <button
+                key={sample.label}
+                type="button"
+                disabled={isSending}
+                onClick={() =>
+                  void sendSimulatedMessage(
+                    sample.media.caption || sample.text || '',
+                    sample.media,
+                    sample.context || chatType,
+                    sample.label
+                  )
+                }
+                className="w-full text-left px-3 py-2 text-xs font-medium text-slate-800 bg-emerald-50/70 hover:bg-emerald-100/70 border border-emerald-200 rounded-lg transition-colors truncate cursor-pointer"
+              >
+                {sample.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="bg-white border border-slate-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-slate-900">Sample Text Commands</h3>
           <div className="mt-3 space-y-2">
             {QUICK_COMMANDS.map((cmd) => (
               <button
                 key={cmd}
                 type="button"
                 disabled={isSending}
-                onClick={() => sendSimulatedMessage(cmd)}
+                onClick={() => void sendSimulatedMessage(cmd)}
                 className="w-full text-left px-3 py-2 text-xs font-mono text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors truncate cursor-pointer"
                 title={cmd}
               >
@@ -401,7 +536,9 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
             <div className="text-xs text-slate-500 font-mono truncate max-w-md">
               {chatType.startsWith('group')
                 ? `${activeGroupObj?.name || activeGroupJid} · Sender: ${senderNameInput}`
-                : '8801700000000@s.whatsapp.net'}
+                : chatType === 'story'
+                  ? `status@broadcast · Poster: ${senderNameInput}`
+                  : '8801700000000@s.whatsapp.net'}
             </div>
           </div>
           <button
@@ -416,9 +553,9 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
 
         <div className="flex-1 p-5 space-y-3 overflow-y-auto bg-slate-50">
           {messages.length === 0 && (
-          <div className="h-full flex items-center justify-center text-sm text-slate-500">
-            বটের কমান্ড ও প্রোটেকশন নিয়ম টেস্ট করতে নিচে একটি মেসেজ পাঠান।
-          </div>
+            <div className="h-full flex items-center justify-center text-sm text-slate-500">
+              বটের কমান্ড, স্টোরি কমেন্ট ও ছবি/ভিডিও/স্টিকার টেস্ট করতে নিচে মেসেজ বা ছবি পাঠান।
+            </div>
           )}
 
           {messages.map((m) => {
@@ -444,6 +581,11 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                       : 'bg-white border-slate-200 text-slate-900'
                   }`}
                 >
+                  {m.mediaBadge && (
+                    <div className="mb-1.5 text-[11px] font-mono font-semibold text-emerald-700">
+                      [{m.mediaBadge}]
+                    </div>
+                  )}
                   {m.deleted ? (
                     <div className="italic text-xs">
                       অ্যান্টি-লিংক প্রোটেকশনের মাধ্যমে এই মেসেজটি ডিলিট করা হয়েছে ({m.text})
@@ -463,7 +605,7 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
                       isUser && !m.deleted ? 'text-emerald-100' : 'text-slate-400'
                     }`}
                   >
-                    <span>{m.rule || (isUser ? 'প্রেরিত মেসেজ' : 'বটের উত্তর')}</span>
+                    <span>{m.rule || (isUser ? 'প্রেরিত মেসেজ' : 'বটের SMS উত্তর')}</span>
                     <span>{m.timestamp}</span>
                   </div>
                 </div>
@@ -475,20 +617,41 @@ export function CommandSimulator({ config, onConfigUpdated }: CommandSimulatorPr
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            sendSimulatedMessage(input);
+            void sendSimulatedMessage(input);
           }}
-          className="p-4 border-t border-slate-200 bg-white flex items-center gap-3"
+          className="p-4 border-t border-slate-200 bg-white flex items-center gap-2.5"
         >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleImageUploadTest}
+            className="hidden"
+          />
+          <button
+            type="button"
+            disabled={isSending}
+            onClick={() => fileInputRef.current?.click()}
+            title="আসল ছবি আপলোড করে ০ টোকেন টেস্ট করুন"
+            className="px-3 py-2.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <ImagePlus className="w-4 h-4 text-emerald-600" />
+            ছবি টেস্ট
+          </button>
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder=".ai <প্রশ্ন>, .antilink delete on, .autoreply on অথবা যেকোনো মেসেজ লিখুন..."
+            placeholder={
+              chatType === 'story'
+                ? 'স্টোরির ক্যাপশন লিখুন বা ছবি টেস্ট করুন...'
+                : '.ai <প্রশ্ন>, .antilink delete on, .autoreply on অথবা যেকোনো মেসেজ লিখুন...'
+            }
             className="flex-1 px-4 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
           />
           <button
             type="submit"
-            disabled={isSending || !input.trim()}
+            disabled={isSending || (!input.trim() && chatType !== 'story')}
             className="px-4 py-2.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Send className="w-4 h-4" />

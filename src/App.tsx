@@ -3,27 +3,39 @@ import {
   BookOpen,
   Cloud,
   Code2,
+  Cpu,
+  Globe,
   Inbox,
   LayoutDashboard,
   Lock,
   LogIn,
   LogOut,
   MessageSquare,
+  Settings,
   Shield,
   ShieldCheck,
   Smartphone,
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import { AssistantBrainPanel } from './components/AssistantBrainPanel';
+import { AutonomousAgentPanel } from './components/AutonomousAgentPanel';
 import { ClientBotsPanel } from './components/ClientBotsPanel';
 import { ClientPortalView } from './components/ClientPortalView';
 import { CommandSimulator } from './components/CommandSimulator';
 import { InboxMemoryPanel } from './components/InboxMemoryPanel';
 import { LockScreen } from './components/LockScreen';
 import { ModerationRules } from './components/ModerationRules';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { PairingOverview } from './components/PairingOverview';
+import { PWAInstallButton } from './components/PWAInstallButton';
 import { SecurityAntiBanPanel } from './components/SecurityAntiBanPanel';
+import { SettingsPanel } from './components/SettingsPanel';
 import { SourceExplorer } from './components/SourceExplorer';
+import { WebOutreachPanel } from './components/WebOutreachPanel';
+import {
+  pollAndRunNextOffloadJob,
+  sendMobileOffloadHeartbeat,
+} from './lib/mobileOffloadWorker';
 import {
   authFetch,
   clearStoredSession,
@@ -52,12 +64,15 @@ import {
 const NAV_ITEMS: { id: NavSection; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'overview', label: 'Pairing & Status', icon: LayoutDashboard },
   { id: 'assistant', label: 'AI Brain & Dictionary', icon: BookOpen },
+  { id: 'agent', label: 'Autonomous Agent & PWA', icon: Cpu },
   { id: 'inbox', label: 'Notes & Chat Memory', icon: Inbox },
   { id: 'simulator', label: 'Command Simulator', icon: MessageSquare },
   { id: 'rules', label: 'Anti-Link & Auto-Reply', icon: Shield },
+  { id: 'outreach', label: 'Web Research & Outreach', icon: Globe },
   { id: 'clients', label: 'Client Bots (Multi)', icon: Smartphone },
   { id: 'security', label: 'Security & Anti-Ban', icon: ShieldCheck },
-  { id: 'source', label: 'Render Source Code', icon: Code2 },
+  { id: 'settings', label: 'Settings & Termux', icon: Settings },
+  { id: 'source', label: 'Cloud Source Code', icon: Code2 },
 ];
 
 const DEFAULT_STATUS: BotStatusResponse = {
@@ -95,6 +110,17 @@ const DEFAULT_STATUS: BotStatusResponse = {
     groupCooldownMs: 6000,
     groupAiGroups: {},
     groupDirectives: {},
+    mediaIntelligenceEnabled: true,
+    mediaZeroTokenReplyMode: true,
+    storyAutoReadEnabled: true,
+    storyAutoReactEnabled: true,
+    storyAutoReplyEnabled: true,
+    storyCooldownMs: 900000,
+    storyWhitelistMode: 'all',
+    storyAllowedContacts: [],
+    selfChatCopilotEnabled: true,
+    selfChatZeroTokenOnly: true,
+    contactPolicies: [],
     configUpdatedAt: '',
   },
   logs: [],
@@ -113,6 +139,22 @@ export default function App() {
   const [botState, setBotState] = useState<BotStatusResponse>(DEFAULT_STATUS);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [cloudStatusMsg, setCloudStatusMsg] = useState<string | null>(null);
+  const [mobileOffloadEnabled, setMobileOffloadEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wanexus_mobile_offload_enabled') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleMobileOffload = useCallback((enabled: boolean) => {
+    setMobileOffloadEnabled(enabled);
+    try {
+      localStorage.setItem('wanexus_mobile_offload_enabled', enabled ? '1' : '0');
+    } catch {
+      // ignore storage failure
+    }
+  }, []);
 
   const configMutationVersionRef = useRef(0);
 
@@ -239,6 +281,34 @@ export default function App() {
     });
     return () => unsubscribe();
   }, [unlockedEmail, fetchStatus]);
+
+  // Mobile Browser / PWA Offload background worker loop (runs on phone RAM & data when opted in)
+  useEffect(() => {
+    if (!unlockedEmail || !mobileOffloadEnabled) return;
+    let cancelled = false;
+    let busy = false;
+
+    const tick = async () => {
+      if (cancelled || busy || !getStoredSessionToken()) return;
+      busy = true;
+      try {
+        await sendMobileOffloadHeartbeat().catch(() => null);
+        await pollAndRunNextOffloadJob().catch(() => false);
+      } finally {
+        busy = false;
+      }
+    };
+
+    void tick();
+    const timer = setInterval(() => {
+      void tick();
+    }, 6000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [unlockedEmail, mobileOffloadEnabled]);
 
   if (portalBotId && portalAccessKey) {
     return <ClientPortalView botId={portalBotId} accessKey={portalAccessKey} />;
@@ -431,6 +501,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            <PWAInstallButton />
             {section !== 'simulator' ? (
               <button
                 type="button"
@@ -448,6 +519,19 @@ export default function App() {
                 Edit AI Persona
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setSection('settings')}
+              className={`px-3 py-2 text-xs font-medium rounded-lg border flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                section === 'settings'
+                  ? 'bg-emerald-600 text-white border-emerald-600'
+                  : 'text-slate-700 bg-white border-slate-200 hover:bg-slate-50'
+              }`}
+              title="Settings & Termux"
+            >
+              <Settings className="w-3.5 h-3.5" />
+              Settings
+            </button>
             <button
               type="button"
               onClick={handleLockDashboard}
@@ -482,6 +566,13 @@ export default function App() {
             />
           )}
 
+          {section === 'agent' && (
+            <AutonomousAgentPanel
+              mobileOffloadEnabled={mobileOffloadEnabled}
+              onToggleMobileOffload={handleToggleMobileOffload}
+            />
+          )}
+
           {section === 'inbox' && <InboxMemoryPanel />}
 
           {section === 'simulator' && (
@@ -499,6 +590,8 @@ export default function App() {
               onUpdateConfig={handleUpdateConfig}
             />
           )}
+
+          {section === 'outreach' && <WebOutreachPanel />}
 
           {section === 'clients' && (
             <ClientBotsPanel
@@ -519,9 +612,18 @@ export default function App() {
             />
           )}
 
+          {section === 'settings' && (
+            <SettingsPanel
+              config={botState.config}
+              onUpdateConfig={handleUpdateConfig}
+              onLockNow={handleLockDashboard}
+            />
+          )}
+
           {section === 'source' && <SourceExplorer />}
         </main>
       </div>
+      <OfflineIndicator />
     </div>
   );
 }

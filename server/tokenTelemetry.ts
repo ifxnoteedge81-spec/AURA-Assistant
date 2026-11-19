@@ -40,6 +40,17 @@ export interface OpenRouterKeyTelemetry {
   isFreeTier: boolean | null;
 }
 
+export interface ZeroTokenMediaStats {
+  totalReadsToday: number;
+  photoReads: number;
+  videoReads: number;
+  stickerReads: number;
+  storyReads: number;
+  reactionReads: number;
+  zeroTokenRepliesToday: number;
+  tokensSpentReadingMedia: 0;
+}
+
 export interface TokenTelemetrySnapshot {
   date: string;
   todayTotalTokens: number;
@@ -48,6 +59,7 @@ export interface TokenTelemetrySnapshot {
   todayTotalCalls: number;
   lifetimeTotalTokens: number;
   lifetimeTotalCalls: number;
+  zeroTokenMedia: ZeroTokenMediaStats;
   byCategory: {
     group: CategoryTokenStats;
     dm: CategoryTokenStats;
@@ -105,6 +117,7 @@ interface PersistedTokenState {
   openRouterRequestsToday: number;
   openRouterTokensToday: number;
   perKeyToday: Record<string, { requests: number; tokens: number; exhausted: boolean; lastError: string | null }>;
+  zeroTokenMedia: ZeroTokenMediaStats;
   categories: Record<
     TokenCallCategory,
     { calls: number; promptTokens: number; completionTokens: number; totalTokens: number }
@@ -138,6 +151,19 @@ function emptyCategories(): PersistedTokenState['categories'] {
   };
 }
 
+function emptyZeroTokenMedia(): ZeroTokenMediaStats {
+  return {
+    totalReadsToday: 0,
+    photoReads: 0,
+    videoReads: 0,
+    stickerReads: 0,
+    storyReads: 0,
+    reactionReads: 0,
+    zeroTokenRepliesToday: 0,
+    tokensSpentReadingMedia: 0,
+  };
+}
+
 function createFreshDayState(date: string, lifetimeTotalTokens = 0, lifetimeTotalCalls = 0): PersistedTokenState {
   return {
     date,
@@ -150,6 +176,7 @@ function createFreshDayState(date: string, lifetimeTotalTokens = 0, lifetimeTota
     openRouterRequestsToday: 0,
     openRouterTokensToday: 0,
     perKeyToday: {},
+    zeroTokenMedia: emptyZeroTokenMedia(),
     categories: emptyCategories(),
     lastCall: null,
   };
@@ -204,6 +231,19 @@ export class TokenTelemetryTracker {
                   };
                 }
               }
+            }
+            if (parsed.zeroTokenMedia && typeof parsed.zeroTokenMedia === 'object') {
+              const zm = parsed.zeroTokenMedia;
+              base.zeroTokenMedia = {
+                totalReadsToday: Number(zm.totalReadsToday || 0),
+                photoReads: Number(zm.photoReads || 0),
+                videoReads: Number(zm.videoReads || 0),
+                stickerReads: Number(zm.stickerReads || 0),
+                storyReads: Number(zm.storyReads || 0),
+                reactionReads: Number(zm.reactionReads || 0),
+                zeroTokenRepliesToday: Number(zm.zeroTokenRepliesToday || 0),
+                tokensSpentReadingMedia: 0,
+              };
             }
             base.lastCall = parsed.lastCall || null;
           }
@@ -279,6 +319,28 @@ export class TokenTelemetryTracker {
       keySlot: event.keySlot,
     };
 
+    this.schedulePersist();
+  }
+
+  public recordZeroTokenMediaRead(params: {
+    kind: 'photo' | 'video' | 'gif' | 'sticker' | 'story_text' | 'audio' | 'reaction' | 'text';
+    isStory?: boolean;
+    repliedWithZeroTokens?: boolean;
+  }) {
+    this.rollDateIfNeeded();
+    const zm = (this.state.zeroTokenMedia ||= emptyZeroTokenMedia());
+    zm.totalReadsToday += 1;
+    if (params.isStory || params.kind === 'story_text') {
+      zm.storyReads += 1;
+    }
+    if (params.kind === 'photo') zm.photoReads += 1;
+    else if (params.kind === 'video' || params.kind === 'gif') zm.videoReads += 1;
+    else if (params.kind === 'sticker') zm.stickerReads += 1;
+    else if (params.kind === 'reaction') zm.reactionReads += 1;
+    if (params.repliedWithZeroTokens) {
+      zm.zeroTokenRepliesToday += 1;
+    }
+    zm.tokensSpentReadingMedia = 0;
     this.schedulePersist();
   }
 
@@ -445,6 +507,10 @@ export class TokenTelemetryTracker {
       todayTotalCalls: this.state.todayTotalCalls,
       lifetimeTotalTokens: this.state.lifetimeTotalTokens,
       lifetimeTotalCalls: this.state.lifetimeTotalCalls,
+      zeroTokenMedia: {
+        ...(this.state.zeroTokenMedia || emptyZeroTokenMedia()),
+        tokensSpentReadingMedia: 0,
+      },
       byCategory: {
         group: groupStats,
         dm: dmStats,

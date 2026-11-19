@@ -4,6 +4,13 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clock,
+  Cpu,
+  Eye,
+  Film,
+  Heart,
+  Image,
+  MessageCircle,
   MessageSquareText,
   Pencil,
   Plus,
@@ -11,11 +18,16 @@ import {
   RotateCcw,
   Save,
   Search,
+  Send,
   ShieldAlert,
+  Sparkles,
   Target,
+  Terminal,
   Trash2,
   UserCheck,
+  UserPlus,
   Users,
+  VolumeX,
   X,
 } from 'lucide-react';
 import { authFetch } from '../lib/api';
@@ -23,11 +35,18 @@ import {
   BENGALI_AUTOREPLY_EXACT,
   type BotConfig,
   type BotStatusResponse,
+  type ContactPolicyEntry,
+  type ContactPolicyMode,
+  type DirectCommandLogItem,
   type GroupAiMode,
   type GroupDirectiveConfig,
   type GroupMemberTargetDirective,
+  type KnownContactItem,
   type KnownGroupItem,
   type KnownGroupMemberItem,
+  type MediaStoryFeedItem,
+  type SelfChatTurnItem,
+  type StoryWhitelistContact,
   type TokenTelemetrySnapshot,
 } from '../types';
 
@@ -74,11 +93,54 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
   const [manualMemberName, setManualMemberName] = useState('');
   const [manualMemberPhone, setManualMemberPhone] = useState('');
   const [targetObjectiveInput, setTargetObjectiveInput] = useState('');
+  const [mediaStories, setMediaStories] = useState<MediaStoryFeedItem[]>([]);
+  const [isLoadingStories, setIsLoadingStories] = useState(false);
+
+  // Known WhatsApp Contacts & Story Custom Whitelist State
+  const [knownContacts, setKnownContacts] = useState<KnownContactItem[]>([]);
+  const [storySelectedPicker, setStorySelectedPicker] = useState<string>('manual');
+  const [storyManualName, setStoryManualName] = useState('');
+  const [storyManualPhone, setStoryManualPhone] = useState('');
+  const [storyCustomPrompt, setStoryCustomPrompt] = useState('');
+
+  // Direct Action Command Box (Inbox Knock + Group @Mention)
+  const [directActionType, setDirectActionType] = useState<'auto' | 'dm_knock' | 'group_mention'>('auto');
+  const [directContactPicker, setDirectContactPicker] = useState<string>('manual');
+  const [directTargetPhoneOrName, setDirectTargetPhoneOrName] = useState('');
+  const [directGroupJid, setDirectGroupJid] = useState('');
+  const [directMentionMemberJids, setDirectMentionMemberJids] = useState<string[]>([]);
+  const [directInstruction, setDirectInstruction] = useState('');
+  const [directUseAiCraft, setDirectUseAiCraft] = useState(true);
+  const [isExecutingDirectCmd, setIsExecutingDirectCmd] = useState(false);
+  const [directCmdResult, setDirectCmdResult] = useState<{
+    messageText: string;
+    note: string;
+    targetLabel: string;
+    deliveredLive: boolean;
+    dryRun: boolean;
+    mentionedJids: string[];
+    providerUsed: string;
+  } | null>(null);
+  const [directCommandHistory, setDirectCommandHistory] = useState<DirectCommandLogItem[]>([]);
+
+  // Owner Self-Chat Copilot & Contact Engagement/Hold Policies State
+  const [selfChatHistory, setSelfChatHistory] = useState<SelfChatTurnItem[]>([]);
+  const [selfChatInput, setSelfChatInput] = useState('');
+  const [isSendingSelfChat, setIsSendingSelfChat] = useState(false);
+  const [serverRssMb, setServerRssMb] = useState<number | null>(null);
+  const [selfConnectedPhone, setSelfConnectedPhone] = useState('');
+  const [policyPicker, setPolicyPicker] = useState<string>('manual');
+  const [policyName, setPolicyName] = useState('');
+  const [policyPhone, setPolicyPhone] = useState('');
+  const [policyMode, setPolicyMode] = useState<ContactPolicyMode>('long_engage');
+  const [policyNote, setPolicyNote] = useState('');
 
   // Keep fresh refs so rapid clicks merge cleanly without stale closure rollbacks
   const groupAiMapRef = useRef<Record<string, boolean>>(config.groupAiGroups || {});
   const antilinkMapRef = useRef<Record<string, boolean>>(config.antilinkGroups || {});
   const directivesMapRef = useRef<Record<string, GroupDirectiveConfig>>(config.groupDirectives || {});
+  const storyAllowedRef = useRef<StoryWhitelistContact[]>(config.storyAllowedContacts || []);
+  const contactPoliciesRef = useRef<ContactPolicyEntry[]>(config.contactPolicies || []);
 
   useEffect(() => {
     groupAiMapRef.current = config.groupAiGroups || {};
@@ -91,6 +153,14 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
   useEffect(() => {
     directivesMapRef.current = config.groupDirectives || {};
   }, [config.groupDirectives]);
+
+  useEffect(() => {
+    storyAllowedRef.current = config.storyAllowedContacts || [];
+  }, [config.storyAllowedContacts]);
+
+  useEffect(() => {
+    contactPoliciesRef.current = config.contactPolicies || [];
+  }, [config.contactPolicies]);
 
   useEffect(() => {
     if (!isEditingReply) {
@@ -137,13 +207,89 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
     }
   }
 
+  async function loadMediaStories() {
+    setIsLoadingStories(true);
+    try {
+      const res = await authFetch('/api/media/stories');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.stories)) {
+          setMediaStories(data.stories);
+        }
+      }
+    } catch {
+      // ignore transient story fetch errors
+    } finally {
+      setIsLoadingStories(false);
+    }
+  }
+
+  async function loadContacts() {
+    try {
+      const res = await authFetch('/api/contacts');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.contacts)) {
+          setKnownContacts(data.contacts);
+        }
+      }
+    } catch {
+      // ignore transient contact fetch errors
+    }
+  }
+
+  async function loadDirectCommands() {
+    try {
+      const res = await authFetch('/api/assistant/direct-commands');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.commands)) {
+          setDirectCommandHistory(data.commands);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function loadSelfChatState() {
+    try {
+      const res = await authFetch('/api/assistant/self-chat');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.history)) {
+          setSelfChatHistory(data.history);
+        }
+        if (typeof data.memoryRssMb === 'number') {
+          setServerRssMb(data.memoryRssMb);
+        }
+        if (typeof data.connectedPhone === 'string') {
+          setSelfConnectedPhone(data.connectedPhone);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   useEffect(() => {
     void loadGroups();
+    void loadMediaStories();
+    void loadContacts();
+    void loadDirectCommands();
+    void loadSelfChatState();
   }, [botStatus]);
+
+  useEffect(() => {
+    if (!directGroupJid && knownGroups.length > 0) {
+      setDirectGroupJid(knownGroups[0].jid);
+    }
+  }, [knownGroups, directGroupJid]);
 
   const groupEntries = Object.entries(config.antilinkGroups || {});
   const groupAiMap = config.groupAiGroups || {};
   const directivesMap = config.groupDirectives || {};
+  const storyAllowedList = config.storyAllowedContacts || [];
 
   async function safeUpdate(
     patch: Partial<BotConfig>,
@@ -440,6 +586,281 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
     await safeUpdate({ antilinkGroups: nextMap }, `rm_antilink_${jid}`, 'Removed group anti-link rule.');
   }
 
+  async function handleAddStoryWhitelistContact(e: React.FormEvent) {
+    e.preventDefault();
+    let name = '';
+    let phone = '';
+    let jid = '';
+
+    if (storySelectedPicker !== 'manual') {
+      const picked = knownContacts.find((c) => c.jid === storySelectedPicker);
+      if (picked) {
+        name = picked.name;
+        phone = picked.phone;
+        jid = picked.jid;
+      }
+    } else {
+      name = storyManualName.trim();
+      phone = storyManualPhone.replace(/\D/g, '');
+      if (/^01[3-9]\d{8}$/.test(phone)) phone = `88${phone}`;
+      jid = phone ? `${phone}@s.whatsapp.net` : '';
+      if (!name && phone) name = `+${phone}`;
+    }
+
+    if (!name && !phone && !jid) {
+      setRuleError('স্টোরি লিস্টে যোগ করার জন্য একটি কন্টাক্ট সিলেক্ট করুন বা নাম/নম্বর লিখুন।');
+      return;
+    }
+
+    const nextEntry: StoryWhitelistContact = {
+      id: `story_wl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      phone,
+      jid: jid || undefined,
+      customPrompt: storyCustomPrompt.trim() || undefined,
+      enabled: true,
+    };
+
+    const currentList = storyAllowedRef.current;
+    const deduped = currentList.filter(
+      (x) =>
+        !(phone && x.phone === phone) &&
+        !(jid && x.jid === jid) &&
+        !(name && x.name.toLowerCase() === name.toLowerCase())
+    );
+    const nextList = [nextEntry, ...deduped];
+    storyAllowedRef.current = nextList;
+
+    const ok = await safeUpdate(
+      {
+        storyWhitelistMode: 'selected_only',
+        storyAllowedContacts: nextList,
+      },
+      'add_story_wl',
+      `"${name}"-কে কাস্টম স্টোরি লিস্টে যোগ করা হয়েছে।`
+    );
+
+    if (ok) {
+      setStoryManualName('');
+      setStoryManualPhone('');
+      setStoryCustomPrompt('');
+    }
+  }
+
+  async function handleToggleStoryWhitelistContact(id: string) {
+    const nextList = storyAllowedRef.current.map((item) =>
+      item.id === id ? { ...item, enabled: !item.enabled } : item
+    );
+    storyAllowedRef.current = nextList;
+    await safeUpdate({ storyAllowedContacts: nextList }, `toggle_story_wl_${id}`, 'Updated story contact status.');
+  }
+
+  async function handleRemoveStoryWhitelistContact(id: string) {
+    const nextList = storyAllowedRef.current.filter((item) => item.id !== id);
+    storyAllowedRef.current = nextList;
+    await safeUpdate({ storyAllowedContacts: nextList }, `del_story_wl_${id}`, 'Removed contact from story whitelist.');
+  }
+
+  function handleToggleDirectMentionMember(memberJid: string) {
+    setDirectMentionMemberJids((prev) =>
+      prev.includes(memberJid) ? prev.filter((id) => id !== memberJid) : [...prev, memberJid]
+    );
+  }
+
+  async function handleExecuteDirectCommand(dryRun: boolean) {
+    const instruction = directInstruction.trim();
+    if (!instruction) {
+      setRuleError('কমান্ড বক্সে কী মেসেজ পাঠাতে চান বা কী বলতে চান তা লিখুন।');
+      return;
+    }
+
+    setRuleError(null);
+    setIsExecutingDirectCmd(true);
+    try {
+      const selectedContact =
+        directContactPicker !== 'manual'
+          ? knownContacts.find((c) => c.jid === directContactPicker)
+          : undefined;
+
+      const selectedGroup = knownGroups.find((g) => g.jid === directGroupJid);
+      const selectedMembersPayload =
+        selectedGroup && directMentionMemberJids.length > 0
+          ? (selectedGroup.members || [])
+              .filter((m) => directMentionMemberJids.includes(m.jid))
+              .map((m) => ({ jid: m.jid, lid: m.lid, phone: m.phone, name: m.name }))
+          : undefined;
+
+      const res = await authFetch('/api/assistant/direct-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          actionType: directActionType,
+          targetPhoneOrJid: selectedContact ? selectedContact.jid : directTargetPhoneOrName.trim(),
+          targetContactName: selectedContact ? selectedContact.name : undefined,
+          groupJid: directActionType === 'group_mention' ? directGroupJid : directActionType === 'auto' ? directGroupJid || undefined : undefined,
+          mentionMembers: selectedMembersPayload,
+          instruction,
+          useAiCraft: directUseAiCraft,
+          dryRun,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setRuleError(data.error || 'Could not execute direct command.');
+        return;
+      }
+
+      setDirectCmdResult({
+        messageText: data.messageText,
+        note: data.note,
+        targetLabel: data.targetLabel,
+        deliveredLive: Boolean(data.deliveredLive),
+        dryRun: Boolean(data.dryRun),
+        mentionedJids: Array.isArray(data.mentionedJids) ? data.mentionedJids : [],
+        providerUsed: String(data.providerUsed || 'offline_emotion'),
+      });
+      if (!dryRun && data.commandRecord) {
+        setDirectCommandHistory((prev) => [data.commandRecord, ...prev].slice(0, 30));
+        flashSaved(data.deliveredLive ? 'WhatsApp-এ মেসেজ পাঠানো হয়েছে!' : 'ড্রাফট সেভ হয়েছে।');
+      }
+    } catch (err) {
+      setRuleError((err as Error).message || 'Direct command network error.');
+    } finally {
+      setIsExecutingDirectCmd(false);
+    }
+  }
+
+  async function handleSendSelfChatMessage(
+    customText?: string,
+    simMedia?: { kind: 'video' | 'photo'; caption: string; visualPreset?: 'dark_bad' | 'portrait_stunning'; durationSec?: number }
+  ) {
+    const textToSend = (customText !== undefined ? customText : selfChatInput).trim();
+    if (!textToSend && !simMedia) return;
+    setRuleError(null);
+    setIsSendingSelfChat(true);
+    try {
+      const res = await authFetch('/api/assistant/self-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: textToSend,
+          ...(simMedia ? { media: simMedia } : {}),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setRuleError(data.error || 'Self-Chat copilot failed.');
+        return;
+      }
+      if (Array.isArray(data.history)) setSelfChatHistory(data.history);
+      if (typeof data.memoryRssMb === 'number') setServerRssMb(data.memoryRssMb);
+      if (customText === undefined) setSelfChatInput('');
+      if (data.config) {
+        await onUpdateConfig({
+          autoreply: data.config.autoreply,
+          aiAssistantEnabled: data.config.aiAssistantEnabled,
+          assistantTone: data.config.assistantTone,
+          dailyReplyLimit: data.config.dailyReplyLimit,
+          groupAiEnabled: data.config.groupAiEnabled,
+          groupAiGroups: data.config.groupAiGroups,
+          antilinkGroups: data.config.antilinkGroups,
+          storyWhitelistMode: data.config.storyWhitelistMode,
+          contactPolicies: data.config.contactPolicies,
+        });
+      }
+    } catch (err) {
+      setRuleError((err as Error).message || 'Self-Chat error.');
+    } finally {
+      setIsSendingSelfChat(false);
+    }
+  }
+
+  async function handleClearSelfChat() {
+    setRuleError(null);
+    try {
+      const res = await authFetch('/api/assistant/self-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clear: true }),
+      });
+      if (res.ok) {
+        setSelfChatHistory([]);
+        flashSaved('Self-Chat হিস্ট্রি ক্লিয়ার করা হয়েছে।');
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleAddContactPolicy(e: React.FormEvent) {
+    e.preventDefault();
+    setRuleError(null);
+    let name = '';
+    let phone = '';
+    let jid = '';
+
+    if (policyPicker !== 'manual') {
+      const picked = knownContacts.find((c) => c.jid === policyPicker);
+      if (picked) {
+        name = picked.name;
+        phone = picked.phone;
+        jid = picked.jid;
+      }
+    } else {
+      name = policyName.trim();
+      const rawDigits = policyPhone.replace(/\D/g, '');
+      phone =
+        rawDigits.startsWith('01') && rawDigits.length === 11
+          ? `88${rawDigits}`
+          : rawDigits.startsWith('1') && rawDigits.length === 10
+            ? `880${rawDigits}`
+            : rawDigits;
+      jid = phone ? `${phone}@s.whatsapp.net` : '';
+      if (!name && phone) name = `+${phone}`;
+    }
+
+    if (!name && !phone && !jid) {
+      setRuleError('একটি কন্টাক্ট সিলেক্ট করুন বা নাম ও নাম্বার লিখুন।');
+      return;
+    }
+
+    const nextEntry: ContactPolicyEntry = {
+      id: `cpol_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      phone,
+      jid: jid || undefined,
+      mode: policyMode,
+      note: policyNote.trim() || undefined,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const current = contactPoliciesRef.current.filter(
+      (c) =>
+        !(phone && c.phone === phone) &&
+        !(jid && c.jid === jid) &&
+        !(name && c.name.toLowerCase() === name.toLowerCase())
+    );
+    const nextList = [nextEntry, ...current];
+    contactPoliciesRef.current = nextList;
+
+    const ok = await safeUpdate(
+      { contactPolicies: nextList },
+      'add_contact_policy',
+      `"${name}"-এর জন্য কন্টাক্ট রুল সেভ হয়েছে।`
+    );
+    if (ok) {
+      setPolicyName('');
+      setPolicyPhone('');
+      setPolicyNote('');
+    }
+  }
+
+  async function handleRemoveContactPolicy(id: string) {
+    const nextList = contactPoliciesRef.current.filter((p) => p.id !== id);
+    contactPoliciesRef.current = nextList;
+    await safeUpdate({ contactPolicies: nextList }, `del_pol_${id}`, 'কন্টাক্ট রুল মুছে ফেলা হয়েছে।');
+  }
+
   async function handleTestLink(e: React.FormEvent) {
     e.preventDefault();
     setRuleError(null);
@@ -627,8 +1048,8 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
                 <span className="font-medium text-emerald-700">Separate Group Clone</span>
               </li>
               <li className="px-4 py-2.5 flex justify-between">
-                <span>Own Messages &amp; Self-Chat</span>
-                <span className="font-medium text-slate-500">Excluded</span>
+                <span>Own Number Self-Chat</span>
+                <span className="font-medium text-emerald-700">Owner Copilot (0 Tokens)</span>
               </li>
               <li className="px-4 py-2.5 flex justify-between">
                 <span>Prefix Commands (.)</span>
@@ -636,6 +1057,571 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
               </li>
             </ul>
           </div>
+        </div>
+      </section>
+
+      {/* Owner Self-Chat Direct Copilot & Contact Long-Engage / Hold Manager */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="p-6 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+              <MessageCircle className="w-4 h-4 text-emerald-600" />
+              Owner Self-Chat Copilot (নিজের নাম্বারে সরাসরি চ্যাট ও কমান্ড)
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              কানেক্টেড WhatsApp অ্যাকাউন্ট থেকে নিজের নাম্বারে (<span className="font-medium text-slate-900">Message Yourself</span>) মেসেজ বা ভিডিও পাঠালেই AI সরাসরি আপনার সাথে চ্যাট করবে—পরামর্শ, একাধিক নাম্বারে পাঠানো, ভিডিওর ভুল ধরা, এবং কাকে <span className="font-medium text-slate-900">দীর্ঘক্ষণ কথা</span> বা <span className="font-medium text-slate-900">আটকে রাখবে</span> তা এখান থেকেই সেট হবে।
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-xs font-medium text-emerald-800">
+              <Sparkles className="w-3.5 h-3.5" />
+              0 Tokens Strictly
+            </span>
+            {serverRssMb !== null && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-700">
+                <Cpu className="w-3.5 h-3.5 text-slate-500" />
+                RAM: {serverRssMb} MB
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={busyKey === 'self_chat_toggle'}
+              onClick={() =>
+                void safeUpdate(
+                  { selfChatCopilotEnabled: !(config.selfChatCopilotEnabled !== false) },
+                  'self_chat_toggle',
+                  config.selfChatCopilotEnabled !== false ? 'Self-Chat Copilot বন্ধ হয়েছে।' : 'Self-Chat Copilot চালু হয়েছে!'
+                )
+              }
+              className={`px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors cursor-pointer disabled:opacity-60 ${
+                config.selfChatCopilotEnabled !== false
+                  ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {config.selfChatCopilotEnabled !== false ? 'Self-Chat: ON' : 'Self-Chat: OFF'}
+            </button>
+          </div>
+        </div>
+
+        <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left: Direct Self-Chat Console */}
+          <div className="lg:col-span-7 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-medium text-slate-600">
+                Direct Owner Chat Console {selfConnectedPhone ? `(+${selfConnectedPhone})` : '(Message Yourself Sync)'}
+              </div>
+              {selfChatHistory.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleClearSelfChat()}
+                  className="text-xs text-slate-500 hover:text-rose-600 transition-colors cursor-pointer"
+                >
+                  Clear History
+                </button>
+              )}
+            </div>
+
+            <div className="border border-slate-200 rounded-xl bg-slate-50 p-3.5 h-64 overflow-y-auto space-y-2.5">
+              {selfChatHistory.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center px-4 text-xs text-slate-500 space-y-1.5">
+                  <p className="font-medium text-slate-700">আপনার নিজের নাম্বারে সরাসরি চ্যাট করতে নিচে লিখুন অথবা WhatsApp-এ "Message Yourself"-এ মেসেজ/ভিডিও দিন।</p>
+                  <p>সম্পূর্ণ ০ টোকেন ও লো-র‍্যাম (সর্বোচ্চ ২৫ টার্ন বাফার) মোডে চলবে।</p>
+                </div>
+              ) : (
+                selfChatHistory.slice(-10).map((turn) => (
+                  <div
+                    key={turn.id}
+                    className={`flex ${turn.role === 'owner' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[88%] rounded-xl px-3.5 py-2.5 text-xs leading-relaxed whitespace-pre-wrap ${
+                        turn.role === 'owner'
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-white border border-slate-200 text-slate-800'
+                      }`}
+                    >
+                      {turn.mediaKind && (
+                        <div className="text-[10px] font-semibold uppercase tracking-wide opacity-80 mb-1">
+                          Media: {turn.mediaKind}
+                        </div>
+                      )}
+                      <div>{turn.text}</div>
+                      {turn.actionSummary && (
+                        <div className="mt-1.5 pt-1 border-t border-slate-100 text-[10px] text-emerald-700 font-medium">
+                          {turn.actionSummary}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() => void handleSendSelfChatMessage('স্ট্যাটাস ও র‍্যাম দেখাও')}
+                className="px-2.5 py-1 text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md transition-colors cursor-pointer"
+              >
+                স্ট্যাটাস ও র‍্যাম
+              </button>
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() =>
+                  void handleSendSelfChatMessage('এই ভিডিওটা দেখো, আমার বটের কোথায় মিসটেক হইছে?', {
+                    kind: 'video',
+                    caption: 'এই ভিডিওটা দেখো, আমার বটের কোথায় মিসটেক হইছে?',
+                    durationSec: 12,
+                    visualPreset: 'portrait_stunning',
+                  })
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-md transition-colors cursor-pointer"
+              >
+                <Film className="w-3 h-3" />
+                ভিডিও মিসটেক অ্যানালাইসিস টেস্ট
+              </button>
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() => void handleSendSelfChatMessage('কার কার ওপর রুল চালু আছে দেখাও')}
+                className="px-2.5 py-1 text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md transition-colors cursor-pointer"
+              >
+                কন্টাক্ট রুলস দেখো
+              </button>
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() => void handleSendSelfChatMessage('কমান্ড লিস্ট')}
+                className="px-2.5 py-1 text-[11px] font-medium bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-md transition-colors cursor-pointer"
+              >
+                সব কমান্ড (A-Z Help)
+              </button>
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() => void handleSendSelfChatMessage('আমার জন্য একটা ক্লায়েন্ট অফার ইমেইল ড্রাফট করো')}
+                className="px-2.5 py-1 text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md transition-colors cursor-pointer"
+              >
+                ইমেইল ড্রাফট টেস্ট
+              </button>
+              <button
+                type="button"
+                disabled={isSendingSelfChat}
+                onClick={() => void handleSendSelfChatMessage('ক্লায়েন্ট দাম কমাতে চাচ্ছে কী বলবো পরামর্শ দাও')}
+                className="px-2.5 py-1 text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md transition-colors cursor-pointer"
+              >
+                পরামর্শ টেস্ট
+              </button>
+            </div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void handleSendSelfChatMessage();
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={selfChatInput}
+                onChange={(e) => setSelfChatInput(e.target.value)}
+                placeholder="যেকোনো কথা, পরামর্শ, কমান্ড (যেমন: 01711..., 01811... এদেরকে পাঠাও...)"
+                className="flex-1 px-3.5 py-2.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+              />
+              <button
+                type="submit"
+                disabled={isSendingSelfChat || !selfChatInput.trim()}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-60"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {isSendingSelfChat ? 'পাঠাচ্ছে...' : 'Send'}
+              </button>
+            </form>
+          </div>
+
+          {/* Right: Contact Engagement & Hold Manager */}
+          <div className="lg:col-span-5 space-y-3 border-t lg:border-t-0 lg:border-l border-slate-200 pt-4 lg:pt-0 lg:pl-6">
+            <div>
+              <h3 className="text-xs font-semibold text-slate-800 uppercase tracking-wide">
+                Contact Long-Engage &amp; Hold Rules
+              </h3>
+              <p className="mt-1 text-xs text-slate-500">
+                নির্দিষ্ট নাম্বারের জন্য রুল দিন: কার সাথে দীর্ঘক্ষণ কথা বলবে, কাকে আটকে রাখবে (হোল্ড), অথবা কাকে মিউট রাখবে।
+              </p>
+            </div>
+
+            <form onSubmit={(e) => void handleAddContactPolicy(e)} className="space-y-2.5 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+              <select
+                value={policyPicker}
+                onChange={(e) => setPolicyPicker(e.target.value)}
+                className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+              >
+                <option value="manual">নতুন নাম / নাম্বার লিখুন</option>
+                {knownContacts.map((c) => (
+                  <option key={c.jid} value={c.jid}>
+                    {c.name} {c.phone ? `(+${c.phone})` : ''}
+                  </option>
+                ))}
+              </select>
+
+              {policyPicker === 'manual' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    value={policyName}
+                    onChange={(e) => setPolicyName(e.target.value)}
+                    placeholder="নাম (যেমন: রাহুল)"
+                    className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800"
+                  />
+                  <input
+                    type="text"
+                    value={policyPhone}
+                    onChange={(e) => setPolicyPhone(e.target.value)}
+                    placeholder="01712345678"
+                    className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 font-mono"
+                  />
+                </div>
+              )}
+
+              <select
+                value={policyMode}
+                onChange={(e) => setPolicyMode(e.target.value as ContactPolicyMode)}
+                className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 font-medium"
+              >
+                <option value="long_engage">💬 দীর্ঘক্ষণ কথা বলো (Long Engage)</option>
+                <option value="hold_wait">⏳ আটকে রাখো / অপেক্ষায় রাখো (0-Token Hold)</option>
+                <option value="mute_ai">🔇 রিপ্লাই বন্ধ রাখো (Mute AI)</option>
+              </select>
+
+              <input
+                type="text"
+                value={policyNote}
+                onChange={(e) => setPolicyNote(e.target.value)}
+                placeholder="ঐচ্ছিক কারণ/নোট (যেমন: পেমেন্টের বিষয়ে ব্যস্ত দেখাও)"
+                className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800"
+              />
+
+              <button
+                type="submit"
+                disabled={busyKey === 'add_contact_policy'}
+                className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-60"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Save Contact Rule
+              </button>
+            </form>
+
+            <div className="space-y-2 max-h-52 overflow-y-auto">
+              {(config.contactPolicies || []).filter((p) => p.mode !== 'normal').length === 0 ? (
+                <div className="text-xs text-slate-400 text-center py-4 border border-dashed border-slate-200 rounded-lg">
+                  কোনো কন্টাক্ট রুল এখনো সেট করা নেই।
+                </div>
+              ) : (
+                (config.contactPolicies || [])
+                  .filter((p) => p.mode !== 'normal')
+                  .map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-start justify-between gap-2 p-2.5 rounded-lg border border-slate-200 bg-white text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 truncate">
+                          {p.name} {p.phone ? <span className="font-mono text-slate-500">(+{p.phone})</span> : ''}
+                        </div>
+                        <div className="mt-0.5 flex items-center gap-1.5">
+                          <span
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                              p.mode === 'long_engage'
+                                ? 'bg-emerald-50 text-emerald-700'
+                                : p.mode === 'hold_wait'
+                                  ? 'bg-amber-50 text-amber-700'
+                                  : 'bg-rose-50 text-rose-700'
+                            }`}
+                          >
+                            {p.mode === 'long_engage' ? (
+                              <>
+                                <MessageCircle className="w-2.5 h-2.5" /> দীর্ঘক্ষণ কথা
+                              </>
+                            ) : p.mode === 'hold_wait' ? (
+                              <>
+                                <Clock className="w-2.5 h-2.5" /> আটকে রাখো (Hold)
+                              </>
+                            ) : (
+                              <>
+                                <VolumeX className="w-2.5 h-2.5" /> রিপ্লাই বন্ধ
+                              </>
+                            )}
+                          </span>
+                        </div>
+                        {p.note && <div className="mt-1 text-[11px] text-slate-500">{p.note}</div>}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleRemoveContactPolicy(p.id)}
+                        className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer shrink-0"
+                        title="Remove Rule"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Direct Action Command Box (Inbox Knock & Group @Mention Dispatcher) */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="p-6 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-emerald-600" />
+              Direct AI Action Command Box (সরাসরি ইনবক্স নক ও গ্রুপ @মেনশন)
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              এখান থেকে সরাসরি কমান্ড দিন—কোনো নির্দিষ্ট নাম্বার/কন্টাক্টের <span className="font-medium text-slate-900">ইনবক্সে গিয়ে নক করতে</span> অথবা কোনো{' '}
+              <span className="font-medium text-slate-900">গ্রুপে @মেনশন দিয়ে কথা বলতে</span> বা কাজটি করে দিতে। মেমোরি সেভ থাকায় রিপ্লাই দিলে AI ধারাবাহিকভাবে কথা চালিয়ে যাবে।
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {(
+              [
+                { id: 'auto', label: 'ফ্রি-হ্যান্ড / অটো' },
+                { id: 'dm_knock', label: 'ইনবক্স নক (DM)' },
+                { id: 'group_mention', label: 'গ্রুপে @মেনশন' },
+              ] as const
+            ).map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setDirectActionType(tab.id)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
+                  directActionType === tab.id
+                    ? 'bg-slate-900 text-white border-slate-900'
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="p-6 space-y-5 bg-slate-50/50">
+          {(directActionType === 'dm_knock' || directActionType === 'auto') && (
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+              <div className="md:col-span-5">
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  কন্টাক্ট সিলেক্ট করুন (অথবা নিচে নাম/নাম্বার লিখুন)
+                </label>
+                <select
+                  value={directContactPicker}
+                  onChange={(e) => setDirectContactPicker(e.target.value)}
+                  className="w-full px-3.5 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-emerald-600"
+                >
+                  <option value="manual">+ কাস্টম নাম্বার বা নাম লিখবো (অথবা কমান্ড থেকে নেবে)</option>
+                  {knownContacts.map((c) => (
+                    <option key={c.jid} value={c.jid}>
+                      {c.name} {c.phone ? `(+${c.phone})` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {directContactPicker === 'manual' && (
+                <div className="md:col-span-7">
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    টার্গেট নাম্বার বা কন্টাক্ট নাম (ইনবক্সের জন্য)
+                  </label>
+                  <input
+                    type="text"
+                    value={directTargetPhoneOrName}
+                    onChange={(e) => setDirectTargetPhoneOrName(e.target.value)}
+                    placeholder="যেমন: 01712345678 বা Rafiq (অথবা শুধু কমান্ড বক্সে লিখুন)"
+                    className="w-full px-3.5 py-2 text-xs font-mono bg-white border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-emerald-600"
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {(directActionType === 'group_mention' || directActionType === 'auto') && (
+            <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+                <div className="md:col-span-6">
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    হোয়াটসঅ্যাপ গ্রুপ (গ্রুপে মেনশন দেওয়ার জন্য)
+                  </label>
+                  <select
+                    value={directGroupJid}
+                    onChange={(e) => {
+                      setDirectGroupJid(e.target.value);
+                      setDirectMentionMemberJids([]);
+                    }}
+                    className="w-full px-3.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-emerald-600"
+                  >
+                    <option value="">-- গ্রুপ বাছাই করুন --</option>
+                    {knownGroups.map((g) => (
+                      <option key={g.jid} value={g.jid}>
+                        {g.name} ({g.members?.length || g.participantCount || 0} members)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="md:col-span-6 text-[11px] text-slate-500">
+                  নিচে ক্লিক করে যাদেরকে গ্রুপে <span className="font-mono text-slate-800">@mention</span> করতে চান সিলেক্ট করুন (একাধিক মেম্বার সিলেক্ট করা যাবে):
+                </div>
+              </div>
+
+              {directGroupJid && (
+                <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto pt-1">
+                  {(knownGroups.find((g) => g.jid === directGroupJid)?.members || []).length === 0 ? (
+                    <span className="text-xs text-slate-500">
+                      এই গ্রুপের মেম্বার এখনো লোড হয়নি—WhatsApp কানেক্ট থাকলে "Refresh Groups" চাপুন অথবা কমান্ডে @নাম/নাম্বার লিখুন।
+                    </span>
+                  ) : (
+                    (knownGroups.find((g) => g.jid === directGroupJid)?.members || []).slice(0, 60).map((m) => {
+                      const picked = directMentionMemberJids.includes(m.jid);
+                      return (
+                        <button
+                          key={m.jid}
+                          type="button"
+                          onClick={() => handleToggleDirectMentionMember(m.jid)}
+                          className={`px-2.5 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer ${
+                            picked
+                              ? 'bg-emerald-600 text-white border-emerald-600'
+                              : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          @{m.name} {m.phone ? `(${m.phone.slice(-4)})` : ''}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-semibold text-slate-800">
+                কমান্ড / ইনস্ট্রাকশন বক্স (কী বলবে বা কী কাজ করবে লিখুন)
+              </label>
+              <button
+                type="button"
+                onClick={() => setDirectUseAiCraft((v) => !v)}
+                className={`px-2.5 py-1 text-[11px] font-medium rounded-md border cursor-pointer ${
+                  directUseAiCraft
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    : 'bg-white text-slate-700 border-slate-200'
+                }`}
+              >
+                {directUseAiCraft ? 'AI স্মার্টলি লিখে দেবে' : 'হুবহু মেসেজ পাঠাবে (0 Token)'}
+              </button>
+            </div>
+
+            <textarea
+              rows={3}
+              value={directInstruction}
+              onChange={(e) => setDirectInstruction(e.target.value)}
+              placeholder="উদাহরণ ১: 01712345678 এই নাম্বারে ইনবক্সে নক করে বলো আজকে সন্ধ্যা ৭টায় মিটিং আছে, ফ্রি থাকলে জানাতে।&#10;উদাহরণ ২: গ্রুপে তানভীরকে মেনশন দিয়ে বলো কালকের ট্যুরের হিসাবটা আজকে দিয়ে দিতে।"
+              className="w-full px-3.5 py-2.5 text-xs leading-relaxed bg-white border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+            />
+
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                'ইনবক্সে নক দিয়ে বলো কেমন আছেন, আজকে একটু সময় থাকলে কথা বলি।',
+                'গ্রুপে @মেনশন দিয়ে বলো আজকের মিটিংয়ের আপডেটটা জানাতে।',
+                'ওকে নক দিয়ে বলো কালকে প্রজেক্টের ফাইলটা পাঠিয়ে দিতে।',
+              ].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setDirectInstruction(preset)}
+                  className="px-2.5 py-1 text-[11px] bg-white border border-slate-200 rounded-md text-slate-600 hover:bg-slate-100 cursor-pointer"
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={isExecutingDirectCmd}
+              onClick={() => void handleExecuteDirectCommand(true)}
+              className="px-4 py-2 text-xs font-medium bg-white text-slate-800 border border-slate-200 rounded-lg hover:bg-slate-100 flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              {isExecutingDirectCmd ? 'Processing...' : 'Preview Draft (না পাঠিয়ে দেখুন)'}
+            </button>
+            <button
+              type="button"
+              disabled={isExecutingDirectCmd}
+              onClick={() => void handleExecuteDirectCommand(false)}
+              className="px-4 py-2 text-xs font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              <Send className="w-3.5 h-3.5" />
+              {isExecutingDirectCmd ? 'Sending...' : 'Execute & Send on WhatsApp'}
+            </button>
+          </div>
+
+          {directCmdResult && (
+            <div className="p-4 rounded-xl border border-slate-200 bg-white space-y-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-slate-900">
+                  Target: {directCmdResult.targetLabel}
+                </span>
+                <span
+                  className={`font-mono text-[11px] font-semibold ${
+                    directCmdResult.deliveredLive ? 'text-emerald-700' : 'text-amber-700'
+                  }`}
+                >
+                  {directCmdResult.deliveredLive
+                    ? 'LIVE SENT'
+                    : directCmdResult.dryRun
+                      ? 'PREVIEW'
+                      : 'DRAFT (OFFLINE)'}{' '}
+                  · {directCmdResult.providerUsed}
+                </span>
+              </div>
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-900 whitespace-pre-wrap">
+                {directCmdResult.messageText}
+              </div>
+              <div className="text-[11px] text-slate-600">{directCmdResult.note}</div>
+            </div>
+          )}
+
+          {directCommandHistory.length > 0 && (
+            <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold text-slate-700">
+                Recent Executed Commands ({directCommandHistory.length})
+              </div>
+              <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto">
+                {directCommandHistory.slice(0, 8).map((cmd) => (
+                  <div key={cmd.id} className="px-4 py-2.5 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="font-medium text-slate-900">
+                        [{cmd.actionType === 'group_mention' ? 'GROUP @MENTION' : 'DM KNOCK'}] {cmd.targetLabel}
+                      </div>
+                      <div className="text-slate-600 truncate">{cmd.messageSent}</div>
+                    </div>
+                    <span className="font-mono text-[11px] text-slate-400 shrink-0 tabular-nums">
+                      {cmd.deliveredLive ? 'Sent' : 'Draft'} · {new Date(cmd.timestamp).toLocaleTimeString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -1189,6 +2175,395 @@ export function ModerationRules({ config, botStatus, tokenTelemetry, onUpdateCon
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+      </section>
+
+      {/* Zero-Token Story, Sticker, Photo & Video Intelligence */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="p-6 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+              <Image className="w-4 h-4 text-emerald-600" />
+              Zero-Token Story, Sticker, Photo &amp; Video Intelligence
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              AI <span className="font-medium text-slate-900">০ টোকেন খরচে</span> লোকাল পিক্সেল ও মেটাডাটা বিশ্লেষণের মাধ্যমে স্টোরি, ছবি, ভিডিও, স্টিকার ও রিয়্যাকশন পড়ে এবং{' '}
+              <span className="font-medium text-slate-900">শুধুমাত্র টেক্সট SMS</span> (ভালো/খারাপ/হাসি/যুক্তি/সুন্দর ছবির প্রশংসা) ও লাইক-রিয়্যাক্টে রিপ্লাই দেয়।
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              disabled={busyKey === 'media_zero_mode'}
+              onClick={() =>
+                void safeUpdate(
+                  { mediaZeroTokenReplyMode: !(config.mediaZeroTokenReplyMode !== false) },
+                  'media_zero_mode',
+                  !(config.mediaZeroTokenReplyMode !== false)
+                    ? '100% Zero-Token Media Reply Mode enabled.'
+                    : 'Hybrid Mode (0-Token Read + Text AI for Captioned Media) enabled.'
+                )
+              }
+              className={`px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60 ${
+                config.mediaZeroTokenReplyMode !== false
+                  ? 'bg-slate-900 text-white border-slate-900 hover:bg-slate-800'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {config.mediaZeroTokenReplyMode !== false
+                ? 'Reply Mode: 100% Zero-Token'
+                : 'Reply Mode: Hybrid (0-Tok Read + Text AI)'}
+            </button>
+
+            <button
+              type="button"
+              disabled={busyKey === 'media_intel_master'}
+              onClick={() =>
+                void safeUpdate(
+                  { mediaIntelligenceEnabled: !(config.mediaIntelligenceEnabled !== false) },
+                  'media_intel_master',
+                  !(config.mediaIntelligenceEnabled !== false)
+                    ? 'Zero-Token Media Intelligence turned ON.'
+                    : 'Zero-Token Media Intelligence turned OFF.'
+                )
+              }
+              className={`px-4 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60 ${
+                config.mediaIntelligenceEnabled !== false
+                  ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {config.mediaIntelligenceEnabled !== false ? 'Media Reader: ON' : 'Media Reader: OFF'}
+            </button>
+          </div>
+        </div>
+
+        <div className="p-6 border-b border-slate-200 bg-slate-50/70 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+          <button
+            type="button"
+            disabled={busyKey === 'story_read'}
+            onClick={() =>
+              void safeUpdate(
+                { storyAutoReadEnabled: !(config.storyAutoReadEnabled !== false) },
+                'story_read',
+                'Story Auto-Read setting saved.'
+              )
+            }
+            className={`px-3.5 py-2.5 text-xs font-medium rounded-lg border flex items-center justify-between gap-2 cursor-pointer ${
+              config.storyAutoReadEnabled !== false
+                ? 'bg-white border-emerald-200 text-emerald-800'
+                : 'bg-white border-slate-200 text-slate-500'
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <Eye className="w-3.5 h-3.5" />
+              Story Auto-Read
+            </span>
+            <span className="font-mono font-semibold">
+              {config.storyAutoReadEnabled !== false ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={busyKey === 'story_react'}
+            onClick={() =>
+              void safeUpdate(
+                { storyAutoReactEnabled: !(config.storyAutoReactEnabled !== false) },
+                'story_react',
+                'Story Auto-Like setting saved.'
+              )
+            }
+            className={`px-3.5 py-2.5 text-xs font-medium rounded-lg border flex items-center justify-between gap-2 cursor-pointer ${
+              config.storyAutoReactEnabled !== false
+                ? 'bg-white border-emerald-200 text-emerald-800'
+                : 'bg-white border-slate-200 text-slate-500'
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <Heart className="w-3.5 h-3.5" />
+              Story Like Reaction
+            </span>
+            <span className="font-mono font-semibold">
+              {config.storyAutoReactEnabled !== false ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={busyKey === 'story_reply'}
+            onClick={() =>
+              void safeUpdate(
+                { storyAutoReplyEnabled: !(config.storyAutoReplyEnabled !== false) },
+                'story_reply',
+                'Story SMS Comment setting saved.'
+              )
+            }
+            className={`px-3.5 py-2.5 text-xs font-medium rounded-lg border flex items-center justify-between gap-2 cursor-pointer ${
+              config.storyAutoReplyEnabled !== false
+                ? 'bg-white border-emerald-200 text-emerald-800'
+                : 'bg-white border-slate-200 text-slate-500'
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5" />
+              Story SMS Comment
+            </span>
+            <span className="font-mono font-semibold">
+              {config.storyAutoReplyEnabled !== false ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
+          <div>
+            <label className="block text-[11px] font-medium text-slate-600 mb-1">
+              Story Comment Cooldown
+            </label>
+            <select
+              value={config.storyCooldownMs ?? 900000}
+              onChange={(e) =>
+                void safeUpdate(
+                  { storyCooldownMs: Number(e.target.value) },
+                  'story_cooldown',
+                  'Story cooldown saved.'
+                )
+              }
+              className="w-full px-3 py-2 text-xs font-medium bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-600/20"
+            >
+              <option value={60000}>1m Cooldown (Test)</option>
+              <option value={300000}>5m Cooldown</option>
+              <option value={900000}>15m Cooldown (Balanced)</option>
+              <option value={3600000}>1h Cooldown</option>
+              <option value={21600000}>6h Cooldown</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Custom Story Audience Selector (Whitelist: ONLY Selected Contacts' Stories) */}
+        <div className="p-6 border-b border-slate-200 bg-white space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                <UserPlus className="w-4 h-4 text-emerald-600" />
+                Story Custom Contact Whitelist (শুধু সিলেক্টেড কন্টাক্টের স্টোরি দেখবে ও ইনবক্সে রিপ্লাই দেবে)
+              </h3>
+              <p className="text-xs text-slate-600 mt-0.5">
+                শুধু স্টোরির ক্ষেত্রে: যাদের নাম/নম্বর এখানে এড করবেন, "Selected Contacts Only" চালু থাকলে একমাত্র তাদের স্টোরিগুলো AI পড়বে, লাইক দেবে এবং সরাসরি ইনবক্স করবে।
+              </p>
+            </div>
+
+            <div className="inline-flex rounded-lg border border-slate-200 p-0.5 bg-slate-50 shrink-0">
+              <button
+                type="button"
+                disabled={busyKey === 'story_wl_mode'}
+                onClick={() =>
+                  void safeUpdate(
+                    { storyWhitelistMode: 'all' },
+                    'story_wl_mode',
+                    'Story mode set to: All Contacts.'
+                  )
+                }
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  config.storyWhitelistMode !== 'selected_only'
+                    ? 'bg-slate-900 text-white'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                All Contacts
+              </button>
+              <button
+                type="button"
+                disabled={busyKey === 'story_wl_mode'}
+                onClick={() =>
+                  void safeUpdate(
+                    { storyWhitelistMode: 'selected_only' },
+                    'story_wl_mode',
+                    'Story mode set to: Selected Contacts Only.'
+                  )
+                }
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  config.storyWhitelistMode === 'selected_only'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Selected Only ({storyAllowedList.filter((x) => x.enabled !== false).length})
+              </button>
+            </div>
+          </div>
+
+          <form onSubmit={handleAddStoryWhitelistContact} className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-end">
+            <div className="lg:col-span-4">
+              <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                কন্টাক্ট বাছাই করুন ({knownContacts.length} cached)
+              </label>
+              <select
+                value={storySelectedPicker}
+                onChange={(e) => setStorySelectedPicker(e.target.value)}
+                className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-emerald-600"
+              >
+                <option value="manual">+ নাম ও নাম্বার ম্যানুয়ালি এড করুন</option>
+                {knownContacts.map((c) => (
+                  <option key={c.jid} value={c.jid}>
+                    {c.name} {c.phone ? `(+${c.phone})` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {storySelectedPicker === 'manual' && (
+              <>
+                <div className="lg:col-span-2">
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">নাম (Name)</label>
+                  <input
+                    type="text"
+                    value={storyManualName}
+                    onChange={(e) => setStoryManualName(e.target.value)}
+                    placeholder="যেমন: Ayesha"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
+                  />
+                </div>
+                <div className="lg:col-span-3">
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">নাম্বার (Optional)</label>
+                  <input
+                    type="text"
+                    value={storyManualPhone}
+                    onChange={(e) => setStoryManualPhone(e.target.value)}
+                    placeholder="017XXXXXXXX"
+                    className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
+                  />
+                </div>
+              </>
+            )}
+
+            <div className={storySelectedPicker === 'manual' ? 'lg:col-span-3' : 'lg:col-span-5'}>
+              <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                কাস্টম স্টোরি নোট (Optional: প্রশংসা / ফানি / ভদ্র)
+              </label>
+              <input
+                type="text"
+                value={storyCustomPrompt}
+                onChange={(e) => setStoryCustomPrompt(e.target.value)}
+                placeholder="যেমন: সুন্দর ছবি হলে ভীষণ প্রশংসা করবে"
+                className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
+              />
+            </div>
+
+            <div className={storySelectedPicker === 'manual' ? 'lg:col-span-12 flex justify-end' : 'lg:col-span-3'}>
+              <button
+                type="submit"
+                disabled={busyKey === 'add_story_wl'}
+                className="px-4 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-60"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Add to Story Whitelist
+              </button>
+            </div>
+          </form>
+
+          {storyAllowedList.length === 0 ? (
+            <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-4 py-3">
+              এখনো কোনো কন্টাক্ট স্টোরি হোয়াইটলিস্টে যোগ করা হয়নি।
+              {config.storyWhitelistMode === 'selected_only'
+                ? ' সতর্কতা: "Selected Only" চালু আছে কিন্তু লিস্ট খালি থাকায় আপাতত কোনো স্টোরিতে রিপ্লাই যাবে না।'
+                : ' চাইলে ওপর থেকে নাম/নাম্বার এড করলে শুধু তাদের স্টোরি দেখা ও ইনবক্স চালু হয়ে যাবে।'}
+            </div>
+          ) : (
+            <div className="border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {storyAllowedList.map((item) => (
+                <div key={item.id} className="px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold text-slate-900">{item.name}</span>
+                      {item.phone && (
+                        <span className="font-mono text-[11px] text-slate-500 tabular-nums">+{item.phone}</span>
+                      )}
+                      <span
+                        className={`text-[11px] font-medium ${
+                          item.enabled !== false ? 'text-emerald-700' : 'text-slate-400'
+                        }`}
+                      >
+                        • {item.enabled !== false ? 'Story Watch ON' : 'Paused'}
+                      </span>
+                    </div>
+                    {item.customPrompt && <div className="text-slate-600">{item.customPrompt}</div>}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={busyKey === `toggle_story_wl_${item.id}`}
+                      onClick={() => void handleToggleStoryWhitelistContact(item.id)}
+                      className={`px-2.5 py-1 text-[11px] font-medium border rounded-md cursor-pointer ${
+                        item.enabled !== false
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                          : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      {item.enabled !== false ? 'Pause' : 'Enable'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busyKey === `del_story_wl_${item.id}`}
+                      onClick={() => void handleRemoveStoryWhitelistContact(item.id)}
+                      className="p-1.5 text-slate-400 hover:text-red-600 cursor-pointer"
+                      title="Remove from story whitelist"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="px-6 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
+          <div className="text-xs text-slate-600">
+            Recent Zero-Token Media &amp; Story Activity ({mediaStories.length}) — strictly SMS text replies only
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadMediaStories()}
+            disabled={isLoadingStories}
+            className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+          >
+            <RefreshCw className={`w-3 h-3 ${isLoadingStories ? 'animate-spin' : ''}`} />
+            Refresh Feed
+          </button>
+        </div>
+
+        {mediaStories.length === 0 ? (
+          <div className="p-6 text-center text-xs text-slate-500">
+            No stories, photos, stickers, or videos analyzed yet today. Test a Story or Photo inside the Command Simulator!
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100 max-h-72 overflow-y-auto">
+            {mediaStories.slice(0, 15).map((item) => (
+              <div key={item.id} className="px-6 py-3 flex flex-col sm:flex-row sm:items-start justify-between gap-3 text-xs">
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-slate-900">{item.senderName}</span>
+                    <span className="font-mono text-[11px] text-slate-500">
+                      [{item.source.toUpperCase()} · {item.banglaSceneLabel}]
+                    </span>
+                    <span className="font-mono text-[11px] font-semibold text-emerald-700">
+                      0 Read Tokens
+                    </span>
+                  </div>
+                  <div className="text-slate-600 break-words">{item.compactContextLine}</div>
+                  {item.replySent && (
+                    <div className="text-slate-900 bg-slate-50 border border-slate-200 rounded-md px-2.5 py-1.5">
+                      {item.reactionSent ? `${item.reactionSent} ` : ''}
+                      {item.replySent}
+                    </div>
+                  )}
+                </div>
+                <div className="text-[11px] font-mono text-slate-400 whitespace-nowrap shrink-0 tabular-nums">
+                  {new Date(item.timestamp).toLocaleTimeString()}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>

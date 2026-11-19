@@ -268,4 +268,27 @@ export class OpenRouterReader {
     this.lastFallbackAt = new Date().toISOString();
     return result;
   }
+
+  /**
+   * Autonomous Multi-Step Agent Fallback (ReAct JSON Tool-Calling Loop):
+   * Runs when Gemini keys are temporarily exhausted/unavailable so OpenRouter can still drive
+   * the autonomous agent's tools step by step.
+   */
+  public async generateAgentStepPlan(params: {
+    systemPrompt: string;
+    transcript: string;
+  }): Promise<{
+    content: string;
+    modelUsed: string;
+    usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  }> {
+    const result = await this.callChatCompletion({
+      systemPrompt: params.systemPrompt,
+      userPrompt: params.transcript,
+      timeoutMs: 9_000,
+      maxTokens: 650,
+    });
+    this.lastFallbackAt = new Date().toISOString();
+    return result;
+  }
 }

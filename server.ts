@@ -22,24 +22,47 @@ import {
   STARTER_REGIONAL_DICTIONARY,
   findMatchingGroupTarget,
   findRelevantDictionaryEntries,
+  generateDirectCommandText,
   generateExecutiveAssistantReply,
   generateGroupCloneAction,
+  generateZeroTokenHoldReply,
   parseUploadedDictionary,
   sanitizeId,
   type AssistantTone,
   type ChatMemoryRecord,
   type ChatTurn,
+  type ContactPolicyEntry,
+  type ContactPolicyMode,
   type DictionaryEntry,
   type GroupAiMode,
   type GroupCloneResult,
   type GroupDirectiveConfig,
   type GroupMemberTargetDirective,
   type InboxNoteRecord,
+  type StoryWhitelistContact,
 } from './server/assistantEngine.ts';
+import {
+  redactSecretsInText,
+  runZeroTokenSelfChatCopilot,
+  type SelfChatPendingDraft,
+  type SelfChatTurnItem,
+} from './server/selfChatCopilot.ts';
+import {
+  registerWebOutreachRoutes,
+  type WebOutreachController,
+} from './server/webResearchOutreach.ts';
 import { GeminiKeyPool } from './server/geminiKeyPool.ts';
 import { OpenRouterReader } from './server/openRouterReader.ts';
 import { TokenTelemetryTracker } from './server/tokenTelemetry.ts';
 import { buildZeroTokenMemorySummary } from './server/localMemorySummarizer.ts';
+import {
+  analyzeSimulatedMediaZeroToken,
+  generateZeroTokenMediaReply,
+  readMediaMessageZeroToken,
+  unwrapBaileysMessageContent,
+  type MediaInsight,
+  type SimulatedMediaInput,
+} from './server/mediaReader.ts';
 import {
   appendArchiveTurn,
   clearArchiveTurns,
@@ -55,7 +78,20 @@ import {
   adminSaveDocument,
   adminSaveSubDocument,
   getAdminFirestore,
+  getFirestoreAdminDiagnostics,
 } from './server/firestoreAdmin.ts';
+import {
+  AutonomousAgentEngine,
+  registerAutonomousAgentRoutes,
+} from './server/autonomousAgent.ts';
+import {
+  MobileOffloadQueueManager,
+  registerMobileOffloadRoutes,
+} from './server/mobileOffloadQueue.ts';
+import {
+  SelfHealingWatchdog,
+  repairCorruptJsonFiles,
+} from './server/selfHealingWatchdog.ts';
 import {
   getPostgresStatus,
   isPostgresConfigured,
@@ -105,7 +141,7 @@ import {
 } from './server/authSecurity.ts';
 import { ClientBotManager, type ClientBotPatchInput } from './server/clientBotManager.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || (process.env.SPACE_ID || process.env.SPACE_HOST ? 7860 : 3000));
 const PREFIX = '.';
 const AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info_baileys');
 const CONFIG_FILE = path.resolve('./bot-config.json');
@@ -114,6 +150,8 @@ const MEMORIES_FILE = path.resolve('./bot-memories.json');
 const NOTES_FILE = path.resolve('./bot-notes.json');
 const GROUP_MEMBERS_FILE = path.resolve('./bot-group-members.json');
 const CONTACTS_FILE = path.resolve('./bot-contacts.json');
+const STORIES_FILE = path.resolve('./bot-stories.json');
+const SELF_CHAT_FILE = path.resolve('./bot-self-chat.json');
 const BOT_SOURCE_DIR = path.resolve('./bot');
 
 export const BENGALI_AUTOREPLY_TEXT =
@@ -158,7 +196,48 @@ interface BotConfig {
   groupCooldownMs: number;
   groupAiGroups: Record<string, boolean>;
   groupDirectives: Record<string, GroupDirectiveConfig>;
+  mediaIntelligenceEnabled: boolean;
+  mediaZeroTokenReplyMode: boolean;
+  storyAutoReadEnabled: boolean;
+  storyAutoReactEnabled: boolean;
+  storyAutoReplyEnabled: boolean;
+  storyCooldownMs: number;
+  storyWhitelistMode: 'all' | 'selected_only';
+  storyAllowedContacts: StoryWhitelistContact[];
+  selfChatCopilotEnabled: boolean;
+  selfChatZeroTokenOnly: boolean;
+  contactPolicies: ContactPolicyEntry[];
   configUpdatedAt: string;
+}
+
+interface DirectCommandLogItem {
+  id: string;
+  timestamp: string;
+  actionType: 'dm_knock' | 'group_mention';
+  targetLabel: string;
+  targetJid: string;
+  mentionedJids: string[];
+  instruction: string;
+  messageSent: string;
+  deliveredLive: boolean;
+  usedAi: boolean;
+  providerUsed: string;
+}
+
+interface MediaStoryFeedItem {
+  id: string;
+  timestamp: string;
+  source: 'story' | 'dm' | 'group' | 'simulator';
+  senderName: string;
+  senderJid: string;
+  kind: MediaInsight['kind'];
+  sentiment: MediaInsight['sentiment'];
+  banglaSceneLabel: string;
+  compactContextLine: string;
+  reactionSent: string;
+  replySent: string;
+  tokensUsedForRead: 0;
+  replyMode: 'zero_token' | 'hybrid_text_ai' | 'read_only';
 }
 
 interface BotLogEntry {
@@ -172,12 +251,13 @@ interface BotLogEntry {
 
 interface SimulatorRequest {
   text: string;
-  chatType: 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self';
+  chatType: 'private' | 'group_bot_admin' | 'group_bot_non_admin' | 'self' | 'story';
   senderIsGroupAdmin?: boolean;
   groupJid?: string;
   contactJid?: string;
   contactName?: string;
   senderJid?: string;
+  media?: SimulatedMediaInput;
 }
 
 // ----------------------------------------------------------------------------
@@ -216,6 +296,17 @@ function defaultConfig(): BotConfig {
     groupCooldownMs: 6000,
     groupAiGroups: {},
     groupDirectives: {},
+    mediaIntelligenceEnabled: true,
+    mediaZeroTokenReplyMode: true,
+    storyAutoReadEnabled: true,
+    storyAutoReactEnabled: true,
+    storyAutoReplyEnabled: true,
+    storyCooldownMs: 15 * 60 * 1000,
+    storyWhitelistMode: 'all',
+    storyAllowedContacts: [],
+    selfChatCopilotEnabled: true,
+    selfChatZeroTokenOnly: true,
+    contactPolicies: [],
     configUpdatedAt: '',
   };
 }
@@ -281,6 +372,85 @@ function normalizeGroupDirectives(raw: unknown): Record<string, GroupDirectiveCo
     }
   }
   return result;
+}
+
+function normalizePhoneForWa(rawPhone: string | undefined | null): string {
+  const digits = String(rawPhone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (/^01[3-9]\d{8}$/.test(digits)) {
+    return `88${digits}`;
+  }
+  if (/^1[3-9]\d{8}$/.test(digits)) {
+    return `880${digits}`;
+  }
+  return digits.slice(0, 15);
+}
+
+function normalizeStoryAllowedContacts(raw: unknown): StoryWhitelistContact[] {
+  if (!Array.isArray(raw)) return [];
+  const out: StoryWhitelistContact[] = [];
+  const seen = new Set<string>();
+  for (const item of raw.slice(0, 200)) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Partial<StoryWhitelistContact>;
+    const name = String(obj.name || '').trim().slice(0, 120);
+    const phone = normalizePhoneForWa(obj.phone || obj.jid);
+    const rawJid = String(obj.jid || '').trim().slice(0, 128);
+    const jid = rawJid || (phone ? `${phone}@s.whatsapp.net` : '');
+    const customPrompt = typeof obj.customPrompt === 'string' ? obj.customPrompt.trim().slice(0, 500) : '';
+    if (!name && !phone && !jid) continue;
+    const dedupeKey = phone ? `pn:${phone}` : jid ? `jid:${jid}` : `name:${name.toLowerCase()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push({
+      id:
+        typeof obj.id === 'string' && obj.id.trim()
+          ? obj.id.trim().slice(0, 64)
+          : sanitizeId(`story_wl_${Date.now()}_${out.length}`),
+      name: name || (phone ? `+${phone}` : jid.split('@')[0]),
+      phone,
+      jid: jid || undefined,
+      customPrompt: customPrompt || undefined,
+      enabled: obj.enabled !== false,
+    });
+  }
+  return out;
+}
+
+function normalizeContactPolicies(raw: unknown): ContactPolicyEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const validModes: ContactPolicyMode[] = ['normal', 'long_engage', 'hold_wait', 'mute_ai'];
+  const out: ContactPolicyEntry[] = [];
+  const seen = new Set<string>();
+  for (const item of raw.slice(0, 200)) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Partial<ContactPolicyEntry>;
+    const mode: ContactPolicyMode = validModes.includes(obj.mode as ContactPolicyMode)
+      ? (obj.mode as ContactPolicyMode)
+      : 'normal';
+    const name = String(obj.name || '').trim().slice(0, 120);
+    const phone = normalizePhoneForWa(obj.phone || obj.jid);
+    const rawJid = String(obj.jid || '').trim().slice(0, 128);
+    const jid = rawJid || (phone ? `${phone}@s.whatsapp.net` : '');
+    const note = typeof obj.note === 'string' ? obj.note.trim().slice(0, 240) : '';
+    if (!name && !phone && !jid) continue;
+    const dedupeKey = phone ? `pn:${phone}` : jid ? `jid:${jid}` : `name:${name.toLowerCase()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push({
+      id:
+        typeof obj.id === 'string' && obj.id.trim()
+          ? obj.id.trim().slice(0, 64)
+          : sanitizeId(`cpol_${Date.now()}_${out.length}`),
+      name: name || (phone ? `+${phone}` : jid.split('@')[0]),
+      phone,
+      jid: jid || undefined,
+      mode,
+      note: note || undefined,
+      updatedAt: typeof obj.updatedAt === 'string' && obj.updatedAt ? obj.updatedAt : new Date().toISOString(),
+    });
+  }
+  return out;
 }
 
 function parseConfigTimestampMs(raw: unknown): number {
@@ -354,6 +524,41 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
         ? raw.groupAiGroups
         : base.groupAiGroups,
     groupDirectives: normalizeGroupDirectives(raw.groupDirectives),
+    mediaIntelligenceEnabled:
+      typeof raw.mediaIntelligenceEnabled === 'boolean'
+        ? raw.mediaIntelligenceEnabled
+        : base.mediaIntelligenceEnabled,
+    mediaZeroTokenReplyMode:
+      typeof raw.mediaZeroTokenReplyMode === 'boolean'
+        ? raw.mediaZeroTokenReplyMode
+        : base.mediaZeroTokenReplyMode,
+    storyAutoReadEnabled:
+      typeof raw.storyAutoReadEnabled === 'boolean'
+        ? raw.storyAutoReadEnabled
+        : base.storyAutoReadEnabled,
+    storyAutoReactEnabled:
+      typeof raw.storyAutoReactEnabled === 'boolean'
+        ? raw.storyAutoReactEnabled
+        : base.storyAutoReactEnabled,
+    storyAutoReplyEnabled:
+      typeof raw.storyAutoReplyEnabled === 'boolean'
+        ? raw.storyAutoReplyEnabled
+        : base.storyAutoReplyEnabled,
+    storyCooldownMs:
+      typeof raw.storyCooldownMs === 'number' && raw.storyCooldownMs >= 0
+        ? Math.min(86_400_000, raw.storyCooldownMs)
+        : base.storyCooldownMs,
+    storyWhitelistMode: raw.storyWhitelistMode === 'selected_only' ? 'selected_only' : 'all',
+    storyAllowedContacts: normalizeStoryAllowedContacts(raw.storyAllowedContacts),
+    selfChatCopilotEnabled:
+      typeof raw.selfChatCopilotEnabled === 'boolean'
+        ? raw.selfChatCopilotEnabled
+        : base.selfChatCopilotEnabled,
+    selfChatZeroTokenOnly:
+      typeof raw.selfChatZeroTokenOnly === 'boolean'
+        ? raw.selfChatZeroTokenOnly
+        : base.selfChatZeroTokenOnly,
+    contactPolicies: normalizeContactPolicies(raw.contactPolicies),
     configUpdatedAt: typeof raw.configUpdatedAt === 'string' ? raw.configUpdatedAt : base.configUpdatedAt,
   };
 }
@@ -374,6 +579,28 @@ let knownContacts: Record<string, KnownContactRecord> = loadJsonFile<Record<stri
   CONTACTS_FILE,
   {}
 );
+let recentMediaStories: MediaStoryFeedItem[] = loadJsonFile<MediaStoryFeedItem[]>(
+  STORIES_FILE,
+  []
+).slice(0, 60);
+let selfChatHistory: SelfChatTurnItem[] = loadJsonFile<SelfChatTurnItem[]>(
+  SELF_CHAT_FILE,
+  []
+).slice(-25);
+let pendingSelfChatDraft: SelfChatPendingDraft | null = null;
+let outreachController: WebOutreachController | null = null;
+const mobileOffloadQueue = new MobileOffloadQueueManager();
+let autonomousAgentEngine: AutonomousAgentEngine | null = null;
+let selfHealingWatchdog: SelfHealingWatchdog | null = null;
+let getRuntimeSelfPingSnapshot: () => {
+  enabled: boolean;
+  targetUrl: string;
+  lastPingAt: string | null;
+  lastPingOk: boolean | null;
+} = () => ({ enabled: true, targetUrl: '', lastPingAt: null, lastPingOk: null });
+const processedSelfMsgIds = new Map<string, number>();
+const recentSelfBotTextCache = new Map<string, number>();
+const recentDirectCommands: DirectCommandLogItem[] = [];
 const lidToPhoneCache = new Map<string, string>();
 const phoneToLidCache = new Map<string, string>();
 let activeCloudOwnerId: string = process.env.FIREBASE_OWNER_UID || 'server_admin';
@@ -777,6 +1004,221 @@ function persistConfig(stampNow = true) {
   void pgSaveSettings(activeCloudOwnerId, botConfig as unknown as Record<string, unknown>);
 }
 
+function findMatchingStoryWhitelistContact(params: {
+  jids?: Array<string | undefined | null>;
+  phone?: string;
+  names?: Array<string | undefined | null>;
+}): StoryWhitelistContact | null {
+  const allowed = (botConfig.storyAllowedContacts || []).filter((c) => c.enabled !== false);
+  if (allowed.length === 0) return null;
+
+  const candidateJids = new Set(
+    (params.jids || [])
+      .map((j) => (j || '').split(':')[0].trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const candidatePhone = normalizePhoneForWa(params.phone);
+  const candidateNames = (params.names || [])
+    .map((n) => (n || '').trim().toLowerCase())
+    .filter((n) => n.length >= 2 && !isDefaultNumericLabel(n));
+
+  for (const entry of allowed) {
+    const entryJid = (entry.jid || '').split(':')[0].trim().toLowerCase();
+    if (entryJid && candidateJids.has(entryJid)) {
+      return entry;
+    }
+
+    const entryPhone = normalizePhoneForWa(entry.phone || entry.jid);
+    if (entryPhone && candidatePhone) {
+      if (
+        entryPhone === candidatePhone ||
+        (entryPhone.length >= 10 && candidatePhone.length >= 10 && entryPhone.slice(-10) === candidatePhone.slice(-10))
+      ) {
+        return entry;
+      }
+    }
+
+    const entryName = (entry.name || '').trim().toLowerCase();
+    if (entryName.length >= 2 && !isDefaultNumericLabel(entryName)) {
+      for (const n of candidateNames) {
+        if (
+          n === entryName ||
+          (entryName.length >= 3 && (n.includes(entryName) || entryName.includes(n)))
+        ) {
+          return entry;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function findMatchingContactPolicy(params: {
+  jids?: Array<string | undefined | null>;
+  phone?: string;
+  names?: Array<string | undefined | null>;
+}): ContactPolicyEntry | null {
+  const list = (botConfig.contactPolicies || []).filter((p) => p.mode && p.mode !== 'normal');
+  if (list.length === 0) return null;
+
+  const candidateJids = new Set(
+    (params.jids || [])
+      .map((j) => (j || '').split(':')[0].trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const candidatePhone = normalizePhoneForWa(params.phone);
+  const candidateNames = (params.names || [])
+    .map((n) => (n || '').trim().toLowerCase())
+    .filter((n) => n.length >= 2 && !isDefaultNumericLabel(n));
+
+  for (const entry of list) {
+    const entryJid = (entry.jid || '').split(':')[0].trim().toLowerCase();
+    if (entryJid && candidateJids.has(entryJid)) return entry;
+
+    const entryPhone = normalizePhoneForWa(entry.phone || entry.jid);
+    if (entryPhone && candidatePhone) {
+      if (
+        entryPhone === candidatePhone ||
+        (entryPhone.length >= 10 && candidatePhone.length >= 10 && entryPhone.slice(-10) === candidatePhone.slice(-10))
+      ) {
+        return entry;
+      }
+    }
+
+    const entryName = (entry.name || '').trim().toLowerCase();
+    if (entryName.length >= 2 && !isDefaultNumericLabel(entryName)) {
+      for (const n of candidateNames) {
+        if (n === entryName || (entryName.length >= 3 && (n.includes(entryName) || entryName.includes(n)))) {
+          return entry;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function recordSelfChatTurn(turn: Omit<SelfChatTurnItem, 'id' | 'timestamp'>) {
+  selfChatHistory.push({
+    id: `sct_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    ...turn,
+    text: redactSecretsInText(turn.text),
+  });
+  if (selfChatHistory.length > 25) {
+    selfChatHistory = selfChatHistory.slice(-25);
+  }
+  saveJsonFileAsync(SELF_CHAT_FILE, selfChatHistory);
+}
+
+function applyCustomPromptHintToInsight(insight: MediaInsight, customPrompt: string): MediaInsight {
+  const hint = customPrompt.trim();
+  if (!hint) return insight;
+  if (/(প্রশংসা|সুন্দর|হ্যান্ডসাম|কিউট|মাশাআল্লাহ|ভালোবাস|লাভ|praise|compliment|cute|love|crush)/iu.test(hint)) {
+    return {
+      ...insight,
+      sentiment: insight.kind === 'photo' || insight.kind === 'video' ? 'praise_portrait' : 'affection_like',
+      recommendedReaction: insight.kind === 'photo' ? '😍' : '❤️',
+    };
+  }
+  if (/(ফানি|হাসি|মজা|রোস্ট|funny|roast|joke|meme)/iu.test(hint)) {
+    return {
+      ...insight,
+      sentiment: 'funny_laugh',
+      recommendedReaction: '😂',
+    };
+  }
+  if (/(যুক্তি|তর্ক|বুদ্ধি|logic|debate|question)/iu.test(hint)) {
+    return {
+      ...insight,
+      sentiment: 'logical_debate',
+      recommendedReaction: '🤔',
+    };
+  }
+  if (/(সমালোচনা|খারাপ|বাজে|critique|roast bad)/iu.test(hint)) {
+    return {
+      ...insight,
+      sentiment: 'bad_critique',
+      recommendedReaction: '👀',
+    };
+  }
+  return insight;
+}
+
+function collectDirectoryContacts(): Array<{ jid: string; lid?: string; phone: string; name: string }> {
+  const byKey = new Map<string, { jid: string; lid?: string; phone: string; name: string }>();
+
+  const upsert = (item: { jid?: string; lid?: string; phone?: string; name?: string }) => {
+    const rawJid = (item.jid || '').split(':')[0].trim();
+    if (rawJid.endsWith('@g.us') || rawJid.endsWith('@broadcast')) return;
+    const phone = normalizePhoneForWa(item.phone || (isPhoneJid(rawJid) ? rawJid : ''));
+    const lid = item.lid ? item.lid.split(':')[0] : isLidJid(rawJid) ? rawJid : undefined;
+    const jid = phone ? `${phone}@s.whatsapp.net` : rawJid;
+    if (!jid) return;
+
+    const key = phone ? `pn:${phone}` : `jid:${jid}`;
+    const existing = byKey.get(key);
+    const cleanName = (item.name || '').trim();
+    const resolvedName =
+      cleanName && !isDefaultNumericLabel(cleanName)
+        ? cleanName
+        : existing?.name && !isDefaultNumericLabel(existing.name)
+          ? existing.name
+          : phone
+            ? `+${phone}`
+            : lid
+              ? `Member • ${extractDigits(lid).slice(-4)}`
+              : jid.split('@')[0];
+
+    byKey.set(key, {
+      jid,
+      lid: lid || existing?.lid,
+      phone: phone || existing?.phone || '',
+      name: resolvedName,
+    });
+  };
+
+  for (const c of Object.values(knownContacts)) {
+    upsert(c);
+  }
+  for (const bucket of Object.values(knownGroupMembers)) {
+    for (const m of Object.values(bucket)) {
+      upsert(m);
+    }
+  }
+  for (const mem of Object.values(chatMemories)) {
+    if (mem.contactJid && !mem.contactJid.endsWith('@g.us') && !mem.contactJid.endsWith('@broadcast')) {
+      upsert({
+        jid: mem.contactJid,
+        phone: extractPhoneDigitsOnly(mem.contactJid),
+        name: mem.contactName,
+      });
+    }
+  }
+
+  return Array.from(byKey.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, 500);
+}
+
+function collectAllKnownGroupSummaries(): Array<{ jid: string; name: string }> {
+  const byJid = new Map<string, string>();
+  const add = (jid: string, name?: string) => {
+    if (!jid || !jid.endsWith('@g.us')) return;
+    const memName = chatMemories[sanitizeId(jid)]?.contactName;
+    const best = (name && name !== jid ? name : '') || (memName && memName !== jid ? memName : '') || byJid.get(jid) || jid;
+    byJid.set(jid, best);
+  };
+  for (const jid of Object.keys(botConfig.antilinkGroups || {})) add(jid);
+  for (const jid of Object.keys(botConfig.groupAiGroups || {})) add(jid);
+  for (const jid of Object.keys(botConfig.groupDirectives || {})) add(jid);
+  for (const jid of Object.keys(knownGroupMembers || {})) add(jid);
+  for (const mem of Object.values(chatMemories)) {
+    if (mem.contactJid?.endsWith('@g.us')) add(mem.contactJid, mem.contactName);
+  }
+  return Array.from(byJid.entries()).map(([jid, name]) => ({ jid, name }));
+}
+
 function persistDictionary() {
   if (dictionaryEntries.length > MAX_RAM_DICTIONARY_ITEMS) {
     dictionaryEntries = dictionaryEntries.slice(0, MAX_RAM_DICTIONARY_ITEMS);
@@ -821,10 +1263,26 @@ function persistNotes() {
 const eventLogs: BotLogEntry[] = [];
 const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
 const autoReplyCooldowns = new Map<string, number>();
+const storyReplyCooldowns = new Map<string, number>();
+const processedStoryIds = new Set<string>();
 const ownerTakeoverUntil = new Map<string, number>();
 const botSentMessageIds = new Set<string>();
 const summaryRefreshInFlight = new Set<string>();
 const lastSummaryRefreshAt = new Map<string, number>();
+
+function recordMediaStoryFeedItem(entry: Omit<MediaStoryFeedItem, 'id' | 'timestamp' | 'tokensUsedForRead'>) {
+  const item: MediaStoryFeedItem = {
+    id: `media_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    tokensUsedForRead: 0,
+    ...entry,
+  };
+  recentMediaStories.unshift(item);
+  if (recentMediaStories.length > 60) {
+    recentMediaStories.length = 60;
+  }
+  saveJsonFileAsync(STORIES_FILE, recentMediaStories);
+}
 
 const chatReplyQueues = new Map<string, Promise<void>>();
 const MAX_CONCURRENT_REPLIES = 8;
@@ -899,6 +1357,437 @@ function getActiveTakeovers() {
   return active;
 }
 
+async function executeZeroTokenSelfChatTurn(params: {
+  incomingText: string;
+  mediaInsight?: MediaInsight | null;
+}) {
+  const incomingText = params.incomingText.trim();
+  const mediaInsight = params.mediaInsight || null;
+  const memoryRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+
+  const directoryContacts = collectDirectoryContacts();
+  const knownGroups = collectAllKnownGroupSummaries().map((g) => ({
+    jid: g.jid,
+    name: g.name,
+    members: Object.values(knownGroupMembers[g.jid] || {}).map((m) => ({
+      jid: m.jid,
+      phone: m.phone,
+      name: m.name,
+    })),
+  }));
+  const recentMemories = Object.values(chatMemories)
+    .sort((a, b) => Date.parse(b.updatedAt || '') - Date.parse(a.updatedAt || ''))
+    .slice(0, 12);
+  const unreadNotes = inboxNotes.filter((n) => !n.resolved).slice(0, 12);
+
+  recordSelfChatTurn({
+    role: 'owner',
+    text: incomingText || mediaInsight?.compactContextLine || '[Media]',
+    mediaKind: mediaInsight?.isMedia ? mediaInsight.kind : undefined,
+  });
+
+  const fallbackOutreach: WebOutreachController = {
+    getSummary: () => ({
+      policy: {
+        dailyEmailLimit: 30,
+        dailyWhatsappLimit: 20,
+        whatsappMinDelayMs: 45000,
+        whatsappMaxDelayMs: 90000,
+        emailDelayMs: 1800,
+        preferredEmailProvider: 'gmail_oauth',
+        zeroTokenDraftDefault: true,
+        defaultLanguage: 'bn',
+        defaultOfferPitch: '',
+        crawlContactSubpages: true,
+        maxSitesPerSearch: 5,
+      },
+      stats: { date: new Date().toISOString().slice(0, 10), emailsSentToday: 0, whatsappSentToday: 0 },
+      totalLeads: 0,
+      verifiedLeadsCount: 0,
+      senders: [],
+      leads: [],
+      recentResearch: [],
+      capabilities: {},
+    }),
+    runResearch: async () => ({
+      research: {
+        id: 'none',
+        query: '',
+        providerUsed: 'duckduckgo',
+        tokensSpent: 0,
+        summary: 'Outreach router not initialized.',
+        urls: [],
+        emailsFound: 0,
+        phonesFound: 0,
+        createdAt: new Date().toISOString(),
+      },
+      leads: [],
+      fromCache: false,
+    }),
+    scrapeUrls: async () => ({
+      research: {
+        id: 'none',
+        query: '',
+        providerUsed: 'direct_url',
+        tokensSpent: 0,
+        summary: 'Outreach router not initialized.',
+        urls: [],
+        emailsFound: 0,
+        phonesFound: 0,
+        createdAt: new Date().toISOString(),
+      },
+      leads: [],
+      errors: [],
+    }),
+    verifyWhatsappLeads: async () => ({ checkedCount: 0, activeFound: 0 }),
+    draftMessage: async () => ({ subject: '', body: '', tokensSpent: 0, providerUsed: 'zero_token_template' }),
+    addAndActivateEmailSender: ({ email }) => ({
+      profile: {
+        id: 'none',
+        email,
+        label: email,
+        type: 'smtp_gmail',
+        host: 'smtp.gmail.com',
+        port: 465,
+        active: false,
+        hasSecret: false,
+        maskedSecret: '****',
+        createdAt: new Date().toISOString(),
+      },
+      deletedCount: 0,
+      isLikelyAppPassword: false,
+    }),
+    switchEmailSender: () => null,
+    deleteEmailSender: () => ({ removedCount: 0, remaining: [] }),
+    listEmailSenders: () => [],
+    sendEmailOutreach: async () => ({ sentCount: 0, failedCount: 0, providerUsed: 'none', results: [] }),
+    sendWhatsappOutreach: async () => ({ queued: false, sentCount: 0, totalTargets: 0, skippedMuted: 0 }),
+    updatePolicy: () => ({
+      dailyEmailLimit: 30,
+      dailyWhatsappLimit: 20,
+      whatsappMinDelayMs: 45000,
+      whatsappMaxDelayMs: 90000,
+      emailDelayMs: 1800,
+      preferredEmailProvider: 'gmail_oauth',
+      zeroTokenDraftDefault: true,
+      defaultLanguage: 'bn',
+      defaultOfferPitch: '',
+      crawlContactSubpages: true,
+      maxSitesPerSearch: 5,
+    }),
+    ingestExternalLead: ({ name, sourceUrl, topic, emails, phones, snippet }) => ({
+      id: 'none',
+      name: name || 'Lead',
+      sourceUrl,
+      domain: '',
+      topic: topic || '',
+      emails: emails || [],
+      phones: phones || [],
+      whatsappVerifiedPhones: [],
+      whatsappCheckedAt: null,
+      snippet: snippet || '',
+      emailSentCount: 0,
+      lastEmailSentAt: null,
+      whatsappSentCount: 0,
+      lastWhatsappSentAt: null,
+      createdAt: new Date().toISOString(),
+    }),
+    clearLeads: () => 0,
+  };
+
+  const copilotRes = await runZeroTokenSelfChatCopilot({
+    incomingText,
+    mediaInsight,
+    botConfig,
+    botStatus,
+    connectedPhone: currentPairingPhone || extractDigits(currentSocket?.user?.id) || '',
+    dailyStats: getDailyReplyStats(),
+    memoryRssMb,
+    directoryContacts,
+    knownGroups,
+    recentLogs: eventLogs.slice(0, 25),
+    recentMemories,
+    unreadNotes,
+    activeTakeovers: getActiveTakeovers(),
+    selfChatHistory,
+    pendingDraft: pendingSelfChatDraft,
+    outreach: outreachController || fallbackOutreach,
+    dispatchDirectDm: async ({ targets, messageText, originalInstruction }) => {
+      let deliveredCount = 0;
+      let draftCount = 0;
+      const targetLabels: string[] = [];
+
+      for (const target of targets.slice(0, 15)) {
+        const targetJid = target.jid || `${normalizePhoneForWa(target.phone)}@s.whatsapp.net`;
+        if (!targetJid) continue;
+        targetLabels.push(target.name || `+${target.phone}`);
+        let sentLive = false;
+        if (currentSocket && botStatus === 'connected') {
+          try {
+            if (botConfig.humanTypingEnabled) {
+              void currentSocket.sendPresenceUpdate('composing', targetJid).catch(() => {});
+              await sleep(450);
+            }
+            await sendTrackedMessage(currentSocket, targetJid, { text: messageText });
+            sentLive = true;
+            deliveredCount += 1;
+            dailyReplyCount += 1;
+          } finally {
+            if (botConfig.humanTypingEnabled) {
+              void currentSocket.sendPresenceUpdate('paused', targetJid).catch(() => {});
+            }
+          }
+        } else {
+          draftCount += 1;
+        }
+
+        await recordZeroTokenMediaExchange({
+          chatJid: targetJid,
+          displayName: target.name || `+${target.phone}`,
+          isGroup: false,
+          incomingSummary: `[Self-Chat Direct Command]: ${originalInstruction}`,
+          replyText: messageText,
+        });
+
+        recentDirectCommands.unshift({
+          id: `dcmd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: new Date().toISOString(),
+          actionType: 'dm_knock',
+          targetLabel: target.name || `+${target.phone}`,
+          targetJid,
+          mentionedJids: [],
+          instruction: originalInstruction,
+          messageSent: messageText,
+          deliveredLive: sentLive,
+          usedAi: false,
+          providerUsed: 'offline_emotion',
+        });
+      }
+      if (recentDirectCommands.length > 30) recentDirectCommands.length = 30;
+      return { deliveredCount, draftCount, targetLabels };
+    },
+    dispatchGroupMention: async ({ groupJid, groupName, members, messageText, originalInstruction }) => {
+      const mentionedJids = members.map((m) => m.jid || `${normalizePhoneForWa(m.phone)}@s.whatsapp.net`).filter(Boolean);
+      let deliveredLive = false;
+      if (currentSocket && botStatus === 'connected') {
+        if (botConfig.humanTypingEnabled) {
+          void currentSocket.sendPresenceUpdate('composing', groupJid).catch(() => {});
+          await sleep(450);
+        }
+        try {
+          await sendTrackedMessage(currentSocket, groupJid, {
+            text: messageText,
+            ...(mentionedJids.length > 0 ? { mentions: mentionedJids } : {}),
+          });
+          deliveredLive = true;
+          dailyReplyCount += 1;
+        } finally {
+          if (botConfig.humanTypingEnabled) {
+            void currentSocket.sendPresenceUpdate('paused', groupJid).catch(() => {});
+          }
+        }
+      }
+      await recordZeroTokenMediaExchange({
+        chatJid: groupJid,
+        displayName: groupName,
+        isGroup: true,
+        senderNameInGroup: botConfig.ownerName || 'Sir',
+        incomingSummary: `[Self-Chat Group @Mention]: ${originalInstruction}`,
+        replyText: messageText,
+      });
+      recentDirectCommands.unshift({
+        id: `dcmd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date().toISOString(),
+        actionType: 'group_mention',
+        targetLabel: groupName,
+        targetJid: groupJid,
+        mentionedJids,
+        instruction: originalInstruction,
+        messageSent: messageText,
+        deliveredLive,
+        usedAi: false,
+        providerUsed: 'offline_emotion',
+      });
+      if (recentDirectCommands.length > 30) recentDirectCommands.length = 30;
+      return { deliveredLive, groupName, mentionedCount: mentionedJids.length };
+    },
+    kickGroupMember: async ({ groupJid, groupName, targetPhoneOrName }) => {
+      if (!currentSocket || botStatus !== 'connected') {
+        return { ok: false, reason: 'WhatsApp কানেক্টেড নেই। আগে হোয়াটসঅ্যাপ কানেক্ট করুন।' };
+      }
+      try {
+        const meta = await getCachedGroupMetadata(currentSocket, groupJid);
+        const botIsAdmin = isParticipantAdmin(
+          meta,
+          currentSocket.user?.id,
+          (currentSocket.user as { lid?: string } | undefined)?.lid
+        );
+        if (!botIsAdmin) {
+          return {
+            ok: false,
+            reason: `আপনার নাম্বার "${meta.subject || groupName}" গ্রুপে অ্যাডমিন নয়, তাই মেম্বার কিক করা যাবে না।`,
+          };
+        }
+
+        const qDigits = normalizePhoneForWa(targetPhoneOrName);
+        const qSuffix = qDigits.length >= 7 ? qDigits.slice(-10) : '';
+        const qLower = targetPhoneOrName.trim().toLowerCase();
+
+        const cachedMembers = Object.values(knownGroupMembers[groupJid] || {});
+        const cachedMatch = cachedMembers.find(
+          (m) =>
+            (qSuffix && normalizePhoneForWa(m.phone || m.jid).slice(-10) === qSuffix) ||
+            (qLower.length >= 2 && m.name && m.name.toLowerCase().includes(qLower))
+        );
+
+        const participants = meta.participants || [];
+        const matchedParticipant = participants.find((p) => {
+          const pId = (p.id || '').toLowerCase();
+          const pPn = normalizePhoneForWa((p as { phoneNumber?: string }).phoneNumber || p.id);
+          const pSfx = pPn.length >= 7 ? pPn.slice(-10) : '';
+          if (qSuffix && pSfx && pSfx === qSuffix) return true;
+          if (cachedMatch) {
+            if (pId === (cachedMatch.jid || '').toLowerCase() || (cachedMatch.lid && pId === cachedMatch.lid.toLowerCase())) {
+              return true;
+            }
+          }
+          if (qSuffix && extractDigits(p.id).slice(-10) === qSuffix) return true;
+          return false;
+        });
+
+        const removeJid = matchedParticipant?.id || cachedMatch?.lid || cachedMatch?.jid || (qDigits ? `${qDigits}@s.whatsapp.net` : '');
+        if (!removeJid) {
+          return { ok: false, reason: `"${targetPhoneOrName}"-কে গ্রুপের অংশগ্রহণকারীদের মধ্যে খুঁজে পাওয়া যায়নি।` };
+        }
+        if (matchedParticipant?.admin === 'admin' || matchedParticipant?.admin === 'superadmin') {
+          return { ok: false, reason: 'টার্গেট মেম্বার এই গ্রুপের অ্যাডমিন — WhatsApp গ্রুপ অ্যাডমিনকে সরাসরি কিক করা অনুমোদিত নয়।' };
+        }
+
+        await currentSocket.groupParticipantsUpdate(groupJid, [removeJid], 'remove');
+        const label = cachedMatch?.name || targetPhoneOrName;
+        pushLog('antilink', meta.subject || groupName, `Self-Chat Kicked ${label} (${removeJid})`, 'success');
+        return { ok: true, kickedLabel: label, reason: 'Kicked cleanly' };
+      } catch (err) {
+        return { ok: false, reason: `গ্রুপ থেকে কিক করা যায়নি: ${(err as Error).message}` };
+      }
+    },
+    upsertContactPolicies: async (entries) => {
+      const current = [...(botConfig.contactPolicies || [])];
+      const nowIso = new Date().toISOString();
+      for (const item of entries) {
+        const pn = normalizePhoneForWa(item.phone || item.jid);
+        const idx = current.findIndex(
+          (c) =>
+            (item.jid && c.jid === item.jid) ||
+            (pn && normalizePhoneForWa(c.phone || c.jid).slice(-10) === pn.slice(-10))
+        );
+        if (item.mode === 'normal') {
+          if (idx !== -1) current.splice(idx, 1);
+          continue;
+        }
+        const nextEntry: ContactPolicyEntry = {
+          id: idx !== -1 ? current[idx].id : sanitizeId(`cpol_${Date.now()}_${current.length}`),
+          name: item.name || (pn ? `+${pn}` : 'Contact'),
+          phone: pn,
+          jid: item.jid || (pn ? `${pn}@s.whatsapp.net` : undefined),
+          mode: item.mode,
+          note: item.note || (idx !== -1 ? current[idx].note : undefined),
+          updatedAt: nowIso,
+        };
+        if (idx !== -1) {
+          current[idx] = nextEntry;
+        } else {
+          current.unshift(nextEntry);
+        }
+      }
+      botConfig = normalizeConfig({
+        ...botConfig,
+        contactPolicies: current.slice(0, 200),
+        configUpdatedAt: nowIso,
+      });
+      persistConfig(true);
+      return botConfig.contactPolicies;
+    },
+    updateSystemSettings: async (patch) => {
+      botConfig = normalizeConfig({
+        ...botConfig,
+        ...(patch as Partial<BotConfig>),
+        configUpdatedAt: new Date().toISOString(),
+      });
+      persistConfig(true);
+    },
+    clearTakeovers: (targetJid?: string) => {
+      if (targetJid) {
+        const existed = ownerTakeoverUntil.delete(targetJid);
+        return existed ? 1 : 0;
+      }
+      const count = ownerTakeoverUntil.size;
+      ownerTakeoverUntil.clear();
+      return count;
+    },
+    runSelfHealNow: async () => {
+      if (!selfHealingWatchdog) {
+        pruneRuntimeCaches();
+        return {
+          rssBeforeMb: memoryRssMb,
+          rssAfterMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+          actionsTaken: ['Pruned caches cleanly.'],
+          botStatus,
+        };
+      }
+      return selfHealingWatchdog.runHealCycle('manual');
+    },
+    getSystemDiagnostics: () => ({
+      selfPing: getRuntimeSelfPingSnapshot(),
+      watchdog: selfHealingWatchdog
+        ? (() => {
+            const st = selfHealingWatchdog.getStatus();
+            return {
+              enabled: st.enabled,
+              cycleCount: st.cycleCount,
+              totalHealsApplied: st.totalHealsApplied,
+              processErrorsIntercepted: st.processErrorsIntercepted,
+            };
+          })()
+        : null,
+      mobileWorkers: mobileOffloadQueue.getActiveWorkers().map((w) => ({
+        deviceLabel: w.deviceLabel,
+        deviceMemoryGb: w.deviceMemoryGb,
+        networkType: w.networkType,
+        jobsCompleted: w.jobsCompleted,
+      })),
+      firestore: getFirestoreAdminDiagnostics(),
+      schedulesCount: autonomousAgentEngine ? autonomousAgentEngine.getSnapshot().schedules.length : 0,
+    }),
+    runAutonomousMission: async (goal: string) => {
+      if (!autonomousAgentEngine) {
+        return {
+          finalReport: '⚠️ অটোনোমাস এজেন্ট ইঞ্জিন এখনো প্রস্তুত নয়।',
+          tokensUsed: 0,
+          providerUsed: 'none',
+          stepsCount: 0,
+        };
+      }
+      const run = await autonomousAgentEngine.executeMission({ goal, source: 'self_chat' });
+      return {
+        finalReport: run.finalReport,
+        tokensUsed: run.tokensUsed,
+        providerUsed: run.providerUsed,
+        stepsCount: run.steps.length,
+      };
+    },
+  });
+
+  pendingSelfChatDraft = copilotRes.nextPendingDraft;
+  recordSelfChatTurn({
+    role: 'assistant',
+    text: copilotRes.replyText,
+    actionSummary: copilotRes.actionSummary,
+  });
+
+  return copilotRes;
+}
+
 function pruneRuntimeCaches() {
   const now = Date.now();
   for (const [jid, cached] of groupMetadataCache.entries()) {
@@ -916,10 +1805,21 @@ function pruneRuntimeCaches() {
       autoReplyCooldowns.delete(jid);
     }
   }
+  for (const [jid, ts] of storyReplyCooldowns.entries()) {
+    if (now - ts > 24 * 60 * 60 * 1000) {
+      storyReplyCooldowns.delete(jid);
+    }
+  }
   for (const [chatId, ts] of lastSummaryRefreshAt.entries()) {
     if (now - ts > 60 * 60 * 1000) {
       lastSummaryRefreshAt.delete(chatId);
     }
+  }
+  for (const [mid, exp] of processedSelfMsgIds.entries()) {
+    if (exp <= now) processedSelfMsgIds.delete(mid);
+  }
+  for (const [fp, exp] of recentSelfBotTextCache.entries()) {
+    if (exp <= now) recentSelfBotTextCache.delete(fp);
   }
   pruneExpiredRateLimits();
   clientBotManager.pruneCaches();
@@ -1484,6 +2384,7 @@ async function runExecutiveAssistantTurn(params: {
   contactJid: string;
   contactName: string;
   incomingText: string;
+  contactPolicy?: { mode: ContactPolicyMode; note?: string };
 }): Promise<{
   replyText: string;
   detectedDistrict: string;
@@ -1543,6 +2444,7 @@ async function runExecutiveAssistantTurn(params: {
       incomingText: params.incomingText,
       contactName: params.contactName,
       dictionaryEntries: relevantDictionary,
+      contactPolicy: params.contactPolicy,
     });
     replyText = result.replyText;
     detectedDistrict = result.detectedDistrict;
@@ -1582,6 +2484,7 @@ async function runExecutiveAssistantTurn(params: {
       incomingText: params.incomingText,
       contactName: params.contactName,
       dictionaryEntries: relevantDictionary,
+      contactPolicy: params.contactPolicy,
     });
     replyText = fallbackResult.replyText;
     providerUsed = fallbackResult.providerUsed || 'offline_emotion';
@@ -1875,31 +2778,385 @@ async function runGroupCloneTurn(params: {
   return result;
 }
 
+async function recordZeroTokenMediaExchange(params: {
+  chatJid: string;
+  displayName: string;
+  isGroup: boolean;
+  senderNameInGroup?: string;
+  incomingSummary: string;
+  replyText?: string;
+}) {
+  const chatId = sanitizeId(params.chatJid);
+  const existing = await ensureChatMemoryHydrated(chatId, params.chatJid, params.displayName);
+  const nowIso = new Date().toISOString();
+  const userText =
+    params.isGroup && params.senderNameInGroup
+      ? `[${params.senderNameInGroup}]: ${params.incomingSummary}`
+      : params.incomingSummary;
+
+  const userTurn: ChatTurn = { role: 'user', text: userText, timestamp: nowIso };
+  const turnsToPersist: Array<ChatTurn & { providerUsed?: string; latencyMs?: number }> = [userTurn];
+  const nextTurnsList = [...(existing?.turns || []), userTurn];
+
+  if (params.replyText) {
+    const assistantTurn: ChatTurn = { role: 'assistant', text: params.replyText, timestamp: nowIso };
+    nextTurnsList.push(assistantTurn);
+    turnsToPersist.push({ ...assistantTurn, providerUsed: 'zero_token_media', latencyMs: 1 });
+    archiveTurnToCloud(chatId, assistantTurn);
+  }
+
+  const updatedMemory: ChatMemoryRecord = {
+    chatId,
+    contactJid: params.chatJid,
+    contactName: existing?.contactName || params.displayName || extractDigits(params.chatJid) || 'Contact',
+    detectedDistrict: existing?.detectedDistrict || 'Standard',
+    lastSummary: existing?.lastSummary || params.incomingSummary.slice(0, 120),
+    turns: nextTurnsList.slice(-20),
+    updatedAt: nowIso,
+  };
+  chatMemories[chatId] = updatedMemory;
+  persistMemories();
+  void adminSaveDocument('chat_memories', chatId, {
+    ownerId: activeCloudOwnerId,
+    ...updatedMemory,
+  });
+  void pgSaveChatMemory(activeCloudOwnerId, updatedMemory, turnsToPersist);
+  archiveTurnToCloud(chatId, userTurn);
+  scheduleBackgroundSummaryRefresh(chatId);
+}
+
+function getPreviousAssistantRepliesForChat(chatJid: string): string[] {
+  const chatId = sanitizeId(chatJid);
+  const turns = chatMemories[chatId]?.turns || [];
+  return turns
+    .filter((t) => t.role === 'assistant')
+    .slice(-8)
+    .map((t) => t.text);
+}
+
+function shouldUsePureZeroTokenMediaReply(insight: MediaInsight, isDirectlyAddressed: boolean): boolean {
+  if (!insight.isMedia) return false;
+  if (!botConfig.aiAssistantEnabled || (!geminiPool.hasKeys() && !openRouterReader.hasKeys())) {
+    return true;
+  }
+  if (!botConfig.mediaZeroTokenReplyMode) {
+    // Hybrid mode: Text AI runs when possible, but reading media itself ALWAYS uses 0 tokens
+    return insight.kind === 'reaction' && !insight.caption;
+  }
+  const captionLen = (insight.caption || '').trim().length;
+  // Pure Zero-Token mode: stickers, photos, videos, stories & reactions use 0 API tokens unless someone typed a rich multi-word question/argument (>18 chars)
+  if (insight.kind === 'sticker' || insight.kind === 'reaction') return true;
+  if (captionLen <= 18 && !isDirectlyAddressed) return true;
+  if (captionLen <= 10) return true;
+  return false;
+}
+
+async function processStoryBroadcast(sock: WASocket, msg: WAMessage) {
+  if (!msg.message || msg.key.fromMe) return;
+  if (!botConfig.mediaIntelligenceEnabled || !botConfig.storyAutoReadEnabled) return;
+
+  const msgId = msg.key.id || '';
+  if (msgId) {
+    if (processedStoryIds.has(msgId)) return;
+    processedStoryIds.add(msgId);
+    if (processedStoryIds.size > 500) {
+      const oldest = processedStoryIds.values().next().value;
+      if (oldest) processedStoryIds.delete(oldest);
+    }
+  }
+
+  const rawPosterJid = msg.key.participant || (msg.key as { participantAlt?: string }).participantAlt || '';
+  if (!rawPosterJid || rawPosterJid === 'status@broadcast') return;
+
+  const posterAlt = (msg.key as { participantAlt?: string }).participantAlt;
+  const posterLid = isLidJid(rawPosterJid)
+    ? rawPosterJid
+    : isLidJid(posterAlt)
+      ? posterAlt
+      : undefined;
+  let posterPnJid = isPhoneJid(rawPosterJid)
+    ? rawPosterJid
+    : isPhoneJid(posterAlt)
+      ? posterAlt
+      : undefined;
+
+  if (!posterPnJid && posterLid) {
+    const mappedPn = await resolveLidToPnDigits(sock, posterLid);
+    if (mappedPn) {
+      posterPnJid = `${mappedPn}@s.whatsapp.net`;
+    }
+  }
+
+  const posterTargetJid = posterPnJid || rawPosterJid;
+  const posterPhone = extractPhoneDigitsOnly(posterPnJid);
+  const contactInfo = findContactForIdentity({
+    jid: posterTargetJid,
+    lid: posterLid,
+    phone: posterPhone,
+  });
+  const posterName =
+    (msg.pushName && !isDefaultNumericLabel(msg.pushName) ? msg.pushName.trim() : '') ||
+    (contactInfo?.name && !isDefaultNumericLabel(contactInfo.name) ? contactInfo.name : '') ||
+    (posterPhone ? `+${posterPhone}` : 'Friend');
+
+  const botDigits = extractDigits(sock.user?.id);
+  const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
+  const posterDigits = extractDigits(posterTargetJid);
+  if ((botDigits && posterDigits === botDigits) || (botLidDigits && posterDigits === botLidDigits)) {
+    return;
+  }
+
+  // Enforce Custom Story Whitelist when selected_only mode is active
+  const matchedWhitelist = findMatchingStoryWhitelistContact({
+    jids: [posterTargetJid, posterPnJid, posterLid, rawPosterJid],
+    phone: posterPhone,
+    names: [msg.pushName, contactInfo?.name, posterName],
+  });
+  if (botConfig.storyWhitelistMode === 'selected_only' && !matchedWhitelist) {
+    return;
+  }
+
+  const insight = await readMediaMessageZeroToken(msg, sock);
+
+  if (botConfig.humanTypingEnabled) {
+    void sock.readMessages([msg.key]).catch(() => {});
+  }
+
+  const cooldownKey = `story:${posterTargetJid}`;
+  const lastStoryAction = storyReplyCooldowns.get(cooldownKey) || 0;
+  const storyCooldownWindow = botConfig.storyCooldownMs ?? 15 * 60 * 1000;
+  const isTakeoverPaused = Date.now() < (ownerTakeoverUntil.get(posterTargetJid) || 0);
+  const daily = getDailyReplyStats();
+  const canEngagePoster =
+    !isTakeoverPaused &&
+    daily.count < daily.limit &&
+    Date.now() - lastStoryAction >= storyCooldownWindow;
+
+  let reactionSent = '';
+  let replySent = '';
+  let replyMode: MediaStoryFeedItem['replyMode'] = 'read_only';
+
+  if (canEngagePoster && (botConfig.storyAutoReactEnabled || botConfig.storyAutoReplyEnabled)) {
+    storyReplyCooldowns.set(cooldownKey, Date.now());
+
+    if (botConfig.storyAutoReactEnabled && insight.recommendedReaction) {
+      reactionSent = insight.recommendedReaction;
+      await sock
+        .sendMessage(
+          'status@broadcast',
+          { react: { text: reactionSent, key: msg.key } },
+          { statusJidList: [posterTargetJid] }
+        )
+        .catch(() => {});
+    }
+
+    if (botConfig.storyAutoReplyEnabled) {
+      const customNote = matchedWhitelist?.customPrompt?.trim() || '';
+      const useHybridTextAi =
+        !botConfig.mediaZeroTokenReplyMode &&
+        (insight.caption.trim().length > 14 || customNote.length > 0) &&
+        botConfig.aiAssistantEnabled &&
+        (geminiPool.hasKeys() || openRouterReader.hasKeys());
+
+      if (useHybridTextAi) {
+        const res = await runExecutiveAssistantTurn({
+          contactJid: posterTargetJid,
+          contactName: posterName,
+          incomingText: customNote
+            ? `${insight.compactContextLine}\n[Owner Custom Story Instruction for ${posterName}: ${customNote}]`
+            : insight.compactContextLine,
+        });
+        replySent = res.replyText;
+        replyMode = res.usedFallback ? 'zero_token' : 'hybrid_text_ai';
+      } else {
+        const adjustedInsight = applyCustomPromptHintToInsight(insight, customNote);
+        const generated = generateZeroTokenMediaReply({
+          insight: adjustedInsight,
+          context: 'story',
+          senderName: posterName,
+          tone: botConfig.assistantTone,
+          ownerName: botConfig.ownerName,
+          previousReplies: getPreviousAssistantRepliesForChat(posterTargetJid),
+        });
+        replySent = generated.replyText;
+        replyMode = 'zero_token';
+        await recordZeroTokenMediaExchange({
+          chatJid: posterTargetJid,
+          displayName: posterName,
+          isGroup: false,
+          incomingSummary: insight.compactContextLine,
+          replyText: replySent,
+        });
+      }
+
+      if (replySent) {
+        if (botConfig.humanTypingEnabled) {
+          void sock.sendPresenceUpdate('composing', posterTargetJid).catch(() => {});
+        }
+        try {
+          await sendTrackedMessage(
+            sock,
+            posterTargetJid,
+            { text: replySent },
+            { quoted: msg }
+          );
+          dailyReplyCount += 1;
+        } finally {
+          if (botConfig.humanTypingEnabled) {
+            void sock.sendPresenceUpdate('paused', posterTargetJid).catch(() => {});
+          }
+        }
+      }
+    }
+  }
+
+  tokenTelemetry.recordZeroTokenMediaRead({
+    kind: insight.kind,
+    isStory: true,
+    repliedWithZeroTokens: replyMode === 'zero_token',
+  });
+
+  recordMediaStoryFeedItem({
+    source: 'story',
+    senderName: posterName,
+    senderJid: posterTargetJid,
+    kind: insight.kind,
+    sentiment: insight.sentiment,
+    banglaSceneLabel: insight.banglaSceneLabel,
+    compactContextLine: insight.compactContextLine,
+    reactionSent,
+    replySent,
+    replyMode,
+  });
+
+  pushLog(
+    'autoreply',
+    `Story · ${posterName}`,
+    `Read Story (${insight.banglaSceneLabel}) [0 Read Tokens]${reactionSent ? ` · React ${reactionSent}` : ''}${replySent ? ` · SMS Replied` : ''}`,
+    replySent || reactionSent ? 'success' : 'info'
+  );
+}
+
 // ----------------------------------------------------------------------------
 // Live Baileys Message Handler
 // ----------------------------------------------------------------------------
 async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   if (!msg.message) return;
   const remoteJid = msg.key.remoteJid;
-  if (
-    !remoteJid ||
-    remoteJid === 'status@broadcast' ||
-    remoteJid.endsWith('@broadcast') ||
-    remoteJid.endsWith('@newsletter')
-  ) {
+  if (!remoteJid || remoteJid.endsWith('@newsletter')) {
+    return;
+  }
+
+  // Handle WhatsApp Stories (status@broadcast) with 0-Token Media Reader
+  if (remoteJid === 'status@broadcast') {
+    await processStoryBroadcast(sock, msg);
+    return;
+  }
+
+  if (remoteJid.endsWith('@broadcast')) {
     return;
   }
 
   const isGroup = isJidGroup(remoteJid) ?? false;
   const text = extractMessageText(msg.message);
+  const unwrappedMsg = unwrapBaileysMessageContent(msg.message).unwrapped;
+  const isIncomingReaction = Boolean(unwrappedMsg?.reactionMessage);
   const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
   const senderAlt = (msg.key as { participantAlt?: string }).participantAlt;
 
-  // Detect manual human owner reply (in DM OR Group) -> save to memory & pause AI temporarily
-  if (msg.key.fromMe) {
+  const selfBotDigits = extractDigits(sock.user?.id);
+  const selfBotLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
+  const selfPairingDigits = extractDigits(currentPairingPhone);
+  const selfRemoteDigits = extractDigits(remoteJid);
+  const isSelfChatTarget =
+    !isGroup &&
+    Boolean(selfRemoteDigits) &&
+    ((Boolean(selfBotDigits) && selfRemoteDigits === selfBotDigits) ||
+      (Boolean(selfBotLidDigits) && selfRemoteDigits === selfBotLidDigits) ||
+      (Boolean(selfPairingDigits) && selfRemoteDigits === selfPairingDigits));
+
+  // Self-Chat ("Message Yourself") direct Owner Copilot + Zero-Token Video Diagnostics
+  if (isSelfChatTarget && msg.key.fromMe) {
+    const msgId = msg.key.id || '';
+    if ((msgId && botSentMessageIds.has(msgId)) || isIncomingReaction) {
+      return;
+    }
+    const fpKey = `${remoteJid}|${text.slice(0, 80)}`;
+    const fpExp = recentSelfBotTextCache.get(fpKey);
+    if (fpExp && fpExp > Date.now()) {
+      return;
+    }
+    if (msgId) {
+      const prevExp = processedSelfMsgIds.get(msgId);
+      if (prevExp && prevExp > Date.now()) {
+        return;
+      }
+      processedSelfMsgIds.set(msgId, Date.now() + 10 * 60_000);
+      if (processedSelfMsgIds.size > 200) {
+        const firstKey = processedSelfMsgIds.keys().next().value;
+        if (firstKey) processedSelfMsgIds.delete(firstKey);
+      }
+    }
+
+    const hasSelfMedia = Boolean(
+      unwrappedMsg?.imageMessage ||
+        unwrappedMsg?.videoMessage ||
+        unwrappedMsg?.stickerMessage ||
+        unwrappedMsg?.audioMessage
+    );
+
+    const isExplicitGeminiPrefix =
+      text.toLowerCase().startsWith(`${PREFIX}ai `) || text.toLowerCase().startsWith(`${PREFIX}gemini `);
+
+    if (botConfig.selfChatCopilotEnabled !== false && !isExplicitGeminiPrefix && (text || hasSelfMedia)) {
+      enqueuePrivateReply(remoteJid, async () => {
+        if (currentSocket !== sock || botConfig.selfChatCopilotEnabled === false) return;
+        let mediaInsight: MediaInsight | null = null;
+        if (hasSelfMedia) {
+          mediaInsight = await readMediaMessageZeroToken(msg, sock);
+        }
+        const effectiveText = text || mediaInsight?.caption || '';
+        if (!effectiveText && !mediaInsight?.isMedia) return;
+
+        if (botConfig.humanTypingEnabled) {
+          void sock.readMessages([msg.key]).catch(() => {});
+          void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+        }
+        try {
+          const copilotRes = await executeZeroTokenSelfChatTurn({
+            incomingText: effectiveText,
+            mediaInsight,
+          });
+          // Register text fingerprint BEFORE sending so Baileys echo never loops
+          const replyFp = `${remoteJid}|${copilotRes.replyText.slice(0, 80)}`;
+          recentSelfBotTextCache.set(replyFp, Date.now() + 25_000);
+          if (recentSelfBotTextCache.size > 80) {
+            const firstFp = recentSelfBotTextCache.keys().next().value;
+            if (firstFp) recentSelfBotTextCache.delete(firstFp);
+          }
+
+          await sendTrackedMessage(sock, remoteJid, { text: copilotRes.replyText }, { quoted: msg });
+          pushLog(
+            'autoreply',
+            'Self-Chat Copilot',
+            copilotRes.actionSummary,
+            'success'
+          );
+        } finally {
+          if (botConfig.humanTypingEnabled) {
+            void sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+          }
+        }
+      });
+      return;
+    }
+  }
+
+  // Detect manual human owner reply (in external DM OR Group — never in Self-Chat) -> save to memory & pause AI temporarily
+  if (msg.key.fromMe && !isSelfChatTarget) {
     const msgId = msg.key.id;
     const isCommand = text.startsWith(PREFIX);
-    if (msgId && !botSentMessageIds.has(msgId) && !isCommand && text) {
+    if (msgId && !botSentMessageIds.has(msgId) && !isCommand && !isIncomingReaction && text) {
       let chatDisplayName = msg.pushName;
       if (isGroup) {
         const meta = await getCachedGroupMetadata(sock, remoteJid).catch(() => null);
@@ -2208,8 +3465,17 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     });
   }
 
+  const hasNonTextMedia = Boolean(
+    unwrappedMsg?.imageMessage ||
+      unwrappedMsg?.videoMessage ||
+      unwrappedMsg?.stickerMessage ||
+      unwrappedMsg?.audioMessage ||
+      unwrappedMsg?.reactionMessage
+  );
+
   if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[remoteJid] === true) {
-    if (msg.key.fromMe || !text) return;
+    if (msg.key.fromMe) return;
+    if (!text && (!hasNonTextMedia || !botConfig.mediaIntelligenceEnabled)) return;
 
     const botDigits = extractDigits(sock.user?.id);
     const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
@@ -2227,6 +3493,23 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       (msg.pushName && !isDefaultNumericLabel(msg.pushName) ? msg.pushName.trim() : '') ||
       (contactInfo?.name && !isDefaultNumericLabel(contactInfo.name) ? contactInfo.name : '') ||
       (resolvedSenderPhone ? `+${resolvedSenderPhone}` : 'Member');
+
+    // Enforce global contactPolicies mute_ai (and exclusion commands) inside Group AI Clone too
+    const groupSenderPolicy = findMatchingContactPolicy({
+      jids: [resolvedSenderPnJid, senderJid, senderAlt, resolvedSenderLid],
+      phone: resolvedSenderPhone,
+      names: [senderName],
+    });
+    if (groupSenderPolicy?.mode === 'mute_ai') {
+      pushLog(
+        'autoreply',
+        `${extractDigits(remoteJid)} · ${senderName}`,
+        'Contact Policy (Off/Mute): skipped Group AI reaction & reply [0 Tokens].',
+        'blocked'
+      );
+      return;
+    }
+
     const isDirectlyAddressed = isDirectlyAddressedInGroup(msg, sock, text, botConfig.ownerName);
 
     enqueuePrivateReply(remoteJid, async () => {
@@ -2234,18 +3517,43 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         return;
       }
 
+      let mediaInsight: MediaInsight | null = null;
+      if (hasNonTextMedia && botConfig.mediaIntelligenceEnabled) {
+        mediaInsight = await readMediaMessageZeroToken(msg, sock);
+        // Ignore reactions in groups unless the user specifically reacted to our own/owner message
+        if (mediaInsight.kind === 'reaction' && !mediaInsight.reactionTargetFromMe) {
+          return;
+        }
+        // Ignore empty/removed reactions (text === '')
+        if (mediaInsight.kind === 'reaction' && !mediaInsight.reactionEmojiReceived) {
+          return;
+        }
+      }
+
+      const effectiveIncomingText = mediaInsight?.isMedia
+        ? mediaInsight.compactContextLine
+        : text;
+      if (!effectiveIncomingText) return;
+
       const metadata = await getCachedGroupMetadata(sock, remoteJid).catch(() => null);
       const groupName = metadata?.subject || extractDigits(remoteJid) || 'Group Chat';
 
       const pausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
       if (Date.now() < pausedUntil) {
+        if (mediaInsight?.isMedia) {
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: mediaInsight.kind,
+            isStory: false,
+            repliedWithZeroTokens: false,
+          });
+        }
         await runGroupCloneTurn({
           groupJid: remoteJid,
           groupName,
           senderName,
           senderJid: resolvedSenderPnJid || senderJid,
           senderAlt: resolvedSenderPnJid || senderAlt,
-          incomingText: text,
+          incomingText: effectiveIncomingText,
           isDirectlyAddressed,
           canTextReply: false,
           observeOnly: true,
@@ -2255,13 +3563,20 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
 
       const daily = getDailyReplyStats();
       if (daily.count >= daily.limit) {
+        if (mediaInsight?.isMedia) {
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: mediaInsight.kind,
+            isStory: false,
+            repliedWithZeroTokens: false,
+          });
+        }
         await runGroupCloneTurn({
           groupJid: remoteJid,
           groupName,
           senderName,
           senderJid: resolvedSenderPnJid || senderJid,
           senderAlt: resolvedSenderPnJid || senderAlt,
-          incomingText: text,
+          incomingText: effectiveIncomingText,
           isDirectlyAddressed,
           canTextReply: false,
           observeOnly: true,
@@ -2283,6 +3598,114 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       const lastGroupSent = autoReplyCooldowns.get(cooldownBucketKey) || 0;
       const canTextReply = Date.now() - lastGroupSent >= cooldownWindowMs;
 
+      // Zero-Token Media Path for pure Stickers/Photos/Videos/Reactions in Group
+      if (
+        mediaInsight?.isMedia &&
+        !matchedTarget &&
+        shouldUsePureZeroTokenMediaReply(mediaInsight, isDirectlyAddressed)
+      ) {
+        const mode = botConfig.groupAiMode || 'smart_blend';
+        const allowReply =
+          (mode !== 'mention_only' || isDirectlyAddressed) &&
+          canTextReply &&
+          mediaInsight.kind !== 'reaction';
+        const reactionEmoji =
+          botConfig.groupReactionEnabled !== false && mediaInsight.kind !== 'reaction'
+            ? mediaInsight.recommendedReaction
+            : '';
+
+        if (reactionEmoji) {
+          await sock
+            .sendMessage(remoteJid, { react: { text: reactionEmoji, key: msg.key } })
+            .catch(() => {});
+        }
+
+        let replyText = '';
+        if (allowReply) {
+          const generated = generateZeroTokenMediaReply({
+            insight: mediaInsight,
+            context: 'group',
+            senderName,
+            tone: botConfig.assistantTone,
+            ownerName: botConfig.ownerName,
+            previousReplies: getPreviousAssistantRepliesForChat(remoteJid),
+          });
+          replyText = generated.replyText;
+        }
+
+        await recordZeroTokenMediaExchange({
+          chatJid: remoteJid,
+          displayName: groupName,
+          isGroup: true,
+          senderNameInGroup: senderName,
+          incomingSummary: mediaInsight.compactContextLine,
+          replyText: replyText || undefined,
+        });
+
+        tokenTelemetry.recordZeroTokenMediaRead({
+          kind: mediaInsight.kind,
+          isStory: false,
+          repliedWithZeroTokens: Boolean(replyText),
+        });
+
+        recordMediaStoryFeedItem({
+          source: 'group',
+          senderName: `${groupName} · ${senderName}`,
+          senderJid: remoteJid,
+          kind: mediaInsight.kind,
+          sentiment: mediaInsight.sentiment,
+          banglaSceneLabel: mediaInsight.banglaSceneLabel,
+          compactContextLine: mediaInsight.compactContextLine,
+          reactionSent: reactionEmoji,
+          replySent: replyText,
+          replyMode: replyText ? 'zero_token' : 'read_only',
+        });
+
+        if (replyText) {
+          if (botConfig.humanTypingEnabled) {
+            void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+          }
+          try {
+            if (cooldownWindowMs > 0) {
+              autoReplyCooldowns.set(cooldownBucketKey, Date.now());
+            }
+            await sendTrackedMessage(
+              sock,
+              remoteJid,
+              { text: replyText },
+              { quoted: msg }
+            );
+            dailyReplyCount += 1;
+            pushLog(
+              'autoreply',
+              `${groupName} · ${senderName}`,
+              `0-Token Media (${mediaInsight.banglaSceneLabel}${reactionEmoji ? ` · ${reactionEmoji}` : ''}) -> Text SMS`,
+              'success'
+            );
+          } finally {
+            if (botConfig.humanTypingEnabled) {
+              void sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+            }
+          }
+        } else if (reactionEmoji) {
+          pushLog(
+            'autoreply',
+            `${groupName} · ${senderName}`,
+            `0-Token Media React ${reactionEmoji} (${mediaInsight.banglaSceneLabel})`,
+            'info'
+          );
+        }
+        return;
+      }
+
+      if (mediaInsight?.isMedia) {
+        tokenTelemetry.recordZeroTokenMediaRead({
+          kind: mediaInsight.kind,
+          isStory: false,
+          repliedWithZeroTokens: false,
+        });
+      }
+
       const startedAt = Date.now();
       const decision = await runGroupCloneTurn({
         groupJid: remoteJid,
@@ -2290,25 +3713,41 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         senderName,
         senderJid: resolvedSenderPnJid || senderJid,
         senderAlt: resolvedSenderPnJid || senderAlt,
-        incomingText: text,
+        incomingText: effectiveIncomingText,
         isDirectlyAddressed,
         canTextReply,
       });
 
       if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
 
+      if (mediaInsight?.isMedia) {
+        recordMediaStoryFeedItem({
+          source: 'group',
+          senderName: `${groupName} · ${senderName}`,
+          senderJid: remoteJid,
+          kind: mediaInsight.kind,
+          sentiment: mediaInsight.sentiment,
+          banglaSceneLabel: mediaInsight.banglaSceneLabel,
+          compactContextLine: mediaInsight.compactContextLine,
+          reactionSent: decision.reactionEmoji || mediaInsight.recommendedReaction,
+          replySent: decision.replyText || '',
+          replyMode: decision.providerUsed === 'offline_emotion' ? 'zero_token' : 'hybrid_text_ai',
+        });
+      }
+
       // Send WhatsApp Emoji Reaction if selected
       if (
         (decision.action === 'react' || decision.action === 'reply_and_react') &&
         botConfig.groupReactionEnabled &&
-        decision.reactionEmoji
+        decision.reactionEmoji &&
+        mediaInsight?.kind !== 'reaction'
       ) {
         await sock
           .sendMessage(remoteJid, { react: { text: decision.reactionEmoji, key: msg.key } })
           .catch(() => {});
       }
 
-      // Send Group Clone Reply if selected
+      // Send Group Clone Reply if selected (always text-only SMS)
       if ((decision.action === 'reply' || decision.action === 'reply_and_react') && decision.replyText) {
         if (botConfig.humanTypingEnabled) {
           void sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
@@ -2317,7 +3756,7 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
           if (cooldownWindowMs > 0) {
             autoReplyCooldowns.set(cooldownBucketKey, Date.now());
           }
-          const quoteOrMention = decision.shouldQuote ? { quoted: msg } : undefined;
+          const quoteOrMention = decision.shouldQuote && mediaInsight?.kind !== 'reaction' ? { quoted: msg } : undefined;
           await sendTrackedMessage(
             sock,
             remoteJid,
@@ -2365,7 +3804,8 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       !isGroup &&
       !remoteJid.endsWith('@g.us') &&
       (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'));
-    if (!isPrivateChat || msg.key.fromMe || !text) return;
+    if (!isPrivateChat || msg.key.fromMe) return;
+    if (!text && (!hasNonTextMedia || !botConfig.mediaIntelligenceEnabled)) return;
 
     const botDigits = extractDigits(sock.user?.id);
     const botLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
@@ -2377,29 +3817,56 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
     const pausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
     const contactName = msg.pushName || senderDigits || 'Contact';
     if (Date.now() < pausedUntil) {
-      recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+      if (text) recordPassiveIncomingTurn(remoteJid, contactName, text, false);
       return;
     }
 
+    const dmContactPolicy = findMatchingContactPolicy({
+      jids: [remoteJid],
+      phone: extractPhoneDigitsOnly(remoteJid),
+      names: [contactName],
+    });
+
+    if (dmContactPolicy?.mode === 'mute_ai') {
+      if (text) recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+      pushLog('autoreply', contactName, 'Contact Policy (Mute): skipped auto-reply [0 Tokens].', 'blocked');
+      return;
+    }
+
+    const effectiveCooldown =
+      dmContactPolicy?.mode === 'long_engage'
+        ? Math.min(botConfig.cooldownMs, 2000)
+        : botConfig.cooldownMs;
     const lastSent = autoReplyCooldowns.get(remoteJid) || 0;
-    if (Date.now() - lastSent < botConfig.cooldownMs) {
-      recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+    if (Date.now() - lastSent < effectiveCooldown) {
+      if (text) recordPassiveIncomingTurn(remoteJid, contactName, text, false);
       return;
     }
 
-    // Instant zero-delay enqueue: start AI generation immediately on message arrival
+    // Instant zero-delay enqueue: start AI/Zero-Token Media generation immediately on message arrival
     enqueuePrivateReply(remoteJid, async () => {
       if (!botConfig.autoreply || currentSocket !== sock) return;
 
+      let mediaInsight: MediaInsight | null = null;
+      if (hasNonTextMedia && botConfig.mediaIntelligenceEnabled) {
+        mediaInsight = await readMediaMessageZeroToken(msg, sock);
+        if (mediaInsight.kind === 'reaction' && (!mediaInsight.reactionTargetFromMe || !mediaInsight.reactionEmojiReceived)) {
+          return;
+        }
+      }
+
+      const effectiveIncomingText = mediaInsight?.isMedia ? mediaInsight.compactContextLine : text;
+      if (!effectiveIncomingText) return;
+
       const latestPausedUntil = ownerTakeoverUntil.get(remoteJid) || 0;
       if (Date.now() < latestPausedUntil) {
-        recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+        recordPassiveIncomingTurn(remoteJid, contactName, effectiveIncomingText, false);
         return;
       }
 
       const daily = getDailyReplyStats();
       if (daily.count >= daily.limit) {
-        recordPassiveIncomingTurn(remoteJid, contactName, text, false);
+        recordPassiveIncomingTurn(remoteJid, contactName, effectiveIncomingText, false);
         pushLog(
           'autoreply',
           contactName,
@@ -2420,6 +3887,96 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
       }
 
       try {
+        // Pure Zero-Token DM Media Path
+        if (mediaInsight?.isMedia && shouldUsePureZeroTokenMediaReply(mediaInsight, false)) {
+          const generated = generateZeroTokenMediaReply({
+            insight: mediaInsight,
+            context: 'dm',
+            senderName: contactName,
+            tone: botConfig.assistantTone,
+            ownerName: botConfig.ownerName,
+            previousReplies: getPreviousAssistantRepliesForChat(remoteJid),
+          });
+          const reactionEmoji =
+            mediaInsight.kind !== 'reaction' && generated.reactionEmoji ? generated.reactionEmoji : '';
+          if (reactionEmoji) {
+            await sock
+              .sendMessage(remoteJid, { react: { text: reactionEmoji, key: msg.key } })
+              .catch(() => {});
+          }
+          await sendTrackedMessage(
+            sock,
+            remoteJid,
+            { text: generated.replyText },
+            mediaInsight.kind !== 'reaction' ? { quoted: msg } : undefined
+          );
+          dailyReplyCount += 1;
+
+          await recordZeroTokenMediaExchange({
+            chatJid: remoteJid,
+            displayName: contactName,
+            isGroup: false,
+            incomingSummary: mediaInsight.compactContextLine,
+            replyText: generated.replyText,
+          });
+
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: mediaInsight.kind,
+            isStory: false,
+            repliedWithZeroTokens: true,
+          });
+
+          recordMediaStoryFeedItem({
+            source: 'dm',
+            senderName: contactName,
+            senderJid: remoteJid,
+            kind: mediaInsight.kind,
+            sentiment: mediaInsight.sentiment,
+            banglaSceneLabel: mediaInsight.banglaSceneLabel,
+            compactContextLine: mediaInsight.compactContextLine,
+            reactionSent: reactionEmoji,
+            replySent: generated.replyText,
+            replyMode: 'zero_token',
+          });
+
+          pushLog(
+            'autoreply',
+            contactName,
+            `0-Token Media DM (${mediaInsight.banglaSceneLabel}) -> Text SMS`,
+            'success'
+          );
+          return;
+        }
+
+        if (mediaInsight?.isMedia) {
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: mediaInsight.kind,
+            isStory: false,
+            repliedWithZeroTokens: false,
+          });
+        }
+
+        // Zero-Token Polite Hold/Wait Policy Path
+        if (dmContactPolicy?.mode === 'hold_wait') {
+          const holdReply = generateZeroTokenHoldReply({
+            contactName,
+            note: dmContactPolicy.note,
+            previousAssistantReplies: getPreviousAssistantRepliesForChat(remoteJid),
+            ownerName: botConfig.ownerName,
+          });
+          await sendTrackedMessage(sock, remoteJid, { text: holdReply }, { quoted: msg });
+          dailyReplyCount += 1;
+          await recordZeroTokenMediaExchange({
+            chatJid: remoteJid,
+            displayName: contactName,
+            isGroup: false,
+            incomingSummary: effectiveIncomingText,
+            replyText: holdReply,
+          });
+          pushLog('autoreply', contactName, 'Contact Policy (Hold/Wait): 0-Token polite hold sent.', 'info');
+          return;
+        }
+
         const startedAt = Date.now();
         const {
           replyText,
@@ -2431,12 +3988,34 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
         } = await runExecutiveAssistantTurn({
           contactJid: remoteJid,
           contactName,
-          incomingText: text,
+          incomingText: effectiveIncomingText,
+          contactPolicy: dmContactPolicy ? { mode: dmContactPolicy.mode, note: dmContactPolicy.note } : undefined,
         });
 
         if (Date.now() < (ownerTakeoverUntil.get(remoteJid) || 0)) return;
 
-        const shouldQuote = Math.random() < 0.45;
+        if (mediaInsight?.isMedia) {
+          const reactEmoji = mediaInsight.kind !== 'reaction' ? mediaInsight.recommendedReaction : '';
+          if (reactEmoji) {
+            await sock
+              .sendMessage(remoteJid, { react: { text: reactEmoji, key: msg.key } })
+              .catch(() => {});
+          }
+          recordMediaStoryFeedItem({
+            source: 'dm',
+            senderName: contactName,
+            senderJid: remoteJid,
+            kind: mediaInsight.kind,
+            sentiment: mediaInsight.sentiment,
+            banglaSceneLabel: mediaInsight.banglaSceneLabel,
+            compactContextLine: mediaInsight.compactContextLine,
+            reactionSent: reactEmoji,
+            replySent: replyText,
+            replyMode: usedFallback ? 'zero_token' : 'hybrid_text_ai',
+          });
+        }
+
+        const shouldQuote = Math.random() < 0.45 && mediaInsight?.kind !== 'reaction';
         await sendTrackedMessage(
           sock,
           remoteJid,
@@ -2964,6 +4543,42 @@ async function bootstrap() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
 
+  const RUNTIME_HOST_FILE = path.resolve('./bot-runtime-host.json');
+  let learnedPublicBaseUrl = '';
+  try {
+    if (fs.existsSync(RUNTIME_HOST_FILE)) {
+      const savedHost = JSON.parse(fs.readFileSync(RUNTIME_HOST_FILE, 'utf8'));
+      if (typeof savedHost?.baseUrl === 'string' && /^https?:\/\//i.test(savedHost.baseUrl)) {
+        learnedPublicBaseUrl = savedHost.baseUrl.replace(/\/+$/, '');
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // Learn live external public URL automatically from incoming requests (so Render works even without RENDER_EXTERNAL_URL env var)
+  app.use((req, _res, next) => {
+    const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    if (
+      rawHost &&
+      !rawHost.startsWith('127.0.0.1') &&
+      !rawHost.startsWith('localhost') &&
+      !rawHost.startsWith('0.0.0.0')
+    ) {
+      const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+      const candidate = `${proto}://${rawHost}`.replace(/\/+$/, '');
+      if (candidate !== learnedPublicBaseUrl && /^https?:\/\/[a-z0-9.-]+/i.test(candidate)) {
+        learnedPublicBaseUrl = candidate;
+        try {
+          fs.writeFileSync(RUNTIME_HOST_FILE, JSON.stringify({ baseUrl: candidate, updatedAt: new Date().toISOString() }), 'utf8');
+        } catch {
+          // ignore
+        }
+      }
+    }
+    next();
+  });
+
   // --------------------------------------------------------------------------
   // Public Owner Authentication & Anti-Bot Challenge Endpoints
   // --------------------------------------------------------------------------
@@ -3239,6 +4854,193 @@ async function bootstrap() {
     requireOwnerAuth(req, res, next);
   });
 
+  // Web Research, Lead Vault, Gmail OAuth + SMTP Profile + Resend/Brevo Email & Anti-Ban WhatsApp Outreach (Additive Module)
+  outreachController = registerWebOutreachRoutes(app, {
+    geminiPool,
+    openRouterReader,
+    tokenTelemetry,
+    getBotConfig: () => botConfig,
+    getSocket: () => currentSocket,
+    getBotStatus: () => botStatus,
+    sendTrackedMessage: (sock, jid, content) => sendTrackedMessage(sock, jid, content),
+    pushLog,
+    onLeadWhatsAppSent: ({ phoneDigits, jid, leadName }) => {
+      upsertContactRecord({ id: jid, phoneNumber: phoneDigits, name: leadName });
+    },
+  });
+
+  // Mobile Browser / PWA Offload Queue (Uses phone RAM & mobile data)
+  registerMobileOffloadRoutes(app, mobileOffloadQueue, ({ url, emails, phones, title, snippet }) => {
+    outreachController?.ingestExternalLead({
+      name: title || url,
+      sourceUrl: url,
+      topic: 'Mobile PWA Offload',
+      emails,
+      phones,
+      snippet: snippet || '',
+    });
+  });
+
+  // Autonomous Action Agent Engine ("Brain + Hands & Feet") & 5-Min Self-Healing Watchdog
+  autonomousAgentEngine = new AutonomousAgentEngine({
+    geminiPool,
+    openRouterReader,
+    tokenTelemetry,
+    outreach: outreachController,
+    offloadQueue: mobileOffloadQueue,
+    getWatchdog: () => selfHealingWatchdog,
+    getBotConfig: () => botConfig,
+    getBotStatus: () => botStatus,
+    getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
+    getDirectoryContacts: () => collectDirectoryContacts(),
+    getKnownGroups: () =>
+      collectAllKnownGroupSummaries().map((g) => ({
+        jid: g.jid,
+        name: g.name,
+        members: Object.values(knownGroupMembers[g.jid] || {}).map((m) => ({
+          jid: m.jid,
+          phone: m.phone,
+          name: m.name,
+        })),
+      })),
+    getRecentMemories: () =>
+      Object.values(chatMemories)
+        .sort((a, b) => Date.parse(b.updatedAt || '') - Date.parse(a.updatedAt || ''))
+        .slice(0, 12),
+    getUnreadNotes: () => inboxNotes.filter((n) => !n.resolved).slice(0, 12),
+    getSelfPingStats: () => getRuntimeSelfPingSnapshot(),
+    dispatchDirectDm: async ({ targets, messageText, originalInstruction }) => {
+      let deliveredCount = 0;
+      let draftCount = 0;
+      const targetLabels: string[] = [];
+      for (const target of targets.slice(0, 15)) {
+        const targetJid = target.jid || `${normalizePhoneForWa(target.phone)}@s.whatsapp.net`;
+        if (!targetJid) continue;
+        targetLabels.push(target.name || `+${target.phone}`);
+        if (currentSocket && botStatus === 'connected') {
+          await sendTrackedMessage(currentSocket, targetJid, { text: messageText });
+          deliveredCount += 1;
+          dailyReplyCount += 1;
+        } else {
+          draftCount += 1;
+        }
+        await recordZeroTokenMediaExchange({
+          chatJid: targetJid,
+          displayName: target.name || `+${target.phone}`,
+          isGroup: false,
+          incomingSummary: `[Autonomous Agent]: ${originalInstruction}`,
+          replyText: messageText,
+        });
+      }
+      return { deliveredCount, draftCount, targetLabels };
+    },
+    dispatchGroupMention: async ({ groupJid, groupName, members, messageText }) => {
+      let deliveredLive = false;
+      const mentionJids = members.map((m) => m.jid).filter(Boolean).slice(0, 20);
+      if (currentSocket && botStatus === 'connected') {
+        await sendTrackedMessage(currentSocket, groupJid, { text: messageText, mentions: mentionJids });
+        deliveredLive = true;
+      }
+      return { deliveredLive, groupName, mentionedCount: mentionJids.length };
+    },
+    kickGroupMember: async ({ groupJid, targetPhoneOrName }) => {
+      if (!currentSocket || botStatus !== 'connected') {
+        return { ok: false, reason: 'WhatsApp সকেট এই মুহূর্তে কানেক্টেড নয়।' };
+      }
+      try {
+        const meta = await currentSocket.groupMetadata(groupJid);
+        const targetDigits = normalizePhoneForWa(targetPhoneOrName).slice(-10);
+        const participant = meta.participants.find((p) => {
+          const d = extractDigits(p.id).slice(-10);
+          const phoneD = normalizePhoneForWa(p.phoneNumber).slice(-10);
+          return (targetDigits && (d === targetDigits || phoneD === targetDigits)) || (p.name && p.name.toLowerCase().includes(targetPhoneOrName.toLowerCase()));
+        });
+        if (!participant) return { ok: false, reason: `গ্রুপে "${targetPhoneOrName}" খুঁজে পাওয়া যায়নি।` };
+        await currentSocket.groupParticipantsUpdate(groupJid, [participant.id], 'remove');
+        return { ok: true, kickedLabel: participant.id, reason: 'Kicked cleanly' };
+      } catch (err) {
+        return { ok: false, reason: (err as Error).message };
+      }
+    },
+    upsertContactPolicies: async (entries) => {
+      const current = [...(botConfig.contactPolicies || [])];
+      const nowIso = new Date().toISOString();
+      for (const item of entries) {
+        const pn = normalizePhoneForWa(item.phone || item.jid);
+        const idx = current.findIndex(
+          (c) => (item.jid && c.jid === item.jid) || (pn && normalizePhoneForWa(c.phone || c.jid).slice(-10) === pn.slice(-10))
+        );
+        if (item.mode === 'normal') {
+          if (idx !== -1) current.splice(idx, 1);
+          continue;
+        }
+        const nextEntry: ContactPolicyEntry = {
+          id: idx !== -1 ? current[idx].id : sanitizeId(`cpol_${Date.now()}_${current.length}`),
+          name: item.name || (pn ? `+${pn}` : 'Contact'),
+          phone: pn,
+          jid: item.jid || (pn ? `${pn}@s.whatsapp.net` : undefined),
+          mode: item.mode,
+          note: item.note || (idx !== -1 ? current[idx].note : undefined),
+          updatedAt: nowIso,
+        };
+        if (idx !== -1) current[idx] = nextEntry;
+        else current.unshift(nextEntry);
+      }
+      botConfig = normalizeConfig({ ...botConfig, contactPolicies: current.slice(0, 200), configUpdatedAt: nowIso });
+      persistConfig(true);
+      return botConfig.contactPolicies;
+    },
+    updateSystemSettings: async (patch) => {
+      botConfig = normalizeConfig({ ...botConfig, ...(patch as Partial<BotConfig>), configUpdatedAt: new Date().toISOString() });
+      persistConfig(true);
+    },
+    sendOwnerSelfChatReport: async (text: string) => {
+      if (!currentSocket || botStatus !== 'connected') return false;
+      const myPn = normalizePhoneForWa(currentSocket.user?.id || currentPairingPhone);
+      if (!myPn) return false;
+      await sendTrackedMessage(currentSocket, `${myPn}@s.whatsapp.net`, { text });
+      recordSelfChatTurn({ role: 'assistant', text, actionSummary: 'Scheduled Autonomous Agent Report' });
+      return true;
+    },
+    pushLog,
+  });
+  autonomousAgentEngine.startScheduler();
+
+  selfHealingWatchdog = new SelfHealingWatchdog({
+    getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
+    pruneRuntimeCaches: () => pruneRuntimeCaches(),
+    getBotStatus: () => botStatus,
+    isManualDisconnect: () => manualDisconnect,
+    hasRegisteredCreds: () => {
+      try {
+        const credsPath = path.join(AUTH_DIR, 'creds.json');
+        if (!fs.existsSync(credsPath)) return false;
+        const parsed = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+        return Boolean(parsed?.registered);
+      } catch {
+        return false;
+      }
+    },
+    hasPendingReconnectTimer: () => Boolean(reconnectTimer),
+    triggerWhatsAppReconnect: async () => {
+      await startBaileysConnection(currentPairingPhone || undefined);
+    },
+    healStuckQueuesAndAgents: () => {
+      const actions: string[] = [];
+      const offloadHealed = mobileOffloadQueue.pruneStuckJobs();
+      if (offloadHealed > 0) actions.push(`Cleaned ${offloadHealed} stale mobile offload job(s)`);
+      if (autonomousAgentEngine) {
+        actions.push(...autonomousAgentEngine.healStuckRuns());
+      }
+      return actions;
+    },
+    verifyAndRepairJsonFiles: (files) => repairCorruptJsonFiles(files),
+    pushLog,
+  });
+  selfHealingWatchdog.start();
+
+  registerAutonomousAgentRoutes(app, autonomousAgentEngine, () => selfHealingWatchdog);
+
   // Owner Multi-Number Client Bot Management Endpoints (Unlimited Zero-AI Client Slots)
   app.get('/api/client-bots', (_req, res) => {
     res.json({
@@ -3383,6 +5185,106 @@ async function bootstrap() {
       pushLog('autoreply', 'Owner', 'Resumed AI auto-reply across all paused chats.', 'info');
     }
     res.json({ activeTakeovers: getActiveTakeovers() });
+  });
+
+  app.get('/api/system/env-status', (_req, res) => {
+    const isSet = (name: string) => {
+      const val = String(process.env[name] || '').trim();
+      return Boolean(
+        val &&
+          val !== 'MY_GEMINI_API_KEY' &&
+          val !== 'MY_APP_URL' &&
+          !val.startsWith('YOUR_')
+      );
+    };
+
+    const geminiStats = geminiPool.getStats();
+    const openRouterStats = openRouterReader.getStats();
+
+    res.json({
+      runtime: {
+        platform: process.platform,
+        isTermux: Boolean(
+          process.env.TERMUX_VERSION || (process.env.PREFIX || '').includes('com.termux')
+        ),
+        nodeVersion: process.version,
+        port: PORT,
+        nodeEnv: process.env.NODE_ENV || 'development',
+        memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+        uptimeSec: Math.round(process.uptime()),
+        selfPingEnabled: process.env.ENABLE_SELF_PING !== 'false',
+        ownerEmail: OWNER_EMAIL,
+      },
+      geminiKeysCount: geminiStats.configuredKeysCount,
+      openRouterKeysCount: openRouterStats.configuredKeysCount,
+      firestore: getFirestoreAdminDiagnostics(),
+      envItems: [
+        {
+          key: 'GEMINI_API_KEY_1..5',
+          category: 'AI Brain',
+          configured: geminiStats.configuredKeysCount > 0,
+          detail: `${geminiStats.configuredKeysCount} key slot(s) active`,
+        },
+        {
+          key: 'OPENROUTER_API_KEY',
+          category: 'AI Brain',
+          configured: openRouterStats.configuredKeysCount > 0,
+          detail: `${openRouterStats.configuredKeysCount} key(s) active`,
+        },
+        {
+          key: 'TAVILY_API_KEY',
+          category: 'Web Search',
+          configured: isSet('TAVILY_API_KEY'),
+          detail: isSet('TAVILY_API_KEY') ? 'Configured' : 'Optional (DuckDuckGo active)',
+        },
+        {
+          key: 'SERPER_API_KEY',
+          category: 'Web Search',
+          configured: isSet('SERPER_API_KEY'),
+          detail: isSet('SERPER_API_KEY') ? 'Configured' : 'Optional',
+        },
+        {
+          key: 'FIREBASE_SERVICE_ACCOUNT_JSON',
+          category: 'Database',
+          configured: isSet('FIREBASE_SERVICE_ACCOUNT_JSON'),
+          detail: getFirestoreAdminDiagnostics().mode,
+        },
+        {
+          key: 'OWNER_EMAIL',
+          category: 'Security',
+          configured: isSet('OWNER_EMAIL'),
+          detail: OWNER_EMAIL,
+        },
+        {
+          key: 'DASHBOARD_PIN',
+          category: 'Security',
+          configured: isPinConfigured(),
+          detail: isSet('DASHBOARD_PIN')
+            ? 'Set via Env'
+            : isPinConfigured()
+              ? 'Set in Dashboard'
+              : 'Not Set',
+        },
+        {
+          key: 'RESEND_API_KEY',
+          category: 'Email API',
+          configured: isSet('RESEND_API_KEY'),
+          detail: isSet('RESEND_API_KEY') ? 'Configured' : 'Optional',
+        },
+        {
+          key: 'BREVO_API_KEY',
+          category: 'Email API',
+          configured: isSet('BREVO_API_KEY'),
+          detail: isSet('BREVO_API_KEY') ? 'Configured' : 'Optional',
+        },
+        {
+          key: 'ENABLE_SELF_PING',
+          category: 'Uptime',
+          configured: process.env.ENABLE_SELF_PING !== 'false',
+          detail: process.env.ENABLE_SELF_PING !== 'false' ? 'ON (Every 4m)' : 'Disabled',
+        },
+      ],
+    });
   });
 
   app.get('/api/bot/status', (_req, res) => {
@@ -3998,8 +5900,517 @@ async function bootstrap() {
     });
   });
 
+  app.get('/api/contacts', (_req, res) => {
+    const contacts = collectDirectoryContacts();
+    res.json({
+      connected: botStatus === 'connected',
+      contacts,
+    });
+  });
+
+  app.get('/api/assistant/direct-commands', (_req, res) => {
+    res.json({ commands: recentDirectCommands });
+  });
+
+  app.post('/api/assistant/direct-command', async (req, res) => {
+    try {
+      const body = (req.body || {}) as {
+        actionType?: 'auto' | 'dm_knock' | 'group_mention';
+        targetPhoneOrJid?: string;
+        targetContactName?: string;
+        groupJid?: string;
+        mentionMembers?: Array<{ jid?: string; lid?: string; phone?: string; name?: string }>;
+        instruction?: string;
+        useAiCraft?: boolean;
+        dryRun?: boolean;
+      };
+
+      const instruction = String(body.instruction || '').trim();
+      if (!instruction) {
+        res.status(400).json({ error: 'Command / instruction cannot be empty.' });
+        return;
+      }
+
+      const useAiCraft = body.useAiCraft !== false;
+      const dryRun = Boolean(body.dryRun);
+      const directoryContacts = collectDirectoryContacts();
+
+      // Determine Action Type ('dm_knock' vs 'group_mention')
+      const requestedType = body.actionType || 'auto';
+      const hasGroupCue =
+        Boolean(body.groupJid) ||
+        (Array.isArray(body.mentionMembers) && body.mentionMembers.length > 0) ||
+        /(?:গ্রুপে|গ্রুপ|group|মেনশন|mention|@)/iu.test(instruction);
+
+      let resolvedActionType: 'dm_knock' | 'group_mention' =
+        requestedType === 'group_mention'
+          ? 'group_mention'
+          : requestedType === 'dm_knock'
+            ? 'dm_knock'
+            : hasGroupCue && !/(?:ইনবক্সে|inbox|dm)/iu.test(instruction)
+              ? 'group_mention'
+              : 'dm_knock';
+
+      if (resolvedActionType === 'group_mention') {
+        // Resolve Group JID & Name
+        let resolvedGroupJid = String(body.groupJid || '').trim();
+        let resolvedGroupName = '';
+        const candidateGroups = collectAllKnownGroupSummaries();
+
+        if (resolvedGroupJid) {
+          resolvedGroupName =
+            candidateGroups.find((g) => g.jid === resolvedGroupJid)?.name ||
+            chatMemories[sanitizeId(resolvedGroupJid)]?.contactName ||
+            resolvedGroupJid;
+        } else {
+          const lowerInst = instruction.toLowerCase();
+          const matchedGrp = candidateGroups.find(
+            (g) => g.name && g.name.length >= 2 && lowerInst.includes(g.name.toLowerCase())
+          );
+          if (matchedGrp) {
+            resolvedGroupJid = matchedGrp.jid;
+            resolvedGroupName = matchedGrp.name;
+          }
+        }
+
+        if (!resolvedGroupJid) {
+          res.status(400).json({
+            error: 'কোন গ্রুপে মেনশন দেবেন তা সিলেক্ট করুন অথবা কমান্ডে গ্রুপের নাম লিখুন।',
+          });
+          return;
+        }
+
+        // Resolve Members to @mention
+        const groupBucket = Object.values(knownGroupMembers[resolvedGroupJid] || {});
+        const mentionTargets: Array<{ mentionJid: string; tagHandle: string; label: string }> = [];
+        const addMentionCandidate = (m: { jid?: string; lid?: string; phone?: string; name?: string }) => {
+          const normPhone = normalizePhoneForWa(m.phone || (isPhoneJid(m.jid) ? m.jid : ''));
+          const matchedCached = groupBucket.find(
+            (gm) =>
+              (normPhone && normalizePhoneForWa(gm.phone) === normPhone) ||
+              (m.jid && gm.jid === m.jid) ||
+              (m.lid && gm.lid === m.lid)
+          );
+          const candidateJid =
+            matchedCached?.lid && isLidJid(matchedCached.jid)
+              ? matchedCached.lid
+              : matchedCached?.jid ||
+                m.jid ||
+                m.lid ||
+                (normPhone ? `${normPhone}@s.whatsapp.net` : '');
+          if (!candidateJid) return;
+          const tagDigits = candidateJid.split('@')[0].split(':')[0];
+          const label = matchedCached?.name || m.name || (normPhone ? `+${normPhone}` : `@${tagDigits}`);
+          if (!mentionTargets.some((x) => x.mentionJid === candidateJid)) {
+            mentionTargets.push({
+              mentionJid: candidateJid,
+              tagHandle: `@${tagDigits}`,
+              label,
+            });
+          }
+        };
+
+        if (Array.isArray(body.mentionMembers) && body.mentionMembers.length > 0) {
+          for (const m of body.mentionMembers) {
+            addMentionCandidate(m);
+          }
+        } else {
+          // Auto-extract @mentions or phones or member names from freeform instruction
+          const atMatches = [...instruction.matchAll(/@([^\s,!?]+)/g)].map((x) => x[1].toLowerCase());
+          const lowerInst = instruction.toLowerCase();
+          for (const gm of groupBucket) {
+            const nameLower = gm.name.toLowerCase();
+            const matchedAt = atMatches.some((tok) => nameLower.includes(tok) || (gm.phone && gm.phone.endsWith(tok)));
+            const matchedName = gm.name.length >= 3 && !isDefaultNumericLabel(gm.name) && lowerInst.includes(nameLower);
+            const matchedPhone = gm.phone && lowerInst.includes(gm.phone.slice(-10));
+            if (matchedAt || matchedName || matchedPhone) {
+              addMentionCandidate(gm);
+            }
+          }
+          const phoneInText = instruction.match(/(?:\+?88)?01[3-9]\d{8}/);
+          if (mentionTargets.length === 0 && phoneInText) {
+            const pn = normalizePhoneForWa(phoneInText[0]);
+            addMentionCandidate({ phone: pn, jid: `${pn}@s.whatsapp.net`, name: `+${pn}` });
+          }
+        }
+
+        // If WhatsApp is live, align each mentionJid to exact group participant JID so WhatsApp blue @tag triggers reliably
+        if (currentSocket && botStatus === 'connected' && mentionTargets.length > 0) {
+          try {
+            const meta = await withTimeout(
+              currentSocket.groupMetadata(resolvedGroupJid),
+              5_000,
+              'Fetch groupMetadata for mention'
+            );
+            for (const target of mentionTargets) {
+              const tPhone = normalizePhoneForWa(target.mentionJid.split('@')[0]);
+              const livePart = meta.participants?.find((p) => {
+                const pRaw = (p.id || '').split(':')[0];
+                const pPn = normalizePhoneForWa((p as { phoneNumber?: string }).phoneNumber || (isPhoneJid(pRaw) ? pRaw : ''));
+                return pRaw === target.mentionJid || (tPhone && pPn === tPhone);
+              });
+              if (livePart?.id) {
+                const cleanPartJid = livePart.id.split(':')[0];
+                target.mentionJid = cleanPartJid;
+                target.tagHandle = `@${cleanPartJid.split('@')[0]}`;
+              }
+            }
+          } catch {
+            // proceed with cached JID
+          }
+        }
+
+        const chatId = sanitizeId(resolvedGroupJid);
+        const mem = await ensureChatMemoryHydrated(chatId, resolvedGroupJid, resolvedGroupName);
+        const crafted = await generateDirectCommandText({
+          keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
+          openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
+          onKeyRotate: (rot) => tokenTelemetry.markGeminiSlotError(rot.fromSlot, rot.reason),
+          settings: botConfig,
+          actionType: 'group_mention',
+          targetName: mentionTargets.map((m) => m.label).join(', ') || resolvedGroupName,
+          groupName: resolvedGroupName,
+          mentionTags: mentionTargets.map((m) => m.tagHandle),
+          instruction,
+          memory: mem,
+          useAiCraft,
+        });
+
+        if (crafted.tokenUsage && (crafted.providerUsed === 'gemini' || crafted.providerUsed === 'openrouter')) {
+          tokenTelemetry.recordUsage({
+            provider: crafted.providerUsed,
+            model: crafted.tokenUsage.model,
+            keySlot: crafted.keySlotUsed,
+            category: 'command',
+            promptTokens: crafted.tokenUsage.promptTokens,
+            completionTokens: crafted.tokenUsage.completionTokens,
+            totalTokens: crafted.tokenUsage.totalTokens,
+          });
+        }
+
+        const mentionedJids = mentionTargets.map((m) => m.mentionJid);
+        let deliveredLive = false;
+        let deliveryNote = dryRun
+          ? 'Preview ready (not sent yet).'
+          : 'WhatsApp ডিসকানেক্ট অবস্থায় আছে—মেসেজ ড্রাফট তৈরি হয়েছে, কানেক্ট করে পাঠাতে পারবেন।';
+
+        if (!dryRun && currentSocket && botStatus === 'connected') {
+          if (botConfig.humanTypingEnabled) {
+            void currentSocket.sendPresenceUpdate('composing', resolvedGroupJid).catch(() => {});
+            await new Promise((r) => setTimeout(r, 700));
+          }
+          try {
+            await sendTrackedMessage(currentSocket, resolvedGroupJid, {
+              text: crafted.messageText,
+              ...(mentionedJids.length > 0 ? { mentions: mentionedJids } : {}),
+            });
+            deliveredLive = true;
+            dailyReplyCount += 1;
+            deliveryNote = `গ্রুপে সফলভাবে মেনশন সহ মেসেজ পাঠানো হয়েছে (${resolvedGroupName})।`;
+
+            await recordZeroTokenMediaExchange({
+              chatJid: resolvedGroupJid,
+              displayName: resolvedGroupName,
+              isGroup: true,
+              senderNameInGroup: botConfig.ownerName || 'Sir',
+              incomingSummary: `[Owner Direct Command -> Group Mention]: ${instruction}`,
+              replyText: crafted.messageText,
+            });
+          } finally {
+            if (botConfig.humanTypingEnabled) {
+              void currentSocket.sendPresenceUpdate('paused', resolvedGroupJid).catch(() => {});
+            }
+          }
+        }
+
+        const cmdRecord: DirectCommandLogItem = {
+          id: `dcmd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: new Date().toISOString(),
+          actionType: 'group_mention',
+          targetLabel: `${resolvedGroupName}${mentionTargets.length > 0 ? ` (${mentionTargets.map((m) => m.label).join(', ')})` : ''}`,
+          targetJid: resolvedGroupJid,
+          mentionedJids,
+          instruction,
+          messageSent: crafted.messageText,
+          deliveredLive,
+          usedAi: useAiCraft,
+          providerUsed: crafted.providerUsed,
+        };
+        if (!dryRun) {
+          recentDirectCommands.unshift(cmdRecord);
+          if (recentDirectCommands.length > 30) recentDirectCommands.length = 30;
+          pushLog(
+            'autoreply',
+            `Command · ${resolvedGroupName}`,
+            `Group @Mention (${deliveredLive ? 'Live Sent' : 'Draft'}): ${crafted.messageText.slice(0, 80)}`,
+            deliveredLive ? 'success' : 'info'
+          );
+        }
+
+        res.json({
+          ok: true,
+          dryRun,
+          deliveredLive,
+          actionType: 'group_mention',
+          targetLabel: cmdRecord.targetLabel,
+          targetJid: resolvedGroupJid,
+          mentionedJids,
+          messageText: crafted.messageText,
+          providerUsed: crafted.providerUsed,
+          note: deliveryNote,
+          commandRecord: cmdRecord,
+        });
+        return;
+      }
+
+      // DM Knock Resolution
+      let rawTarget = String(body.targetPhoneOrJid || '').trim();
+      let resolvedName = String(body.targetContactName || '').trim();
+      let resolvedJid = '';
+
+      if (rawTarget.includes('@')) {
+        resolvedJid = rawTarget;
+      } else if (rawTarget) {
+        const pn = normalizePhoneForWa(rawTarget);
+        if (pn.length >= 7) {
+          resolvedJid = `${pn}@s.whatsapp.net`;
+        } else {
+          const matchedByName = directoryContacts.find((c) =>
+            c.name.toLowerCase().includes(rawTarget.toLowerCase())
+          );
+          if (matchedByName) {
+            resolvedJid = matchedByName.jid;
+            resolvedName = resolvedName || matchedByName.name;
+          }
+        }
+      }
+
+      if (!resolvedJid) {
+        const phoneInInst = instruction.match(/(?:\+?88)?01[3-9]\d{8}|\b\d{10,15}\b/);
+        if (phoneInInst) {
+          const pn = normalizePhoneForWa(phoneInInst[0]);
+          resolvedJid = `${pn}@s.whatsapp.net`;
+        } else {
+          const lowerInst = instruction.toLowerCase();
+          const matchedContact = directoryContacts.find(
+            (c) => c.name.length >= 3 && !isDefaultNumericLabel(c.name) && lowerInst.includes(c.name.toLowerCase())
+          );
+          if (matchedContact) {
+            resolvedJid = matchedContact.jid;
+            resolvedName = resolvedName || matchedContact.name;
+          }
+        }
+      }
+
+      if (!resolvedJid) {
+        res.status(400).json({
+          error: 'যাকে ইনবক্স করবেন তার হোয়াটসঅ্যাপ নাম্বার সিলেক্ট করুন বা কমান্ডে স্পষ্ট নাম/নাম্বার লিখুন।',
+        });
+        return;
+      }
+
+      const targetDigits = extractPhoneDigitsOnly(resolvedJid);
+      const directoryMatch = directoryContacts.find(
+        (c) => c.jid === resolvedJid || (targetDigits && normalizePhoneForWa(c.phone) === normalizePhoneForWa(targetDigits))
+      );
+      if (!resolvedName) {
+        resolvedName = directoryMatch?.name || (targetDigits ? `+${targetDigits}` : resolvedJid.split('@')[0]);
+      }
+
+      const chatId = sanitizeId(resolvedJid);
+      const mem = await ensureChatMemoryHydrated(chatId, resolvedJid, resolvedName);
+      const crafted = await generateDirectCommandText({
+        keyPool: botConfig.aiAssistantEnabled ? geminiPool : null,
+        openRouterReader: botConfig.aiAssistantEnabled ? openRouterReader : null,
+        onKeyRotate: (rot) => tokenTelemetry.markGeminiSlotError(rot.fromSlot, rot.reason),
+        settings: botConfig,
+        actionType: 'dm_knock',
+        targetName: resolvedName,
+        instruction,
+        memory: mem,
+        useAiCraft,
+      });
+
+      if (crafted.tokenUsage && (crafted.providerUsed === 'gemini' || crafted.providerUsed === 'openrouter')) {
+        tokenTelemetry.recordUsage({
+          provider: crafted.providerUsed,
+          model: crafted.tokenUsage.model,
+          keySlot: crafted.keySlotUsed,
+          category: 'command',
+          promptTokens: crafted.tokenUsage.promptTokens,
+          completionTokens: crafted.tokenUsage.completionTokens,
+          totalTokens: crafted.tokenUsage.totalTokens,
+        });
+      }
+
+      let deliveredLive = false;
+      let deliveryNote = dryRun
+        ? 'Preview ready (not sent yet).'
+        : 'WhatsApp ডিসকানেক্ট অবস্থায় আছে—মেসেজ ড্রাফট তৈরি হয়েছে, কানেক্ট করে পাঠাতে পারবেন।';
+
+      if (!dryRun && currentSocket && botStatus === 'connected') {
+        if (botConfig.humanTypingEnabled) {
+          void currentSocket.sendPresenceUpdate('composing', resolvedJid).catch(() => {});
+          await new Promise((r) => setTimeout(r, 700));
+        }
+        try {
+          await sendTrackedMessage(currentSocket, resolvedJid, { text: crafted.messageText });
+          deliveredLive = true;
+          dailyReplyCount += 1;
+          deliveryNote = `${resolvedName}-এর ইনবক্সে সফলভাবে নক করা হয়েছে!`;
+
+          await recordZeroTokenMediaExchange({
+            chatJid: resolvedJid,
+            displayName: resolvedName,
+            isGroup: false,
+            incomingSummary: `[Owner Direct Command -> DM Knock]: ${instruction}`,
+            replyText: crafted.messageText,
+          });
+        } finally {
+          if (botConfig.humanTypingEnabled) {
+            void currentSocket.sendPresenceUpdate('paused', resolvedJid).catch(() => {});
+          }
+        }
+      }
+
+      const cmdRecord: DirectCommandLogItem = {
+        id: `dcmd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date().toISOString(),
+        actionType: 'dm_knock',
+        targetLabel: resolvedName,
+        targetJid: resolvedJid,
+        mentionedJids: [],
+        instruction,
+        messageSent: crafted.messageText,
+        deliveredLive,
+        usedAi: useAiCraft,
+        providerUsed: crafted.providerUsed,
+      };
+      if (!dryRun) {
+        recentDirectCommands.unshift(cmdRecord);
+        if (recentDirectCommands.length > 30) recentDirectCommands.length = 30;
+        pushLog(
+          'autoreply',
+          `Command · ${resolvedName}`,
+          `DM Knock (${deliveredLive ? 'Live Sent' : 'Draft'}): ${crafted.messageText.slice(0, 80)}`,
+          deliveredLive ? 'success' : 'info'
+        );
+      }
+
+      res.json({
+        ok: true,
+        dryRun,
+        deliveredLive,
+        actionType: 'dm_knock',
+        targetLabel: resolvedName,
+        targetJid: resolvedJid,
+        mentionedJids: [],
+        messageText: crafted.messageText,
+        providerUsed: crafted.providerUsed,
+        note: deliveryNote,
+        commandRecord: cmdRecord,
+      });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message || 'Direct command execution failed.' });
+    }
+  });
+
+  app.get('/api/assistant/self-chat', (_req, res) => {
+    const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+    res.json({
+      enabled: botConfig.selfChatCopilotEnabled !== false,
+      zeroTokenOnly: true,
+      connectedPhone: currentPairingPhone || extractDigits(currentSocket?.user?.id) || '',
+      botStatus,
+      memoryRssMb: rssMb,
+      history: selfChatHistory.slice(-25),
+      contactPolicies: botConfig.contactPolicies || [],
+    });
+  });
+
+  app.post('/api/assistant/self-chat', async (req, res) => {
+    try {
+      const body = req.body as {
+        text?: string;
+        clear?: boolean;
+        media?: SimulatedMediaInput;
+      };
+      if (body?.clear) {
+        selfChatHistory = [];
+        pendingSelfChatDraft = null;
+        saveJsonFileAsync(SELF_CHAT_FILE, []);
+        res.json({ ok: true, history: [], memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)) });
+        return;
+      }
+      const incomingText = String(body?.text || '').trim();
+      const media = body?.media;
+      if (!incomingText && !media) {
+        res.status(400).json({ error: 'মেসেজ বা ভিডিও/মিডিয়া স্যাম্পল দিন।' });
+        return;
+      }
+
+      const mediaInsight = media ? await analyzeSimulatedMediaZeroToken(media) : null;
+      const result = await executeZeroTokenSelfChatTurn({
+        incomingText: incomingText || mediaInsight?.caption || '',
+        mediaInsight,
+      });
+
+      res.json({
+        ok: true,
+        replyText: result.replyText,
+        actionSummary: result.actionSummary,
+        tokensUsed: 0,
+        memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+        history: selfChatHistory.slice(-25),
+        contactPolicies: botConfig.contactPolicies || [],
+        config: botConfig,
+      });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message || 'Self-Chat copilot failed.' });
+    }
+  });
+
+  app.post('/api/assistant/contact-policies', (req, res) => {
+    try {
+      const body = req.body as { policies?: ContactPolicyEntry[] };
+      if (!Array.isArray(body?.policies)) {
+        res.status(400).json({ error: 'Invalid contact policies payload.' });
+        return;
+      }
+      botConfig = normalizeConfig({
+        ...botConfig,
+        contactPolicies: body.policies,
+        configUpdatedAt: new Date().toISOString(),
+      });
+      persistConfig(true);
+      res.json({ ok: true, contactPolicies: botConfig.contactPolicies, config: botConfig });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message || 'Failed saving contact policies.' });
+    }
+  });
+
+  app.get('/api/media/stories', (_req, res) => {
+    const dailyStats = getDailyReplyStats();
+    const geminiStats = geminiPool.getStats();
+    const openRouterStats = openRouterReader.getStats();
+    const snap = tokenTelemetry.getSnapshot({
+      whatsappUsedToday: dailyStats.count,
+      whatsappDailyLimit: dailyStats.limit,
+      configuredGeminiKeys: geminiStats.configuredKeysCount,
+      geminiSlotCooldowns: geminiPool.getSlotCooldownStats(),
+      openRouterConfiguredKeys: openRouterStats.configuredKeysCount,
+      openRouterFreeModelsCount: openRouterStats.dynamicPool?.discoveredFreeModelsCount || 0,
+      openRouterActiveModel:
+        openRouterStats.dynamicPool?.activeFreeModel || openRouterStats.primaryModel,
+    });
+    res.json({
+      stories: recentMediaStories,
+      stats: snap.zeroTokenMedia,
+    });
+  });
+
   // --------------------------------------------------------------------------
-  // Interactive Simulator (Supports Commands + AI Executive Assistant + Takeover)
+  // Interactive Simulator (Supports Commands + AI Executive Assistant + Takeover + Zero-Token Media)
   // --------------------------------------------------------------------------
   app.post('/api/simulator/message', async (req, res) => {
     try {
@@ -4010,15 +6421,213 @@ async function bootstrap() {
       const groupJid = body?.groupJid || '120363041928374655@g.us';
       const contactJid = body?.contactJid || '8801700000000@s.whatsapp.net';
       const contactName = body?.contactName || 'Simulator Contact';
+      const simMedia = body?.media;
 
-      if (!text) {
-        res.status(400).json({ error: 'Message text cannot be empty.' });
+      if (!text && !simMedia && chatType !== 'story') {
+        res.status(400).json({ error: 'Message text or media sample cannot be empty.' });
         return;
       }
 
       const isGroup = chatType === 'group_bot_admin' || chatType === 'group_bot_non_admin';
       const botIsAdmin = chatType === 'group_bot_admin';
       const isSelf = chatType === 'self';
+      const isStorySim = chatType === 'story' || simMedia?.kind?.startsWith('story_');
+
+      // -1. Simulator Owner Self-Chat ("Message Yourself") with 0-Token Copilot & Video Mistake Diagnostics
+      if (isSelf && !text.startsWith(PREFIX) && botConfig.selfChatCopilotEnabled !== false) {
+        const mediaInsight = simMedia ? await analyzeSimulatedMediaZeroToken(simMedia) : null;
+        const result = await executeZeroTokenSelfChatTurn({
+          incomingText: text || mediaInsight?.caption || '',
+          mediaInsight,
+        });
+        res.json({
+          deleted: false,
+          reply: result.replyText,
+          note: `${result.actionSummary} · strictly 0 tokens`,
+          mediaInsight: mediaInsight || undefined,
+          tokensSpent: 0,
+          ruleTriggered: 'OWNER_SELF_CHAT_COPILOT',
+          config: botConfig,
+        });
+        return;
+      }
+
+      // 0. Zero-Token Story & Media Evaluation (when media preset / image / story mode is provided)
+      if (simMedia || isStorySim) {
+        const matchedStoryWhitelist = isStorySim
+          ? findMatchingStoryWhitelistContact({
+              jids: [contactJid, body?.senderJid],
+              phone: extractPhoneDigitsOnly(contactJid || body?.senderJid),
+              names: [contactName],
+            })
+          : null;
+
+        if (isStorySim && botConfig.storyWhitelistMode === 'selected_only' && !matchedStoryWhitelist) {
+          res.json({
+            deleted: false,
+            reply: null,
+            note: `Story Skipped: "${contactName}" আপনার Custom Story Whitelist-এ যোগ করা নেই। শুধু সিলেক্টেড কন্টাক্টের স্টোরি দেখা ও ইনবক্সে মেসেজ পাঠানো হবে।`,
+            ruleTriggered: 'STORY_WHITELIST_SKIPPED',
+            tokensSpent: 0,
+            config: botConfig,
+          });
+          return;
+        }
+
+        const mediaPayload: SimulatedMediaInput = simMedia
+          ? {
+              ...simMedia,
+              kind:
+                isStorySim && simMedia.kind === 'photo'
+                  ? 'story_photo'
+                  : isStorySim && simMedia.kind === 'video'
+                    ? 'story_video'
+                    : simMedia.kind,
+              caption: simMedia.caption !== undefined ? simMedia.caption : text,
+            }
+          : {
+              kind: 'story_text',
+              caption: text,
+            };
+        const rawInsight = await analyzeSimulatedMediaZeroToken(mediaPayload);
+        const insight = applyCustomPromptHintToInsight(rawInsight, matchedStoryWhitelist?.customPrompt || '');
+        const simContext: 'dm' | 'group' | 'story' = isStorySim ? 'story' : isGroup ? 'group' : 'dm';
+        const effectiveText = insight.compactContextLine;
+
+        const useHybridAi =
+          !botConfig.mediaZeroTokenReplyMode &&
+          !isStorySim &&
+          insight.caption.trim().length > 15 &&
+          botConfig.aiAssistantEnabled &&
+          (geminiPool.hasKeys() || openRouterReader.hasKeys());
+
+        if (isGroup && useHybridAi && botConfig.groupAiEnabled) {
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: insight.kind,
+            isStory: false,
+            repliedWithZeroTokens: false,
+          });
+          const simGroupName = chatMemories[sanitizeId(groupJid)]?.contactName || 'Simulator Group';
+          const decision = await runGroupCloneTurn({
+            groupJid,
+            groupName: simGroupName,
+            senderName: contactName || 'Friend',
+            senderJid: body?.senderJid || contactJid,
+            incomingText: effectiveText,
+            isDirectlyAddressed: true,
+            canTextReply: true,
+          });
+          recordMediaStoryFeedItem({
+            source: 'simulator',
+            senderName: contactName,
+            senderJid: groupJid,
+            kind: insight.kind,
+            sentiment: insight.sentiment,
+            banglaSceneLabel: insight.banglaSceneLabel,
+            compactContextLine: insight.compactContextLine,
+            reactionSent: decision.reactionEmoji || insight.recommendedReaction,
+            replySent: decision.replyText || '',
+            replyMode: decision.providerUsed === 'offline_emotion' ? 'zero_token' : 'hybrid_text_ai',
+          });
+          res.json({
+            deleted: false,
+            reply: decision.replyText || null,
+            reactionEmoji: decision.reactionEmoji || insight.recommendedReaction,
+            mediaInsight: insight,
+            providerUsed: decision.providerUsed,
+            ruleTriggered: 'HYBRID_MEDIA_GROUP_CLONE',
+            config: botConfig,
+          });
+          return;
+        }
+
+        if (!isGroup && !isStorySim && useHybridAi && botConfig.autoreply) {
+          tokenTelemetry.recordZeroTokenMediaRead({
+            kind: insight.kind,
+            isStory: false,
+            repliedWithZeroTokens: false,
+          });
+          const resTurn = await runExecutiveAssistantTurn({
+            contactJid,
+            contactName,
+            incomingText: effectiveText,
+          });
+          recordMediaStoryFeedItem({
+            source: 'simulator',
+            senderName: contactName,
+            senderJid: contactJid,
+            kind: insight.kind,
+            sentiment: insight.sentiment,
+            banglaSceneLabel: insight.banglaSceneLabel,
+            compactContextLine: insight.compactContextLine,
+            reactionSent: insight.recommendedReaction,
+            replySent: resTurn.replyText,
+            replyMode: resTurn.usedFallback ? 'zero_token' : 'hybrid_text_ai',
+          });
+          res.json({
+            deleted: false,
+            reply: resTurn.replyText,
+            reactionEmoji: insight.recommendedReaction,
+            mediaInsight: insight,
+            providerUsed: resTurn.providerUsed,
+            ruleTriggered: 'HYBRID_MEDIA_DM_ASSISTANT',
+            config: botConfig,
+          });
+          return;
+        }
+
+        // Default 100% Zero-Token Media Read + Zero-Token Text-Only SMS Reply
+        const generated = generateZeroTokenMediaReply({
+          insight,
+          context: simContext,
+          senderName: contactName,
+          tone: botConfig.assistantTone,
+          ownerName: botConfig.ownerName,
+          previousReplies: getPreviousAssistantRepliesForChat(isGroup ? groupJid : contactJid),
+        });
+        tokenTelemetry.recordZeroTokenMediaRead({
+          kind: insight.kind,
+          isStory: isStorySim,
+          repliedWithZeroTokens: true,
+        });
+        await recordZeroTokenMediaExchange({
+          chatJid: isGroup ? groupJid : contactJid,
+          displayName: contactName,
+          isGroup,
+          senderNameInGroup: isGroup ? contactName : undefined,
+          incomingSummary: insight.compactContextLine,
+          replyText: generated.replyText,
+        });
+        recordMediaStoryFeedItem({
+          source: 'simulator',
+          senderName: contactName,
+          senderJid: isGroup ? groupJid : contactJid,
+          kind: insight.kind,
+          sentiment: insight.sentiment,
+          banglaSceneLabel: insight.banglaSceneLabel,
+          compactContextLine: insight.compactContextLine,
+          reactionSent: generated.reactionEmoji,
+          replySent: generated.replyText,
+          replyMode: 'zero_token',
+        });
+        pushLog(
+          'autoreply',
+          `Simulator · ${contactName}`,
+          `0-Token Media (${insight.banglaSceneLabel}) -> Text SMS Reply (0 Tokens Spent)`,
+          'success'
+        );
+        res.json({
+          deleted: false,
+          reply: generated.replyText,
+          reactionEmoji: generated.reactionEmoji,
+          mediaInsight: insight,
+          providerUsed: 'zero_token_media',
+          tokensSpent: 0,
+          ruleTriggered: 'ZERO_TOKEN_MEDIA_INTELLIGENCE',
+          config: botConfig,
+        });
+        return;
+      }
 
       // 1. Group Anti-Link Evaluation
       if (isGroup && botConfig.antilinkGroups[groupJid] === true) {
@@ -4263,6 +6872,22 @@ async function bootstrap() {
       // 3A. Group AI Clone Simulator Evaluation
       if (isGroup && botConfig.groupAiEnabled && botConfig.groupAiGroups[groupJid] === true) {
         const simSenderJid = body?.senderJid || contactJid;
+        const simGroupPolicy = findMatchingContactPolicy({
+          jids: [simSenderJid],
+          phone: extractPhoneDigitsOnly(simSenderJid),
+          names: [contactName],
+        });
+        if (simGroupPolicy?.mode === 'mute_ai') {
+          res.json({
+            deleted: false,
+            reply: null,
+            note: `Group Member Policy Active (Off/Mute): "${contactName}"-কে গ্রুপ AI থেকে মিউট রাখা হয়েছে (০ টোকেন)।`,
+            ruleTriggered: 'GROUP_MEMBER_MUTED',
+            tokensSpent: 0,
+            config: botConfig,
+          });
+          return;
+        }
         const simGroupName = chatMemories[sanitizeId(groupJid)]?.contactName || 'Simulator Group';
         const decision = await runGroupCloneTurn({
           groupJid,
@@ -4290,6 +6915,53 @@ async function bootstrap() {
       // 3B. Automated Private Inbox Assistant
       if (botConfig.autoreply) {
         if (chatType === 'private') {
+          const simPolicy = findMatchingContactPolicy({
+            jids: [contactJid],
+            phone: extractPhoneDigitsOnly(contactJid),
+            names: [contactName],
+          });
+
+          if (simPolicy?.mode === 'mute_ai') {
+            recordPassiveIncomingTurn(contactJid, contactName, text, false);
+            res.json({
+              deleted: false,
+              reply: null,
+              note: `Contact Policy Active (Mute/Blocked): "${contactName}"-কে মিউট রাখা হয়েছে (০ টোকেন, কোনো রিপ্লাই পাঠানো হয়নি)।`,
+              ruleTriggered: 'CONTACT_POLICY_MUTED',
+              tokensSpent: 0,
+              config: botConfig,
+            });
+            return;
+          }
+
+          if (simPolicy?.mode === 'hold_wait') {
+            const mem = await ensureChatMemoryHydrated(sanitizeId(contactJid), contactJid, contactName);
+            const prevReplies = (mem?.turns || []).filter((t) => t.role === 'assistant').slice(-5).map((t) => t.text);
+            const holdReply = generateZeroTokenHoldReply({
+              contactName,
+              note: simPolicy.note,
+              previousAssistantReplies: prevReplies,
+              ownerName: botConfig.ownerName,
+            });
+            await recordZeroTokenMediaExchange({
+              chatJid: contactJid,
+              displayName: contactName,
+              isGroup: false,
+              incomingSummary: text,
+              replyText: holdReply,
+            });
+            res.json({
+              deleted: false,
+              reply: holdReply,
+              note: `Contact Policy Active (Hold/Wait): "${contactName}"-কে ০ টোকেনে ভদ্রভাবে আটকে/অপেক্ষায় রাখা হয়েছে।`,
+              providerUsed: 'offline_emotion',
+              ruleTriggered: 'CONTACT_POLICY_HOLD_WAIT',
+              tokensSpent: 0,
+              config: botConfig,
+            });
+            return;
+          }
+
           const {
             replyText,
             detectedDistrict,
@@ -4302,6 +6974,7 @@ async function bootstrap() {
             contactJid,
             contactName,
             incomingText: text,
+            contactPolicy: simPolicy ? { mode: simPolicy.mode, note: simPolicy.note } : undefined,
           });
           const simSummary =
             providerUsed === 'openrouter'
@@ -4318,7 +6991,12 @@ async function bootstrap() {
             usedFallback,
             providerUsed,
             keySlotUsed,
-            ruleTriggered: usedFallback ? 'STATIC_AUTOREPLY' : 'AI_EXECUTIVE_ASSISTANT',
+            ruleTriggered:
+              simPolicy?.mode === 'long_engage'
+                ? 'CONTACT_POLICY_LONG_ENGAGE'
+                : usedFallback
+                  ? 'STATIC_AUTOREPLY'
+                  : 'AI_EXECUTIVE_ASSISTANT',
             config: botConfig,
           });
           return;
@@ -4328,7 +7006,7 @@ async function bootstrap() {
           res.json({
             deleted: false,
             reply: null,
-            note: 'Auto-reply skipped: Message-to-self / fromMe messages are excluded (triggers human takeover pause in live chats).',
+            note: 'Self-Chat Copilot is currently disabled in settings.',
             ruleTriggered: 'AUTOREPLY_SKIPPED_SELF',
             config: botConfig,
           });
@@ -4372,42 +7050,65 @@ async function bootstrap() {
     res.json({ files });
   });
 
-  // Self-Ping Keep-Alive State (prevents Render Free tier 15m inactivity sleep)
-  const SELF_PING_INTERVAL_MS = 5 * 60 * 1000; // Exactly 5 minutes
-  const selfPingExplicitUrl = process.env.SELF_PING_URL?.trim();
-  const selfPingBaseUrl = (
-    process.env.RENDER_EXTERNAL_URL ||
-    process.env.APP_URL ||
-    'https://aura-assistant-8y1z.onrender.com'
-  )
-    .trim()
-    .replace(/\/+$/, '');
-  const selfPingTargetUrl = selfPingExplicitUrl || `${selfPingBaseUrl}/health`;
-  const selfPingEnabled =
-    process.env.ENABLE_SELF_PING !== 'false' &&
-    (process.env.NODE_ENV === 'production' ||
-      Boolean(process.env.RENDER) ||
-      Boolean(process.env.RENDER_EXTERNAL_URL) ||
-      process.env.ENABLE_SELF_PING === 'true');
+  // Forever 24/7 Self-Ping Keep-Alive State (prevents Hugging Face Spaces / Cloud instance inactivity sleep)
+  const SELF_PING_INTERVAL_MS = 4 * 60 * 1000; // Every 4 minutes
+
+  function resolveSelfPingTargetUrl(): string {
+    const explicit = process.env.SELF_PING_URL?.trim();
+    if (explicit && /^https?:\/\//i.test(explicit)) return explicit;
+
+    const spaceHost = process.env.SPACE_HOST?.trim();
+    if (spaceHost) {
+      const normalizedSpace = /^https?:\/\//i.test(spaceHost) ? spaceHost : `https://${spaceHost}`;
+      return `${normalizedSpace.replace(/\/+$/, '')}/health`;
+    }
+
+    const renderUrl = process.env.RENDER_EXTERNAL_URL?.trim();
+    if (renderUrl && /^https?:\/\//i.test(renderUrl)) return `${renderUrl.replace(/\/+$/, '')}/health`;
+
+    const appUrl = process.env.APP_URL?.trim();
+    if (appUrl && appUrl !== 'MY_APP_URL' && /^https?:\/\//i.test(appUrl)) {
+      return `${appUrl.replace(/\/+$/, '')}/health`;
+    }
+
+    if (learnedPublicBaseUrl) {
+      return `${learnedPublicBaseUrl}/health`;
+    }
+
+    return `http://127.0.0.1:${PORT}/health`;
+  }
+
+  // Enabled forever unless explicitly disabled with ENABLE_SELF_PING=false
+  const selfPingEnabled = process.env.ENABLE_SELF_PING !== 'false';
 
   let lastSelfPingAt: string | null = null;
   let lastSelfPingOk: boolean | null = null;
+  let lastSelfPingTarget = resolveSelfPingTargetUrl();
   let isSelfPingInFlight = false;
   let selfPingTimer: ReturnType<typeof setInterval> | null = null;
   let selfPingWarmupTimer: ReturnType<typeof setTimeout> | null = null;
   let selfPingRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
+  getRuntimeSelfPingSnapshot = () => ({
+    enabled: selfPingEnabled,
+    targetUrl: resolveSelfPingTargetUrl(),
+    lastPingAt: lastSelfPingAt,
+    lastPingOk: lastSelfPingOk,
+  });
+
   async function executeSelfPing(isRetry = false) {
     if (isShuttingDown || isSelfPingInFlight) return;
     isSelfPingInFlight = true;
+    const targetUrl = resolveSelfPingTargetUrl();
+    lastSelfPingTarget = targetUrl;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 12_000);
     try {
-      const resp = await fetch(selfPingTargetUrl, {
+      const resp = await fetch(targetUrl, {
         method: 'GET',
         signal: controller.signal,
         headers: {
-          'User-Agent': 'AuraAssistant-KeepAlive/1.0',
+          'User-Agent': 'WaNexus-ForeverKeepAlive/2.0',
           'Cache-Control': 'no-store',
         },
       });
@@ -4419,14 +7120,16 @@ async function bootstrap() {
     } catch (err) {
       lastSelfPingAt = new Date().toISOString();
       lastSelfPingOk = false;
-      console.warn(`[KeepAlive] Self-ping failed (${selfPingTargetUrl}): ${(err as Error).message}`);
-      // Schedule one quick retry after 15s so a transient hiccup never leaves a 10m gap
+      console.warn(`[KeepAlive] Self-ping failed (${targetUrl}): ${(err as Error).message}`);
+      // Fallback loopback ping so local event-loop health stays confirmed + quick 15s retry
+      if (!targetUrl.includes('127.0.0.1')) {
+        void fetch(`http://127.0.0.1:${PORT}/health`).catch(() => {});
+      }
       if (!isRetry && !isShuttingDown && !selfPingRetryTimer) {
         selfPingRetryTimer = setTimeout(() => {
           selfPingRetryTimer = null;
           void executeSelfPing(true);
         }, 15_000);
-        selfPingRetryTimer.unref?.();
       }
     } finally {
       clearTimeout(timeoutId);
@@ -4445,11 +7148,14 @@ async function bootstrap() {
       geminiKeyPool: geminiPool.getStats(),
       openRouter: openRouterReader.getStats(),
       postgres: getPostgresStatus(),
+      firestore: getFirestoreAdminDiagnostics(),
       clientBots: clientBotManager.getSummaryCounts(),
+      watchdog: selfHealingWatchdog ? selfHealingWatchdog.getStatus() : null,
+      mobileOffload: mobileOffloadQueue.getStatusSnapshot(),
       selfPing: {
         enabled: selfPingEnabled,
         intervalMs: SELF_PING_INTERVAL_MS,
-        targetUrl: selfPingTargetUrl,
+        targetUrl: lastSelfPingTarget || resolveSelfPingTargetUrl(),
         lastPingAt: lastSelfPingAt,
         lastPingOk: lastSelfPingOk,
       },
@@ -4488,21 +7194,20 @@ async function bootstrap() {
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[WaNexus] Control Plane & Bot Studio running on http://0.0.0.0:${PORT}`);
 
-    // Start 5-minute Keep-Alive Self-Ping on Render / Production so instance stays awake 24/7
+    // Start 4-minute Forever Keep-Alive Self-Ping so Render / Cloud instance stays awake 24/7
     if (selfPingEnabled) {
+      const targetAtBoot = resolveSelfPingTargetUrl();
       console.log(
-        `[KeepAlive] Self-Ping enabled: pinging ${selfPingTargetUrl} every ${SELF_PING_INTERVAL_MS / 60000} minutes.`
+        `[KeepAlive] Forever Self-Ping enabled: pinging ${targetAtBoot} every ${SELF_PING_INTERVAL_MS / 60000} minutes.`
       );
       selfPingWarmupTimer = setTimeout(() => {
         selfPingWarmupTimer = null;
         void executeSelfPing();
       }, 15_000);
-      selfPingWarmupTimer.unref?.();
 
       selfPingTimer = setInterval(() => {
         void executeSelfPing();
       }, SELF_PING_INTERVAL_MS);
-      selfPingTimer.unref?.();
     }
 
     // Wait briefly for cloud hydration without blocking HTTP server startup, then auto-resume WhatsApp
@@ -4543,6 +7248,8 @@ async function bootstrap() {
     if (selfPingTimer) clearInterval(selfPingTimer);
     if (selfPingWarmupTimer) clearTimeout(selfPingWarmupTimer);
     if (selfPingRetryTimer) clearTimeout(selfPingRetryTimer);
+    autonomousAgentEngine?.stopScheduler();
+    selfHealingWatchdog?.stop();
     clearInterval(cleanupTimer);
 
     if (currentSocket) {

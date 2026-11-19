@@ -4,7 +4,7 @@
     "contactJid": "8801700000000@s.whatsapp.net",
     "contactName": "Rafi",
     "detectedDistrict": "Standard",
-    "lastSummary": "গুড নাইট, আমার এখনো সকাল হয় নাই!",
+    "lastSummary": "Contact: Rafi (4 msgs saved, Vibe: Sensitive/Emotional/Work/Urgent) • Key Topics/Said: গুড নাইট, আমার এখনো সকাল হয় নাই! | [ • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: square, good, brightness=176 • Caption/Text… • Owner/Prior Stance: আরে বাহ, আপনার রাজ্যে তো এখনো রাত চলছে দেখছি! স্যার এই মুহূর্তে ব্যস্ত আছেন, তাই আমি ওনার পার্… | Simulator, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়ে… • Latest [2026-11-17 22:07]: Simulator, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
     "turns": [
       {
         "role": "user",
@@ -15,8 +15,38 @@
         "role": "assistant",
         "text": "আরে বাহ, আপনার রাজ্যে তো এখনো রাত চলছে দেখছি! স্যার এই মুহূর্তে ব্যস্ত আছেন, তাই আমি ওনার পার্সোনাল অ্যাসিস্ট্যান্ট হয়ে হাল ধরেছি। মিষ্টি একটা ঘুম দেওয়ার আগে স্যারের জন্য কোনো মেসেজ থাকলে আমাকে বলে রাখতে পারেন, অথবা ঘুম না এলে আমার সাথেও একটু আড্ডা দিতে পারেন!",
         "timestamp": "2026-11-15T06:32:01.883Z"
+      },
+      {
+        "role": "user",
+        "text": "[ • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: square, good, brightness=176 • Caption/Text: \"Ektu bikele ghurte ber holam\"]",
+        "timestamp": "2026-11-17T22:07:06.670Z"
+      },
+      {
+        "role": "assistant",
+        "text": "Simulator, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
+        "timestamp": "2026-11-17T22:07:06.670Z"
       }
     ],
-    "updatedAt": "2026-11-15T06:32:01.883Z"
+    "updatedAt": "2026-11-17T22:07:06.677Z"
+  },
+  "8801711000001_s_whatsapp_net": {
+    "chatId": "8801711000001_s_whatsapp_net",
+    "contactJid": "8801711000001@s.whatsapp.net",
+    "contactName": "Ayesha",
+    "detectedDistrict": "Standard",
+    "lastSummary": "Contact: Ayesha (2 msgs saved, Vibe: Sensitive/Emotional) • Key Topics/Said: [WhatsApp Story • Photo • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: portrait, good, brigh… • Owner/Prior Stance: Ayesha, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে … • Latest [2026-11-17 22:07]: Ayesha, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
+    "turns": [
+      {
+        "role": "user",
+        "text": "[WhatsApp Story • Photo • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: portrait, good, brightness=176 • Caption/Text: \"Ektu bikele ghurte ber holam\"]",
+        "timestamp": "2026-11-17T22:07:45.516Z"
+      },
+      {
+        "role": "assistant",
+        "text": "Ayesha, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
+        "timestamp": "2026-11-17T22:07:45.516Z"
+      }
+    ],
+    "updatedAt": "2026-11-17T22:07:45.518Z"
   }
 }

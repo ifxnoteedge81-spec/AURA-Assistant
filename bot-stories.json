@@ -1,0 +1,31 @@
+[
+  {
+    "id": "media_1794953265521_nvxj",
+    "timestamp": "2026-11-17T22:07:45.521Z",
+    "tokensUsedForRead": 0,
+    "source": "simulator",
+    "senderName": "Ayesha",
+    "senderJid": "8801711000001@s.whatsapp.net",
+    "kind": "photo",
+    "sentiment": "bad_critique",
+    "banglaSceneLabel": "মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট",
+    "compactContextLine": "[WhatsApp Story • Photo • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: portrait, good, brightness=176 • Caption/Text: \"Ektu bikele ghurte ber holam\"]",
+    "reactionSent": "😕",
+    "replySent": "Ayesha, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
+    "replyMode": "zero_token"
+  },
+  {
+    "id": "media_1794953226682_htdb",
+    "timestamp": "2026-11-17T22:07:06.682Z",
+    "tokensUsedForRead": 0,
+    "source": "simulator",
+    "senderName": "Simulator Contact",
+    "senderJid": "8801700000000@s.whatsapp.net",
+    "sentiment": "bad_critique",
+    "banglaSceneLabel": "মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট",
+    "compactContextLine": "[ • মন খারাপ / সমস্যা / নেগেটিভ কন্টেন্ট • Visual: square, good, brightness=176 • Caption/Text: \"Ektu bikele ghurte ber holam\"]",
+    "reactionSent": "😕",
+    "replySent": "Simulator, এটা দেখে একটু মন খারাপ বা অস্বস্তি লাগলো—সত্যি বলতে ভালো লাগেনি ব্যাপারটা 😔 কী হয়েছে বলবে?",
+    "replyMode": "zero_token"
+  }
+]

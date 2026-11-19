@@ -112,6 +112,51 @@
           "type": "object",
           "description": "Map of WhatsApp group JIDs to per-group AI command prompts and member mention target objectives."
         },
+        "mediaIntelligenceEnabled": {
+          "type": "boolean",
+          "description": "Enables zero-token local media and story recognition."
+        },
+        "mediaZeroTokenReplyMode": {
+          "type": "boolean",
+          "description": "Forces 0-token offline text replies for media without calling text LLMs."
+        },
+        "storyAutoReadEnabled": {
+          "type": "boolean",
+          "description": "Enables automatic WhatsApp Story reading."
+        },
+        "storyAutoReactEnabled": {
+          "type": "boolean",
+          "description": "Enables automatic like reactions on WhatsApp Stories."
+        },
+        "storyAutoReplyEnabled": {
+          "type": "boolean",
+          "description": "Enables direct inbox text replies to WhatsApp Stories."
+        },
+        "storyCooldownMs": {
+          "type": "number",
+          "description": "Per-contact cooldown in milliseconds for story replies."
+        },
+        "storyWhitelistMode": {
+          "type": "string",
+          "enum": ["all", "selected_only"],
+          "description": "Whether AI reads stories from all contacts or only selected whitelist contacts."
+        },
+        "storyAllowedContacts": {
+          "type": "array",
+          "description": "Custom list of selected contacts allowed for Story reading and direct inbox replies."
+        },
+        "selfChatCopilotEnabled": {
+          "type": "boolean",
+          "description": "Enables direct Owner Self-Chat (Message Yourself) Copilot & Video Mistake Analyzer."
+        },
+        "selfChatZeroTokenOnly": {
+          "type": "boolean",
+          "description": "Locks Self-Chat Copilot strictly to 0 API tokens and low-RAM local execution."
+        },
+        "contactPolicies": {
+          "type": "array",
+          "description": "Per-contact engagement & hold rules (long_engage, hold_wait, mute_ai)."
+        },
         "configUpdatedAt": {
           "type": "string",
           "maxLength": 64,
