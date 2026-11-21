@@ -28,6 +28,7 @@ import {
   clearRateLimit,
   createMathChallenge,
   getClientIp,
+  getTelegramOwnerIds,
   isPinConfigured,
   issuePreAuthToken,
   issueSessionToken,
@@ -38,6 +39,7 @@ import {
   verifyGoogleFirebaseIdToken,
   verifyMathChallenge,
   verifyPreAuthToken,
+  verifyTelegramWebAppInitData,
 } from '../server/authSecurity.ts';
 import {
   TelegramBotController,
@@ -140,6 +142,8 @@ app.get('/api/auth/status', (_req, res) => {
   res.json({
     ownerEmail: OWNER_EMAIL,
     pinConfigured: isPinConfigured(),
+    telegramBotConfigured: Boolean(getTelegramBotToken()),
+    telegramOwnerConfigured: getTelegramOwnerIds().length > 0,
   });
 });
 
@@ -223,7 +227,7 @@ app.post('/api/auth/pin-unlock', (req, res) => {
     return;
   }
   if (!isPinConfigured()) {
-    res.status(400).json({ error: 'No Security PIN set yet. Set DASHBOARD_PIN in Vercel Env Vars.' });
+    res.status(400).json({ error: 'No Security PIN set yet. Set DASHBOARD_PIN in Netlify Env Vars.' });
     return;
   }
   if (!verifyMathChallenge(String(req.body?.challengeToken || ''), String(req.body?.challengeAnswer ?? ''))) {
@@ -238,6 +242,88 @@ app.post('/api/auth/pin-unlock', (req, res) => {
   }
   clearRateLimit(ip);
   res.json({ sessionToken: issueSessionToken(OWNER_EMAIL), email: OWNER_EMAIL, pinConfigured: true });
+});
+
+app.post('/api/auth/telegram-webapp', (req, res) => {
+  const ip = getClientIp(req);
+  const limit = checkRateLimit(ip);
+  if (!limit.allowed) {
+    res.status(429).json({ error: `Locked. Try again in ${limit.retryAfterSec}s.` });
+    return;
+  }
+
+  try {
+    const botToken = getTelegramBotToken();
+    if (!botToken) {
+      res.status(400).json({
+        error: 'TELEGRAM_BOT_TOKEN is not set in Netlify Environment Variables yet.',
+      });
+      return;
+    }
+
+    const initData = String(req.body?.initData || '');
+    const tgUser = verifyTelegramWebAppInitData(initData, botToken);
+    const ownerIds = getTelegramOwnerIds();
+
+    if (ownerIds.length === 0) {
+      res.status(403).json({
+        error: `TELEGRAM_OWNER_ID is not set in Netlify Environment Variables. Your Telegram User ID is ${tgUser.id} — add it as TELEGRAM_OWNER_ID, or use the 2FA PIN Unlock tab.`,
+        telegramUserId: tgUser.id,
+      });
+      return;
+    }
+
+    if (!ownerIds.includes(tgUser.id)) {
+      recordAuthFailure(ip);
+      res.status(403).json({
+        error: `Access denied. Telegram User ID ${tgUser.id} is not authorized in TELEGRAM_OWNER_ID.`,
+        telegramUserId: tgUser.id,
+      });
+      return;
+    }
+
+    clearRateLimit(ip);
+
+    if (isPinConfigured()) {
+      const optionalPin = String(req.body?.pin || '').trim();
+      if (optionalPin) {
+        if (!verifyConfiguredPin(optionalPin)) {
+          const failure = recordAuthFailure(ip);
+          res.status(401).json({
+            error: `Incorrect 2FA Security PIN (${failure.attemptsLeft} attempts remaining).`,
+          });
+          return;
+        }
+        res.json({
+          requiresPin: false,
+          sessionToken: issueSessionToken(OWNER_EMAIL),
+          email: OWNER_EMAIL,
+          pinConfigured: true,
+          telegramUser: tgUser,
+        });
+        return;
+      }
+
+      res.json({
+        requiresPin: true,
+        preAuthToken: issuePreAuthToken(OWNER_EMAIL),
+        email: OWNER_EMAIL,
+        telegramUser: tgUser,
+      });
+      return;
+    }
+
+    res.json({
+      requiresPin: false,
+      sessionToken: issueSessionToken(OWNER_EMAIL),
+      email: OWNER_EMAIL,
+      pinConfigured: false,
+      telegramUser: tgUser,
+    });
+  } catch (err) {
+    recordAuthFailure(ip);
+    res.status(401).json({ error: (err as Error).message || 'Telegram Mini App verification failed.' });
+  }
 });
 
 // Protect authenticated /api/* routes (exempt /api/auth/* & public Telegram Webhook)
@@ -543,10 +629,14 @@ app.post('/api/cloud/sync', async (req, res) => {
 
 app.get('/api/security/stats', (_req, res) => {
   res.json({
-    dailyReplyCount: 0,
-    dailyReplyLimit: botConfig.dailyReplyLimit ?? 200,
+    ownerEmail: OWNER_EMAIL,
+    pinConfigured: isPinConfigured(),
+    envPinActive: Boolean(process.env.DASHBOARD_PIN?.trim()),
+    dailyReplyStats: { count: 0, limit: botConfig.dailyReplyLimit ?? 200 },
     activeTakeovers: [],
-    recentBlockedCount: 0,
+    humanTypingEnabled: Boolean(botConfig.humanTypingEnabled),
+    dailyReplyLimit: botConfig.dailyReplyLimit ?? 200,
+    markOnlineOnConnect: false,
   });
 });
 
@@ -565,16 +655,34 @@ app.get('/api/memories/:chatId/archive', (_req, res) => res.json({ messages: [] 
 
 app.get('/api/dictionary', async (req, res) => {
   await ensureServerlessHydrated();
-  const q = String(req.query.q || '').trim().toLowerCase();
-  const items = q
-    ? dictionaryEntries.filter(
-        (d) =>
-          d.term.toLowerCase().includes(q) ||
-          d.meaning.toLowerCase().includes(q) ||
-          d.district.toLowerCase().includes(q)
-      )
-    : dictionaryEntries;
-  res.json({ entries: items, total: dictionaryEntries.length });
+  const q = String(req.query.search || req.query.q || '').trim().toLowerCase();
+  const district = String(req.query.district || 'ALL').trim();
+  const page = Math.max(1, Number(req.query.page || 1) || 1);
+  const limit = Math.max(10, Math.min(100, Number(req.query.limit || 50) || 50));
+
+  let filtered = dictionaryEntries;
+  if (district && district !== 'ALL') {
+    filtered = filtered.filter((d) => d.district.toLowerCase() === district.toLowerCase());
+  }
+  if (q) {
+    filtered = filtered.filter(
+      (d) =>
+        d.term.toLowerCase().includes(q) ||
+        d.meaning.toLowerCase().includes(q) ||
+        d.district.toLowerCase().includes(q)
+    );
+  }
+  const totalCount = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+  const start = (page - 1) * limit;
+  res.json({
+    entries: filtered.slice(start, start + limit),
+    page,
+    totalPages,
+    totalCount,
+    total: dictionaryEntries.length,
+    storageMode: 'firestore',
+  });
 });
 
 app.post('/api/dictionary', async (req, res) => {
@@ -625,29 +733,52 @@ app.delete('/api/dictionary', async (_req, res) => {
 });
 
 app.get('/api/groups', (_req, res) => res.json({ groups: [] }));
-app.get('/api/contacts', (_req, res) => res.json({ contacts: [] }));
-app.get('/api/media/stories', (_req, res) => res.json({ stories: [] }));
+app.get('/api/contacts', (_req, res) => res.json({ connected: false, contacts: [] }));
+app.get('/api/media/stories', (_req, res) => {
+  const geminiStats = geminiPool.getStats();
+  const openRouterStats = openRouterReader.getStats();
+  const snap = tokenTelemetry.getSnapshot({
+    whatsappUsedToday: 0,
+    whatsappDailyLimit: botConfig.dailyReplyLimit ?? 200,
+    configuredGeminiKeys: geminiStats.configuredKeysCount,
+    geminiSlotCooldowns: geminiPool.getSlotCooldownStats(),
+    openRouterConfiguredKeys: openRouterStats.configuredKeysCount,
+    openRouterFreeModelsCount: openRouterStats.dynamicPool?.discoveredFreeModelsCount || 0,
+    openRouterActiveModel: openRouterStats.dynamicPool?.activeFreeModel || openRouterStats.primaryModel,
+  });
+  res.json({ stories: [], stats: snap.zeroTokenMedia });
+});
 app.get('/api/assistant/direct-commands', (_req, res) => res.json({ commands: [] }));
 app.post('/api/assistant/direct-command', (_req, res) =>
   res.status(400).json({ error: 'WhatsApp direct messaging requires active WhatsApp socket; use Telegram Bot /agent instead.' })
 );
 app.get('/api/assistant/self-chat', (_req, res) =>
   res.json({
-    enabled: Boolean(botConfig.selfChatCopilotEnabled),
+    enabled: botConfig.selfChatCopilotEnabled !== false,
     zeroTokenOnly: Boolean(botConfig.selfChatZeroTokenOnly),
-    logs: [],
+    connectedPhone: '',
+    botStatus: 'disconnected',
+    memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+    history: [],
+    contactPolicies: botConfig.contactPolicies || [],
   })
 );
-app.post('/api/assistant/self-chat', (_req, res) => res.json({ ok: true }));
+app.post('/api/assistant/self-chat', (_req, res) =>
+  res.json({
+    ok: true,
+    history: [],
+    memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+  })
+);
 app.get('/api/client-bots', (_req, res) => res.json({ bots: [] }));
 app.get('/api/source-files', (_req, res) => res.json({ files: [] }));
 
 app.post('/api/antilink/test', (req, res) => {
   const text = String(req.body?.message || req.body?.text || '');
-  const hasLink = /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|bit\.ly\/)/i.test(text);
+  const matches = text.match(/(?:https?:\/\/[^\s]+|www\.[^\s]+|(?:t\.me|telegram\.me|wa\.me|bit\.ly)\/[^\s]+)/gi) || [];
   res.json({
-    blocked: hasLink,
-    reason: hasLink ? 'External URL or Telegram/WhatsApp invite link detected.' : 'Clean message (no links detected).',
+    hasLink: matches.length > 0,
+    matches,
   });
 });
 
@@ -703,7 +834,15 @@ app.post('/api/simulator/message', async (req, res) => {
     providerUsed = 'autoreply_fallback';
   }
 
-  res.json({ ok: true, reply, providerUsed, blockedByAntilink: false });
+  res.json({
+    ok: true,
+    deleted: false,
+    reply,
+    note: `Provider: ${providerUsed}`,
+    tokensSpent: 0,
+    ruleTriggered: providerUsed,
+    config: botConfig,
+  });
 });
 
 app.get('/health', (_req, res) => {

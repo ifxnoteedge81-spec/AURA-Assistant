@@ -127,6 +127,7 @@ import {
   clearRateLimit,
   createMathChallenge,
   getClientIp,
+  getTelegramOwnerIds,
   isPinConfigured,
   issuePreAuthToken,
   issueSessionToken,
@@ -138,6 +139,7 @@ import {
   verifyGoogleFirebaseIdToken,
   verifyMathChallenge,
   verifyPreAuthToken,
+  verifyTelegramWebAppInitData,
 } from './server/authSecurity.ts';
 import { ClientBotManager, type ClientBotPatchInput } from './server/clientBotManager.ts';
 import {
@@ -4593,6 +4595,8 @@ async function bootstrap() {
     res.json({
       ownerEmail: OWNER_EMAIL,
       pinConfigured: isPinConfigured(),
+      telegramBotConfigured: Boolean(getTelegramBotToken()),
+      telegramOwnerConfigured: getTelegramOwnerIds().length > 0,
     });
   });
 
@@ -4735,6 +4739,91 @@ async function bootstrap() {
       email: OWNER_EMAIL,
       pinConfigured: true,
     });
+  });
+
+  app.post('/api/auth/telegram-webapp', (req, res) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip);
+    if (!limit.allowed) {
+      res.status(429).json({ error: `Locked. Try again in ${limit.retryAfterSec}s.` });
+      return;
+    }
+
+    try {
+      const botToken = getTelegramBotToken();
+      if (!botToken) {
+        res.status(400).json({
+          error: 'TELEGRAM_BOT_TOKEN is not configured on this server.',
+        });
+        return;
+      }
+
+      const initData = String(req.body?.initData || '');
+      const tgUser = verifyTelegramWebAppInitData(initData, botToken);
+      const ownerIds = getTelegramOwnerIds();
+
+      if (ownerIds.length === 0) {
+        res.status(403).json({
+          error: `TELEGRAM_OWNER_ID is not configured. Your Telegram User ID is ${tgUser.id} — add it to TELEGRAM_OWNER_ID, or unlock via 2FA PIN.`,
+          telegramUserId: tgUser.id,
+        });
+        return;
+      }
+
+      if (!ownerIds.includes(tgUser.id)) {
+        recordAuthFailure(ip);
+        pushLog('system', `TG:${tgUser.id}`, 'Blocked unauthorized Telegram Mini App unlock attempt.', 'blocked');
+        res.status(403).json({
+          error: `Access denied. Telegram User ID ${tgUser.id} is not in TELEGRAM_OWNER_ID.`,
+          telegramUserId: tgUser.id,
+        });
+        return;
+      }
+
+      clearRateLimit(ip);
+
+      if (isPinConfigured()) {
+        const optionalPin = String(req.body?.pin || '').trim();
+        if (optionalPin) {
+          if (!verifyConfiguredPin(optionalPin)) {
+            const failure = recordAuthFailure(ip);
+            res.status(401).json({
+              error: `Incorrect 2FA Security PIN (${failure.attemptsLeft} attempts remaining).`,
+            });
+            return;
+          }
+          pushLog('system', `TG:${tgUser.id}`, 'Owner unlocked dashboard via Telegram Mini App + PIN.', 'success');
+          res.json({
+            requiresPin: false,
+            sessionToken: issueSessionToken(OWNER_EMAIL),
+            email: OWNER_EMAIL,
+            pinConfigured: true,
+            telegramUser: tgUser,
+          });
+          return;
+        }
+
+        res.json({
+          requiresPin: true,
+          preAuthToken: issuePreAuthToken(OWNER_EMAIL),
+          email: OWNER_EMAIL,
+          telegramUser: tgUser,
+        });
+        return;
+      }
+
+      pushLog('system', `TG:${tgUser.id}`, 'Owner unlocked dashboard via Telegram Mini App.', 'success');
+      res.json({
+        requiresPin: false,
+        sessionToken: issueSessionToken(OWNER_EMAIL),
+        email: OWNER_EMAIL,
+        pinConfigured: false,
+        telegramUser: tgUser,
+      });
+    } catch (err) {
+      recordAuthFailure(ip);
+      res.status(401).json({ error: (err as Error).message || 'Telegram Mini App verification failed.' });
+    }
   });
 
   // Scoped Client Portal Middleware (strictly isolated to a single botId + valid clientAccessKey + active === true)

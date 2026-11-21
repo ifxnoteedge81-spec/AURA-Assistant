@@ -125,7 +125,7 @@ export function SecurityAntiBanPanel({
     }
   }
 
-  const dailyCount = stats?.dailyReplyStats.count ?? 0;
+  const dailyCount = stats?.dailyReplyStats?.count ?? 0;
   const dailyLimit = config.dailyReplyLimit || 120;
 
   return (
@@ -159,7 +159,7 @@ export function SecurityAntiBanPanel({
         <div className="p-5">
           <div className="text-xs font-medium text-slate-500">Stealth &amp; Takeover Pauses</div>
           <div className="mt-1.5 text-lg font-semibold text-slate-900 tabular-nums">
-            {stats?.activeTakeovers.length ?? 0} Paused Chats
+            {stats?.activeTakeovers?.length ?? 0} Paused Chats
           </div>
           <div className="mt-1 text-xs text-slate-500">
             Online indicator hidden (always-online OFF)
@@ -338,7 +338,7 @@ export function SecurityAntiBanPanel({
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {(stats?.activeTakeovers.length ?? 0) > 0 && (
+            {(stats?.activeTakeovers?.length ?? 0) > 0 && (
               <button
                 type="button"
                 onClick={() => handleResumeTakeover()}
@@ -358,7 +358,7 @@ export function SecurityAntiBanPanel({
           </div>
         </div>
 
-        {!stats || stats.activeTakeovers.length === 0 ? (
+        {!stats || !Array.isArray(stats.activeTakeovers) || stats.activeTakeovers.length === 0 ? (
           <div className="p-6 text-sm text-slate-500">
             No private chats are currently paused. Whenever you type a manual message in any DM, it appears here until AI resumes.
           </div>

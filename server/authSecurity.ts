@@ -361,6 +361,85 @@ export async function verifyGoogleFirebaseIdToken(
   };
 }
 
+export interface TelegramWebAppUser {
+  id: string;
+  firstName: string;
+  username?: string;
+}
+
+export function getTelegramOwnerIds(): string[] {
+  const raw = String(process.env.TELEGRAM_OWNER_ID || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(/[\s,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function verifyTelegramWebAppInitData(
+  initData: string,
+  botToken: string
+): TelegramWebAppUser {
+  const raw = String(initData || '').trim();
+  if (!raw) {
+    throw new Error('Missing Telegram Mini App initData.');
+  }
+  if (!botToken) {
+    throw new Error('TELEGRAM_BOT_TOKEN is not configured on the server.');
+  }
+
+  const params = new URLSearchParams(raw);
+  const hash = params.get('hash') || '';
+  if (!hash || !/^[0-9a-f]{64}$/i.test(hash)) {
+    throw new Error('Invalid Telegram Mini App signature.');
+  }
+
+  const authDateSec = Number(params.get('auth_date') || 0);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(authDateSec) || authDateSec <= 0 || nowSec - authDateSec > 24 * 60 * 60) {
+    throw new Error('Telegram Mini App session expired. Close and reopen the Mini App.');
+  }
+
+  const pairs: string[] = [];
+  for (const [key, value] of params.entries()) {
+    if (key === 'hash') continue;
+    pairs.push(`${key}=${value}`);
+  }
+  pairs.sort();
+  const dataCheckString = pairs.join('\n');
+
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  const expectedHash = crypto
+    .createHmac('sha256', secretKey)
+    .update(dataCheckString)
+    .digest('hex');
+
+  const hashBuf = Buffer.from(hash.toLowerCase(), 'utf8');
+  const expectedBuf = Buffer.from(expectedHash.toLowerCase(), 'utf8');
+  if (hashBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(hashBuf, expectedBuf)) {
+    throw new Error('Telegram Mini App cryptographic check failed.');
+  }
+
+  const userJson = params.get('user');
+  if (!userJson) {
+    throw new Error('Telegram user payload missing from Mini App initData.');
+  }
+  const parsedUser = JSON.parse(userJson) as {
+    id?: number | string;
+    first_name?: string;
+    username?: string;
+  };
+  if (!parsedUser?.id) {
+    throw new Error('Telegram user ID missing from Mini App initData.');
+  }
+
+  return {
+    id: String(parsedUser.id),
+    firstName: String(parsedUser.first_name || 'Owner'),
+    username: parsedUser.username ? String(parsedUser.username) : undefined,
+  };
+}
+
 export function requireOwnerAuth(req: Request, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization || '';
   const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';

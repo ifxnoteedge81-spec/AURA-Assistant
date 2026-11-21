@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
 import {
   BookOpen,
   Cloud,
@@ -125,6 +125,54 @@ const DEFAULT_STATUS: BotStatusResponse = {
   },
   logs: [],
 };
+
+class PanelErrorBoundary extends Component<
+  { section: string; onReset: () => void; children: ReactNode },
+  { hasError: boolean; errorMsg: string }
+> {
+  constructor(props: { section: string; onReset: () => void; children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, errorMsg: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, errorMsg: error.message || 'Unexpected UI error.' };
+  }
+
+  componentDidUpdate(prevProps: { section: string }) {
+    if (prevProps.section !== this.props.section && this.state.hasError) {
+      this.setState({ hasError: false, errorMsg: '' });
+    }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[PanelErrorBoundary]', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="bg-white border border-red-200 rounded-xl p-6 space-y-3">
+          <div className="text-base font-semibold text-red-700">This panel encountered a display error</div>
+          <div className="text-xs font-mono text-slate-600 bg-slate-50 p-3 rounded border border-slate-200">
+            {this.state.errorMsg}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              this.setState({ hasError: false, errorMsg: '' });
+              this.props.onReset();
+            }}
+            className="px-4 py-2 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 cursor-pointer"
+          >
+            Reload Panel
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const portalParams =
@@ -545,6 +593,7 @@ export default function App() {
         </header>
 
         <main className="flex-1 p-6 lg:p-8 max-w-[1280px] w-full mx-auto">
+          <PanelErrorBoundary section={section} onReset={() => void fetchStatus()}>
           {section === 'overview' && (
             <PairingOverview
               botState={botState}
@@ -621,6 +670,7 @@ export default function App() {
           )}
 
           {section === 'source' && <SourceExplorer />}
+          </PanelErrorBoundary>
         </main>
       </div>
       <OfflineIndicator />
