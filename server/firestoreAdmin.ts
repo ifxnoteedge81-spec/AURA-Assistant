@@ -8,13 +8,20 @@ let initAttempted = false;
 let initMode: 'service_account' | 'adc' | 'local_only' = 'local_only';
 
 function loadAppletConfig(): { projectId?: string; firestoreDatabaseId?: string } {
-  try {
-    const configPath = path.resolve('./firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const candidates = [
+    path.resolve('./firebase-applet-config.json'),
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+    path.resolve('../firebase-applet-config.json'),
+    path.resolve('../../firebase-applet-config.json'),
+  ];
+  for (const configPath of candidates) {
+    try {
+      if (fs.existsSync(configPath)) {
+        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      }
+    } catch {
+      // try next candidate
     }
-  } catch {
-    // ignore
   }
   return {};
 }

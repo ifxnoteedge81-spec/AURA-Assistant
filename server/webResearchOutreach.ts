@@ -1178,13 +1178,26 @@ export function registerWebOutreachRoutes(
     void adminLoadDocument<Partial<PersistedOutreachStore>>('bot_outreach', 'primary')
       .then((cloudDoc) => {
         if (!cloudDoc) return;
+        let changed = false;
         if (store.leads.length === 0 && Array.isArray(cloudDoc.leads) && cloudDoc.leads.length > 0) {
           store.leads = cloudDoc.leads.slice(0, MAX_LEADS);
-          if (cloudDoc.policy) {
-            store.policy = { ...DEFAULT_OUTREACH_POLICY, ...cloudDoc.policy };
-          }
-          saveStoreToDisk();
+          changed = true;
         }
+        if (store.researchHistory.length === 0 && Array.isArray(cloudDoc.researchHistory) && cloudDoc.researchHistory.length > 0) {
+          store.researchHistory = cloudDoc.researchHistory.slice(0, MAX_RESEARCH_HISTORY);
+          changed = true;
+        }
+        if (cloudDoc.policy) {
+          store.policy = { ...DEFAULT_OUTREACH_POLICY, ...cloudDoc.policy };
+        }
+        if (cloudDoc.dailyStats?.date === todayDateKey()) {
+          store.dailyStats = {
+            date: cloudDoc.dailyStats.date,
+            emailsSentToday: Math.max(store.dailyStats.emailsSentToday, Number(cloudDoc.dailyStats.emailsSentToday || 0)),
+            whatsappSentToday: Math.max(store.dailyStats.whatsappSentToday, Number(cloudDoc.dailyStats.whatsappSentToday || 0)),
+          };
+        }
+        if (changed) saveStoreToDisk();
       })
       .catch(() => {});
   }

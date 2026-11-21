@@ -1,11 +1,13 @@
 import 'dotenv/config';
 import express from 'express';
+import { ThinkingLevel } from '@google/genai';
 import {
   DEFAULT_FIRST_GREETING,
   DEFAULT_OWNER_BIO,
   DEFAULT_OWNER_BOUNDARIES,
   DEFAULT_STRICT_LOGIC_RULES,
   type AssistantConfigFields,
+  type DictionaryEntry,
 } from '../server/assistantEngine.ts';
 import { GeminiKeyPool } from '../server/geminiKeyPool.ts';
 import { OpenRouterReader } from '../server/openRouterReader.ts';
@@ -13,7 +15,12 @@ import { TokenTelemetryTracker } from '../server/tokenTelemetry.ts';
 import { registerWebOutreachRoutes, type WebOutreachController } from '../server/webResearchOutreach.ts';
 import { MobileOffloadQueueManager, registerMobileOffloadRoutes } from '../server/mobileOffloadQueue.ts';
 import { AutonomousAgentEngine, registerAutonomousAgentRoutes } from '../server/autonomousAgent.ts';
-import { getAdminFirestore, getFirestoreAdminDiagnostics } from '../server/firestoreAdmin.ts';
+import {
+  adminLoadDocument,
+  adminSaveDocument,
+  getAdminFirestore,
+  getFirestoreAdminDiagnostics,
+} from '../server/firestoreAdmin.ts';
 import {
   OWNER_EMAIL,
   checkRateLimit,
@@ -445,7 +452,37 @@ app.get('/api/system/env-status', (_req, res) => {
   });
 });
 
-app.get('/api/bot/status', (_req, res) => {
+let dictionaryEntries: DictionaryEntry[] = [];
+let configHydrated = false;
+
+async function ensureServerlessHydrated() {
+  if (configHydrated) return;
+  configHydrated = true;
+  try {
+    const cloud = await adminLoadDocument<{
+      config?: Partial<AssistantConfigFields> & Record<string, unknown>;
+      dictionary?: DictionaryEntry[];
+    }>('bot_serverless_config', 'primary');
+    if (cloud?.config && typeof cloud.config === 'object') {
+      botConfig = { ...botConfig, ...cloud.config };
+    }
+    if (Array.isArray(cloud?.dictionary)) {
+      dictionaryEntries = cloud.dictionary.slice(0, 500);
+    }
+  } catch {
+    // ignore hydration errors
+  }
+}
+
+async function persistServerlessConfig() {
+  await adminSaveDocument('bot_serverless_config', 'primary', {
+    config: botConfig,
+    dictionary: dictionaryEntries.slice(0, 500),
+  }).catch(() => false);
+}
+
+app.get('/api/bot/status', async (_req, res) => {
+  await ensureServerlessHydrated();
   const { mode: firestoreAdminMode } = getAdminFirestore();
   const geminiStats = geminiPool.getStats();
   const openRouterStats = openRouterReader.getStats();
@@ -455,7 +492,9 @@ app.get('/api/bot/status', (_req, res) => {
     pairingCode: null,
     pairingPhone: null,
     sessionExists: false,
-    lastError: 'Vercel Serverless runs 24/7 Telegram AI + Web Studio (Baileys WhatsApp requires persistent Termux/Docker).',
+    lastError: isNetlifyRuntime()
+      ? 'Netlify 24/7 + 15m Background Worker runs Telegram AI, Mini App & Web Studio (WhatsApp Baileys requires persistent Node/Termux).'
+      : 'Serverless mode runs 24/7 Telegram AI & Web Studio.',
     geminiConfigured: geminiPool.hasKeys(),
     geminiKeyPool: geminiStats,
     openRouterConfigured: openRouterReader.hasKeys(),
@@ -473,19 +512,198 @@ app.get('/api/bot/status', (_req, res) => {
     firestoreAdminMode,
     config: botConfig,
     logs: eventLogs,
-    dictionaryCount: 0,
+    dictionaryCount: dictionaryEntries.length,
     memoryCount: 0,
     unreadNotesCount: 0,
-    dailyReplyStats: { count: 0, limit: botConfig.dailyReplyLimit },
+    dailyReplyStats: { count: 0, limit: botConfig.dailyReplyLimit ?? 200 },
     activeTakeoversCount: 0,
   });
 });
 
-app.post('/api/bot/config', (req, res) => {
+app.post('/api/bot/config', async (req, res) => {
+  await ensureServerlessHydrated();
   if (req.body && typeof req.body === 'object') {
     botConfig = { ...botConfig, ...(req.body as Record<string, unknown>) };
+    await persistServerlessConfig();
   }
   res.json({ config: botConfig });
+});
+
+app.post('/api/cloud/sync', async (req, res) => {
+  await ensureServerlessHydrated();
+  if (req.body?.config && typeof req.body.config === 'object') {
+    botConfig = { ...botConfig, ...(req.body.config as Record<string, unknown>) };
+  }
+  if (Array.isArray(req.body?.dictionary)) {
+    dictionaryEntries = (req.body.dictionary as DictionaryEntry[]).slice(0, 500);
+  }
+  await persistServerlessConfig();
+  res.json({ ok: true, config: botConfig, dictionaryCount: dictionaryEntries.length });
+});
+
+app.get('/api/security/stats', (_req, res) => {
+  res.json({
+    dailyReplyCount: 0,
+    dailyReplyLimit: botConfig.dailyReplyLimit ?? 200,
+    activeTakeovers: [],
+    recentBlockedCount: 0,
+  });
+});
+
+app.post('/api/security/resume-takeover', (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.get('/api/assistant/inbox', (_req, res) => {
+  res.json({ notes: [], memories: [], totalArchivedCount: 0 });
+});
+
+app.post('/api/notes/:id/toggle', (_req, res) => res.json({ ok: true }));
+app.delete('/api/notes/:id', (_req, res) => res.json({ ok: true }));
+app.delete('/api/memories/:chatId', (_req, res) => res.json({ ok: true }));
+app.get('/api/memories/:chatId/archive', (_req, res) => res.json({ messages: [] }));
+
+app.get('/api/dictionary', async (req, res) => {
+  await ensureServerlessHydrated();
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const items = q
+    ? dictionaryEntries.filter(
+        (d) =>
+          d.term.toLowerCase().includes(q) ||
+          d.meaning.toLowerCase().includes(q) ||
+          d.district.toLowerCase().includes(q)
+      )
+    : dictionaryEntries;
+  res.json({ entries: items, total: dictionaryEntries.length });
+});
+
+app.post('/api/dictionary', async (req, res) => {
+  await ensureServerlessHydrated();
+  const term = String(req.body?.term || '').trim();
+  const meaning = String(req.body?.meaning || '').trim();
+  if (!term || !meaning) {
+    res.status(400).json({ error: 'Term and meaning are required.' });
+    return;
+  }
+  const entry: DictionaryEntry = {
+    id: `dict_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    term,
+    meaning,
+    district: String(req.body?.district || 'Dhaka').trim(),
+    language: (req.body?.language as DictionaryEntry['language']) || 'bn_dialect',
+    replyStyleHint: String(req.body?.replyStyleHint || '').trim() || undefined,
+  };
+  dictionaryEntries.unshift(entry);
+  await persistServerlessConfig();
+  res.json({ ok: true, entry });
+});
+
+app.post('/api/dictionary/starter', async (_req, res) => {
+  await ensureServerlessHydrated();
+  res.json({ ok: true, added: 0, total: dictionaryEntries.length });
+});
+
+app.post('/api/dictionary/import-chunk', async (req, res) => {
+  await ensureServerlessHydrated();
+  const items = Array.isArray(req.body?.entries) ? (req.body.entries as DictionaryEntry[]) : [];
+  dictionaryEntries = [...items, ...dictionaryEntries].slice(0, 500);
+  await persistServerlessConfig();
+  res.json({ ok: true, added: items.length, total: dictionaryEntries.length });
+});
+
+app.delete('/api/dictionary/:id', async (req, res) => {
+  await ensureServerlessHydrated();
+  dictionaryEntries = dictionaryEntries.filter((d) => d.id !== req.params.id);
+  await persistServerlessConfig();
+  res.json({ ok: true });
+});
+
+app.delete('/api/dictionary', async (_req, res) => {
+  dictionaryEntries = [];
+  await persistServerlessConfig();
+  res.json({ ok: true });
+});
+
+app.get('/api/groups', (_req, res) => res.json({ groups: [] }));
+app.get('/api/contacts', (_req, res) => res.json({ contacts: [] }));
+app.get('/api/media/stories', (_req, res) => res.json({ stories: [] }));
+app.get('/api/assistant/direct-commands', (_req, res) => res.json({ commands: [] }));
+app.post('/api/assistant/direct-command', (_req, res) =>
+  res.status(400).json({ error: 'WhatsApp direct messaging requires active WhatsApp socket; use Telegram Bot /agent instead.' })
+);
+app.get('/api/assistant/self-chat', (_req, res) =>
+  res.json({
+    enabled: Boolean(botConfig.selfChatCopilotEnabled),
+    zeroTokenOnly: Boolean(botConfig.selfChatZeroTokenOnly),
+    logs: [],
+  })
+);
+app.post('/api/assistant/self-chat', (_req, res) => res.json({ ok: true }));
+app.get('/api/client-bots', (_req, res) => res.json({ bots: [] }));
+app.get('/api/source-files', (_req, res) => res.json({ files: [] }));
+
+app.post('/api/antilink/test', (req, res) => {
+  const text = String(req.body?.message || req.body?.text || '');
+  const hasLink = /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|bit\.ly\/)/i.test(text);
+  res.json({
+    blocked: hasLink,
+    reason: hasLink ? 'External URL or Telegram/WhatsApp invite link detected.' : 'Clean message (no links detected).',
+  });
+});
+
+app.post('/api/simulator/message', async (req, res) => {
+  await ensureServerlessHydrated();
+  const messageText = String(req.body?.text || req.body?.message || '').trim();
+  if (!messageText) {
+    res.status(400).json({ error: 'Message text is required.' });
+    return;
+  }
+
+  let reply = '';
+  let providerUsed = 'fallback';
+  const sysPrompt = `You are "${botConfig.ownerName || 'Sir'}"'s AI Executive Assistant (${botConfig.assistantTone}). Reply naturally in Bengali/Banglish/English matching the sender.`;
+
+  if (geminiPool.hasKeys()) {
+    try {
+      const exec = await geminiPool.executeWithRotation(
+        (client) =>
+          client.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: messageText,
+            config: {
+              systemInstruction: sysPrompt,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          }),
+        undefined,
+        { maxTotalMs: 7_000, channel: 'simulator' }
+      );
+      reply = (exec.value.text || '').trim();
+      providerUsed = 'gemini-4-hydrogen';
+    } catch {
+      // fall through to OpenRouter
+    }
+  }
+
+  if (!reply && openRouterReader.hasKeys()) {
+    try {
+      const orRes = await openRouterReader.generateAgentStepPlan({
+        systemPrompt: sysPrompt,
+        transcript: `${messageText}\n\nReply naturally (not JSON).`,
+      });
+      reply = (orRes.content || '').trim();
+      providerUsed = orRes.modelUsed;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (!reply) {
+    reply = String(botConfig.autoreplyMessage || 'স্বাগতম! আমি আপনার AI অ্যাসিস্ট্যান্ট।');
+    providerUsed = 'autoreply_fallback';
+  }
+
+  res.json({ ok: true, reply, providerUsed, blockedByAntilink: false });
 });
 
 app.get('/health', (_req, res) => {
