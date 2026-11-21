@@ -135,6 +135,9 @@ export interface BotConfig {
   selfChatCopilotEnabled?: boolean;
   selfChatZeroTokenOnly?: boolean;
   contactPolicies?: ContactPolicyEntry[];
+  fastReplyMode?: boolean;
+  telegramInlineInstantMode?: boolean;
+  telegramAntilinkDefault?: boolean;
   configUpdatedAt?: string;
 }
 

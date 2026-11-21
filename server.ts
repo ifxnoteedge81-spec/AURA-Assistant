@@ -214,6 +214,9 @@ interface BotConfig {
   selfChatCopilotEnabled: boolean;
   selfChatZeroTokenOnly: boolean;
   contactPolicies: ContactPolicyEntry[];
+  fastReplyMode?: boolean;
+  telegramInlineInstantMode?: boolean;
+  telegramAntilinkDefault?: boolean;
   configUpdatedAt: string;
 }
 
@@ -314,6 +317,9 @@ function defaultConfig(): BotConfig {
     selfChatCopilotEnabled: true,
     selfChatZeroTokenOnly: true,
     contactPolicies: [],
+    fastReplyMode: true,
+    telegramInlineInstantMode: true,
+    telegramAntilinkDefault: false,
     configUpdatedAt: '',
   };
 }
@@ -506,7 +512,7 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
         : base.takeoverPauseMs,
     humanTypingEnabled:
       typeof raw.humanTypingEnabled === 'boolean' ? raw.humanTypingEnabled : base.humanTypingEnabled,
-    dailyReplyLimit: Math.max(10, Math.min(500, Math.round(rawDailyLimit))),
+    dailyReplyLimit: Math.max(1, Math.min(5000, Math.round(rawDailyLimit))),
     antilinkGroups:
       raw.antilinkGroups && typeof raw.antilinkGroups === 'object'
         ? raw.antilinkGroups
@@ -566,6 +572,15 @@ function normalizeConfig(raw: Partial<BotConfig>): BotConfig {
         ? raw.selfChatZeroTokenOnly
         : base.selfChatZeroTokenOnly,
     contactPolicies: normalizeContactPolicies(raw.contactPolicies),
+    fastReplyMode: typeof raw.fastReplyMode === 'boolean' ? raw.fastReplyMode : base.fastReplyMode,
+    telegramInlineInstantMode:
+      typeof raw.telegramInlineInstantMode === 'boolean'
+        ? raw.telegramInlineInstantMode
+        : base.telegramInlineInstantMode,
+    telegramAntilinkDefault:
+      typeof raw.telegramAntilinkDefault === 'boolean'
+        ? raw.telegramAntilinkDefault
+        : base.telegramAntilinkDefault,
     configUpdatedAt: typeof raw.configUpdatedAt === 'string' ? raw.configUpdatedAt : base.configUpdatedAt,
   };
 }
@@ -5148,6 +5163,16 @@ async function bootstrap() {
     outreach: outreachController,
     getAutonomousAgent: () => autonomousAgentEngine,
     getOwnerName: () => botConfig.ownerName || 'Sir',
+    getBotConfig: () => botConfig as unknown as Record<string, unknown> & typeof botConfig,
+    updateBotConfig: async (patch) => {
+      botConfig = normalizeConfig({
+        ...botConfig,
+        ...(patch as Partial<BotConfig>),
+        configUpdatedAt: new Date().toISOString(),
+      });
+      persistConfig(true);
+    },
+    getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
     pushLog,
   });
   registerTelegramRoutes(app, telegramBotController, requireOwnerAuth);

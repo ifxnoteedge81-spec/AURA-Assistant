@@ -109,6 +109,9 @@ let botConfig: AssistantConfigFields & Record<string, unknown> = {
   groupDirectives: {},
   contactPolicies: [],
   storyWhitelist: [],
+  fastReplyMode: true,
+  telegramInlineInstantMode: true,
+  telegramAntilinkDefault: false,
 };
 
 const eventLogs: Array<{
@@ -396,6 +399,7 @@ const autonomousAgentEngine = new AutonomousAgentEngine({
   upsertContactPolicies: async () => [],
   updateSystemSettings: async (patch) => {
     botConfig = { ...botConfig, ...(patch as Record<string, unknown>) };
+    await persistServerlessConfig();
   },
   sendOwnerSelfChatReport: async () => false,
   pushLog,
@@ -451,6 +455,12 @@ const telegramBotController = new TelegramBotController({
   outreach: outreachController,
   getAutonomousAgent: () => autonomousAgentEngine,
   getOwnerName: () => botConfig.ownerName || 'Sir',
+  getBotConfig: () => botConfig,
+  updateBotConfig: async (patch) => {
+    botConfig = { ...botConfig, ...(patch as Record<string, unknown>) };
+    await persistServerlessConfig();
+  },
+  getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
   pushLog,
 });
 
@@ -539,18 +549,23 @@ app.get('/api/system/env-status', (_req, res) => {
 });
 
 let dictionaryEntries: DictionaryEntry[] = [];
-let configHydrated = false;
+let lastHydratedAtMs = 0;
 
-async function ensureServerlessHydrated() {
-  if (configHydrated) return;
-  configHydrated = true;
+async function ensureServerlessHydrated(force = false) {
+  const now = Date.now();
+  if (!force && now - lastHydratedAtMs < 10_000) return;
+  lastHydratedAtMs = now;
   try {
     const cloud = await adminLoadDocument<{
       config?: Partial<AssistantConfigFields> & Record<string, unknown>;
       dictionary?: DictionaryEntry[];
     }>('bot_serverless_config', 'primary');
     if (cloud?.config && typeof cloud.config === 'object') {
-      botConfig = { ...botConfig, ...cloud.config };
+      const localTs = Date.parse(String(botConfig.configUpdatedAt || '')) || 0;
+      const cloudTs = Date.parse(String(cloud.config.configUpdatedAt || '')) || 0;
+      if (cloudTs >= localTs || localTs === 0) {
+        botConfig = { ...botConfig, ...cloud.config };
+      }
     }
     if (Array.isArray(cloud?.dictionary)) {
       dictionaryEntries = cloud.dictionary.slice(0, 500);

@@ -2,12 +2,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Express, Request, Response } from 'express';
-import { ThinkingLevel } from '@google/genai';
+import { ThinkingLevel, Type, type Content, type FunctionDeclaration } from '@google/genai';
 import type { GeminiKeyPool } from './geminiKeyPool.ts';
 import type { OpenRouterReader } from './openRouterReader.ts';
 import type { TokenTelemetryTracker } from './tokenTelemetry.ts';
 import type { WebOutreachController } from './webResearchOutreach.ts';
 import type { AutonomousAgentEngine } from './autonomousAgent.ts';
+import type { AssistantConfigFields } from './assistantEngine.ts';
+import {
+  buildPatchFromInput,
+  getFullControlSnapshot,
+  type ControlPatchInput,
+} from './autonomousControl.ts';
 import { adminLoadDocument, adminSaveDocument, getFirestoreAdminDiagnostics } from './firestoreAdmin.ts';
 
 export interface TelegramTurn {
@@ -36,6 +42,9 @@ export interface TelegramBotAdapters {
   outreach: WebOutreachController;
   getAutonomousAgent: () => AutonomousAgentEngine | null;
   getOwnerName: () => string;
+  getBotConfig?: () => AssistantConfigFields & Record<string, unknown>;
+  updateBotConfig?: (patch: Partial<AssistantConfigFields> & Record<string, unknown>) => Promise<void>;
+  getMemoryRssMb?: () => number;
   pushLog?: (
     category: 'system' | 'pairing' | 'gemini' | 'antilink' | 'autoreply' | 'simulator' | 'cloud',
     actor: string,
@@ -94,6 +103,13 @@ export interface TelegramUpdate {
   edited_message?: TelegramMessage;
 }
 
+interface PendingConfirmationEntry {
+  patchInput: ControlPatchInput;
+  warnings: string[];
+  changedLabels: string[];
+  expiresAt: number;
+}
+
 export function getTelegramBotToken(): string {
   const tok = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
   if (!tok || tok.startsWith('YOUR_') || tok === 'MY_TELEGRAM_BOT_TOKEN') return '';
@@ -138,9 +154,99 @@ function containsExternalLink(text: string): boolean {
   return /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|bit\.ly\/)/i.test(text);
 }
 
+function hasConfirmOverridePhrase(text: string): boolean {
+  const clean = text.trim().toLowerCase();
+  if (
+    /^(?:তারপরও\s*(?:তুমি\s*)?করো|তাও\s*(?:করে\s*)?দাও|তাও\s*করো|হ্যাঁ\s*(?:করো|করে\s*দাও)|ঠিক\s*আছে\s*করো|ওকে\s*করো|করো|দাও|yes|confirm|do\s+it(?:\s+anyway)?|proceed|force|approve)[.!?।]*$/i.test(
+      clean
+    )
+  ) {
+    return true;
+  }
+  return /(?:তারপরও\s*(?:তুমি\s*)?করো|তাও\s*করো|যাই\s*হোক\s*করো|রিস্ক\s*নিলেও|জোর\s*করে|do\s+it\s+anyway|force\s+it|confirmedOverride)/i.test(
+    clean
+  );
+}
+
+const TELEGRAM_CONTROL_TOOLS: FunctionDeclaration[] = [
+  {
+    name: 'get_dashboard_status_and_advice',
+    description:
+      'Get complete live list of ALL dashboard controls currently ON vs OFF, speed/latency estimate in seconds, and concrete recommendations on which settings should be ON/OFF to make replies faster (e.g. saving 10-20 seconds).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        focus: {
+          type: Type.STRING,
+          description: 'all | status | speed_advice',
+        },
+      },
+    },
+  },
+  {
+    name: 'update_dashboard_controls',
+    description:
+      'Turn ANY dashboard setting ON or OFF, change numbers/cooldowns/limits/tone/bio/rules, or apply speed presets (max_speed, balanced, ultra_safe). NEVER refuse an owner request. Warn once on risky changes unless confirmedOverride=true.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        autoreply: { type: Type.BOOLEAN },
+        aiAssistantEnabled: { type: Type.BOOLEAN },
+        fastReplyMode: { type: Type.BOOLEAN },
+        telegramInlineInstantMode: { type: Type.BOOLEAN },
+        humanTypingEnabled: { type: Type.BOOLEAN },
+        cooldownMs: { type: Type.NUMBER },
+        takeoverPauseMs: { type: Type.NUMBER },
+        dailyReplyLimit: { type: Type.NUMBER },
+        assistantTone: {
+          type: Type.STRING,
+          description: 'witty_flirty | warm_polite | executive_formal | sharp_shut_down',
+        },
+        groupAiEnabled: { type: Type.BOOLEAN },
+        groupAiMode: { type: Type.STRING, description: 'smart_blend | mention_only | active_chat' },
+        groupReactionEnabled: { type: Type.BOOLEAN },
+        groupCooldownMs: { type: Type.NUMBER },
+        mediaIntelligenceEnabled: { type: Type.BOOLEAN },
+        mediaZeroTokenReplyMode: { type: Type.BOOLEAN },
+        storyAutoReadEnabled: { type: Type.BOOLEAN },
+        storyAutoReactEnabled: { type: Type.BOOLEAN },
+        storyAutoReplyEnabled: { type: Type.BOOLEAN },
+        selfChatCopilotEnabled: { type: Type.BOOLEAN },
+        selfChatZeroTokenOnly: { type: Type.BOOLEAN },
+        telegramAntilinkDefault: { type: Type.BOOLEAN },
+        allGroupsAntilink: { type: Type.BOOLEAN },
+        allGroupsAi: { type: Type.BOOLEAN },
+        ownerName: { type: Type.STRING },
+        ownerProfession: { type: Type.STRING },
+        ownerLocation: { type: Type.STRING },
+        ownerBio: { type: Type.STRING },
+        ownerBoundaries: { type: Type.STRING },
+        strictLogicRules: { type: Type.STRING },
+        autoreplyMessage: { type: Type.STRING },
+        firstGreetingTemplate: { type: Type.STRING },
+        preset: { type: Type.STRING, description: 'max_speed | balanced | ultra_safe' },
+        confirmedOverride: { type: Type.BOOLEAN },
+      },
+    },
+  },
+  {
+    name: 'run_autonomous_agent_task',
+    description:
+      'Execute an operational autonomous mission (e.g., schedule recurring job, check leads/inbox, trigger self-heal) right from Telegram chat.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        goal: { type: Type.STRING, description: 'Clear operational mission goal' },
+      },
+      required: ['goal'],
+    },
+  },
+];
+
 export class TelegramBotController {
   private readonly adapters: TelegramBotAdapters;
   private store: TelegramMemoryStore = { chats: {} };
+  private readonly pendingConfirmations = new Map<string, PendingConfirmationEntry>();
   private cachedBotUsername: string = String(process.env.TELEGRAM_BOT_USERNAME || '').replace(/^@/, '').trim();
   private lastWebhookUrl: string | null = null;
   private lastWebhookAt: string | null = null;
@@ -150,6 +256,11 @@ export class TelegramBotController {
   constructor(adapters: TelegramBotAdapters) {
     this.adapters = adapters;
     this.loadLocal();
+  }
+
+  public isInlineInstantEnabled(): boolean {
+    const cfg = this.adapters.getBotConfig?.();
+    return cfg?.telegramInlineInstantMode !== false;
   }
 
   private loadLocal() {
@@ -169,14 +280,17 @@ export class TelegramBotController {
     if (this.hydrated) return;
     this.hydrated = true;
     try {
-      const cloud = await adminLoadDocument<TelegramMemoryStore>('bot_telegram_state', 'primary');
+      const cloud = await Promise.race([
+        adminLoadDocument<TelegramMemoryStore>('bot_telegram_state', 'primary'),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_200)),
+      ]);
       if (cloud?.chats && typeof cloud.chats === 'object') {
         this.store = {
           chats: { ...cloud.chats, ...this.store.chats },
         };
       }
     } catch {
-      // ignore cloud hydration error
+      // ignore cloud hydration timeout/error so reply stays instant
     }
   }
 
@@ -203,6 +317,7 @@ export class TelegramBotController {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload || {}),
+      signal: AbortSignal.timeout(8_000),
     });
     const data = (await resp.json()) as { ok: boolean; result?: T; description?: string };
     if (!data.ok) {
@@ -299,7 +414,7 @@ export class TelegramBotController {
         { command: 'agent', description: 'Autonomous AI মিশন চালান' },
         { command: 'imagine', description: 'AI দিয়ে যেকোনো ছবি তৈরি করুন' },
         { command: 'search', description: 'ওয়েব সার্চ ও লিড খুঁজুন' },
-        { command: 'status', description: 'সিস্টেম, Gemini ও Firestore স্ট্যাটাস' },
+        { command: 'status', description: 'সব ON/OFF কন্ট্রোল ও স্পিড স্ট্যাটাস' },
         { command: 'myid', description: 'আপনার Telegram User ID জানুন' },
         { command: 'help', description: 'সব কমান্ডের তালিকা' },
       ],
@@ -330,7 +445,6 @@ export class TelegramBotController {
       throw new Error('Please provide a prompt to generate an image.');
     }
 
-    // 1. Optional Hugging Face Free Inference API (FLUX.1-schnell) when HF_TOKEN is configured
     const hfToken = String(process.env.HF_TOKEN || '').trim();
     if (hfToken) {
       try {
@@ -361,7 +475,6 @@ export class TelegramBotController {
       }
     }
 
-    // 2. Zero-key Free Fallback via Pollinations Image Endpoint
     const seed = Math.floor(Math.random() * 999_999);
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?width=1024&height=1024&nologo=true&seed=${seed}`;
     const imgResp = await fetch(url, {
@@ -411,26 +524,205 @@ export class TelegramBotController {
     }
   }
 
+  private getCurrentConfig(): AssistantConfigFields & Record<string, unknown> {
+    if (this.adapters.getBotConfig) {
+      return this.adapters.getBotConfig();
+    }
+    return {
+      autoreply: true,
+      aiAssistantEnabled: true,
+      autoreplyMessage: 'স্বাগতম! আমি আপনার AI অ্যাসিস্ট্যান্ট।',
+      firstGreetingTemplate: '',
+      ownerName: this.adapters.getOwnerName() || 'Sir',
+      ownerProfession: '',
+      ownerLocation: '',
+      ownerBio: '',
+      ownerBoundaries: '',
+      assistantTone: 'warm_polite',
+      fastReplyMode: true,
+      telegramInlineInstantMode: true,
+      humanTypingEnabled: true,
+    };
+  }
+
+  private async applyControlUpdate(
+    chatIdStr: string,
+    input: ControlPatchInput
+  ): Promise<{
+    applied: boolean;
+    needsConfirmation: boolean;
+    warnings: string[];
+    changedLabels: string[];
+    snapshot: ReturnType<typeof getFullControlSnapshot>;
+  }> {
+    const currentCfg = this.getCurrentConfig();
+    const { patch, telegramAntilinkToggle, warnings, changedLabels } = buildPatchFromInput(
+      input,
+      currentCfg
+    );
+
+    if (warnings.length > 0 && input.confirmedOverride !== true) {
+      this.pendingConfirmations.set(chatIdStr, {
+        patchInput: { ...input, confirmedOverride: true },
+        warnings,
+        changedLabels,
+        expiresAt: Date.now() + 10 * 60_000,
+      });
+      return {
+        applied: false,
+        needsConfirmation: true,
+        warnings,
+        changedLabels,
+        snapshot: getFullControlSnapshot(currentCfg, {
+          telegramChatAntilink: this.store.chats[chatIdStr]?.antilinkEnabled,
+          telegramBotConfigured: Boolean(getTelegramBotToken()),
+        }),
+      };
+    }
+
+    if (typeof telegramAntilinkToggle === 'boolean' && this.store.chats[chatIdStr]) {
+      this.store.chats[chatIdStr].antilinkEnabled = telegramAntilinkToggle;
+      this.store.chats[chatIdStr].updatedAt = new Date().toISOString();
+    }
+
+    if (Object.keys(patch).length > 0 && this.adapters.updateBotConfig) {
+      await this.adapters.updateBotConfig({
+        ...patch,
+        configUpdatedAt: new Date().toISOString(),
+      });
+    }
+
+    this.pendingConfirmations.delete(chatIdStr);
+    const updatedCfg = { ...currentCfg, ...patch };
+    return {
+      applied: true,
+      needsConfirmation: false,
+      warnings,
+      changedLabels,
+      snapshot: getFullControlSnapshot(updatedCfg, {
+        telegramChatAntilink: this.store.chats[chatIdStr]?.antilinkEnabled,
+        telegramBotConfigured: Boolean(getTelegramBotToken()),
+      }),
+    };
+  }
+
+  private async executeControlTool(
+    chatIdStr: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    forceFromPrompt: boolean
+  ): Promise<Record<string, unknown>> {
+    if (toolName === 'get_dashboard_status_and_advice') {
+      const cfg = this.getCurrentConfig();
+      const snap = getFullControlSnapshot(cfg, {
+        telegramChatAntilink: this.store.chats[chatIdStr]?.antilinkEnabled,
+        telegramBotConfigured: Boolean(getTelegramBotToken()),
+        geminiKeysCount: this.adapters.geminiPool.getStats().configuredKeysCount,
+        openRouterKeysCount: this.adapters.openRouterReader.getStats().configuredKeysCount,
+      });
+      return {
+        totalOn: snap.totalOn,
+        totalOff: snap.totalOff,
+        onControls: snap.onList,
+        offControls: snap.offList,
+        estimatedInstantReplySec: snap.estimatedInstantReplySec,
+        optimizedReplySec: snap.optimizedReplySec,
+        potentialSavedSec: snap.potentialSavedSec,
+        speedTipsBn: snap.speedTipsBn,
+        assistantTone: cfg.assistantTone,
+        dailyReplyLimit: cfg.dailyReplyLimit ?? 200,
+      };
+    }
+
+    if (toolName === 'update_dashboard_controls') {
+      const input: ControlPatchInput = {
+        ...(args as unknown as ControlPatchInput),
+        confirmedOverride: args.confirmedOverride === true || forceFromPrompt,
+      };
+      const outcome = await this.applyControlUpdate(chatIdStr, input);
+      if (outcome.needsConfirmation) {
+        return {
+          applied: false,
+          needsConfirmation: true,
+          warnings: outcome.warnings,
+          proposedChanges: outcome.changedLabels,
+          note: 'Warn owner clearly in Bengali about these potential risks, and say that replying "তারপরও করো" or "করো" will execute immediately without resistance.',
+        };
+      }
+      return {
+        applied: true,
+        changedLabels: outcome.changedLabels,
+        warningsNoted: outcome.warnings,
+        estimatedInstantReplySec: outcome.snapshot.estimatedInstantReplySec,
+        totalOn: outcome.snapshot.totalOn,
+        totalOff: outcome.snapshot.totalOff,
+      };
+    }
+
+    if (toolName === 'run_autonomous_agent_task') {
+      const agent = this.adapters.getAutonomousAgent();
+      if (!agent) {
+        return { ok: false, error: 'Autonomous Agent engine is not initialized.' };
+      }
+      const run = await agent.executeMission({
+        goal: String(args.goal || ''),
+        source: 'self_chat',
+        maxWallClockMs: 5_500,
+      });
+      return {
+        ok: run.status === 'completed',
+        report: run.finalReport,
+        stepsCount: run.steps.length,
+      };
+    }
+
+    return { ok: false, error: `Unknown tool: ${toolName}` };
+  }
+
   private async generateSmartChatReply(params: {
     chatId: string;
     senderName: string;
     text: string;
+    isOwner: boolean;
+    backgroundMode?: boolean;
   }): Promise<{ replyText: string; provider: string }> {
+    const cfg = this.getCurrentConfig();
+    const fastMode = cfg.fastReplyMode !== false;
+    const forceFromPrompt = hasConfirmOverridePhrase(params.text);
     const chatState = this.store.chats[params.chatId];
     const recentHistory = (chatState?.turns || [])
-      .slice(-10)
+      .slice(-8)
       .map((t) => `${t.role === 'user' ? params.senderName : 'Assistant'}: ${t.text}`)
       .join('\n');
 
+    const controlSnapshot = getFullControlSnapshot(cfg, {
+      telegramChatAntilink: chatState?.antilinkEnabled,
+      telegramBotConfigured: Boolean(getTelegramBotToken()),
+      geminiKeysCount: this.adapters.geminiPool.getStats().configuredKeysCount,
+      openRouterKeysCount: this.adapters.openRouterReader.getStats().configuredKeysCount,
+    });
+
     const systemPrompt = [
-      `You are the smart Telegram & Web AI Executive Assistant for "${this.adapters.getOwnerName()}".`,
-      'Reply naturally, concisely, and helpfully in the user’s language (Bengali, Banglish, or English).',
-      'If the user asks for multi-step web research, lead finding, or emailing, mention they can also prefix with `/agent <goal>` or `/imagine <prompt>` for images.',
+      `You are the Fully Autonomous AI Executive Controller & Assistant for "${this.adapters.getOwnerName()}".`,
+      'Reply naturally, fast, and concisely in the user’s language (Bengali, Banglish, or English).',
+      params.isOwner
+        ? [
+            'OWNER AUTONOMOUS CONTROL RULES (CRITICAL):',
+            '1. You have COMPLETE control over ALL dashboard settings & controls via `get_dashboard_status_and_advice`, `update_dashboard_controls`, and `run_autonomous_agent_task`.',
+            '2. NEVER refuse the owner or say "I cannot do that". Whatever dashboard/bot control or configuration the owner asks for (ON/OFF, tone, speed, limits, anti-link, bio, rules), ALWAYS fulfill it.',
+            '3. Warn-Once -> Confirm-Override Rule: If `update_dashboard_controls` returns `needsConfirmation=true`, briefly explain the potential downside/risk in Bengali first and tell the owner "আপনি চাইলে তারপরও \'তারপরও করো\' বললেই আমি করে দেবো"। If the owner confirms (or already asked to force/override), pass `confirmedOverride: true` and execute immediately.',
+            '4. If the owner asks what is ON, what is OFF, what is recommended ON/OFF, or how to make replies faster (e.g. saving 10-20s), ALWAYS call `get_dashboard_status_and_advice` (or use exact live values below) and reply clearly with bullet points and exact second savings.',
+            `Live Snapshot: ON=${controlSnapshot.totalOn}, OFF=${controlSnapshot.totalOff}, EstSpeed=${controlSnapshot.estimatedInstantReplySec}, Optimized=${controlSnapshot.optimizedReplySec}.`,
+          ].join('\n')
+        : 'Answer helpfully and concisely.',
     ].join('\n');
 
     const userPrompt = recentHistory
       ? `Recent Conversation:\n${recentHistory}\n\nLatest Message from ${params.senderName}: ${params.text}`
       : `Message from ${params.senderName}: ${params.text}`;
+
+    const totalBudgetMs = params.backgroundMode ? 18_000 : fastMode ? 6_000 : 7_200;
+    const perKeyBudgetMs = params.backgroundMode ? 9_000 : fastMode ? 3_800 : 4_800;
 
     if (this.adapters.geminiPool.hasKeys()) {
       for (const spec of [
@@ -438,33 +730,76 @@ export class TelegramBotController {
         { model: 'gemini-3.1-flash-lite', channel: 'lite', low: false },
       ]) {
         try {
-          const exec = await this.adapters.geminiPool.executeWithRotation(
-            (client) =>
-              client.models.generateContent({
+          const contents: Content[] = [{ role: 'user', parts: [{ text: userPrompt }] }];
+          const maxToolRounds = params.isOwner ? 3 : 1;
+          let finalText = '';
+
+          for (let round = 0; round < maxToolRounds; round += 1) {
+            const exec = await this.adapters.geminiPool.executeWithRotation(
+              (client) =>
+                client.models.generateContent({
+                  model: spec.model,
+                  contents,
+                  config: {
+                    systemInstruction: systemPrompt,
+                    ...(spec.low ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
+                    ...(params.isOwner ? { tools: [{ functionDeclarations: TELEGRAM_CONTROL_TOOLS }] } : {}),
+                  },
+                }),
+              undefined,
+              {
+                maxTotalMs: totalBudgetMs,
+                perAttemptMs: perKeyBudgetMs,
+                channel: spec.channel,
+              }
+            );
+
+            const response = exec.value;
+            const um = response.usageMetadata;
+            if (um?.totalTokenCount) {
+              this.adapters.tokenTelemetry.recordUsage({
+                provider: 'gemini',
                 model: spec.model,
-                contents: userPrompt,
-                config: {
-                  systemInstruction: systemPrompt,
-                  ...(spec.low ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
+                category: 'dm',
+                promptTokens: Number(um.promptTokenCount || 0),
+                completionTokens: Number(um.candidatesTokenCount || 0),
+                totalTokens: Number(um.totalTokenCount || 0),
+                keySlot: exec.keySlot,
+              });
+            }
+
+            const candidateContent = response.candidates?.[0]?.content;
+            if (candidateContent) contents.push(candidateContent);
+
+            const calls = response.functionCalls || [];
+            if (calls.length === 0) {
+              finalText = (response.text || '').trim();
+              break;
+            }
+
+            const responseParts = [];
+            for (const call of calls) {
+              const argsObj = (call.args || {}) as Record<string, unknown>;
+              const toolData = await this.executeControlTool(
+                params.chatId,
+                call.name || '',
+                argsObj,
+                forceFromPrompt
+              );
+              responseParts.push({
+                functionResponse: {
+                  id: call.id,
+                  name: call.name || '',
+                  response: toolData,
                 },
-              }),
-            undefined,
-            { maxTotalMs: 12_000, channel: spec.channel }
-          );
-          const reply = (exec.value.text || '').trim();
-          const um = exec.value.usageMetadata;
-          if (um?.totalTokenCount) {
-            this.adapters.tokenTelemetry.recordUsage({
-              provider: 'gemini',
-              model: spec.model,
-              category: 'dm',
-              promptTokens: Number(um.promptTokenCount || 0),
-              completionTokens: Number(um.candidatesTokenCount || 0),
-              totalTokens: Number(um.totalTokenCount || 0),
-              keySlot: exec.keySlot,
-            });
+              });
+            }
+            contents.push({ role: 'user', parts: responseParts });
           }
-          if (reply) return { replyText: reply, provider: spec.model };
+
+          if (finalText) {
+            return { replyText: finalText, provider: spec.model };
+          }
         } catch {
           // try fallback model
         }
@@ -474,7 +809,7 @@ export class TelegramBotController {
     if (this.adapters.openRouterReader.hasKeys()) {
       try {
         const res = await this.adapters.openRouterReader.generateAgentStepPlan({
-          systemPrompt,
+          systemPrompt: `${systemPrompt}\n\nExact Current ON Controls:\n${controlSnapshot.onList.join(', ')}\n\nExact Current OFF Controls:\n${controlSnapshot.offList.join(', ')}\n\nSpeed Tips:\n${controlSnapshot.speedTipsBn.join('\n')}`,
           transcript: `${userPrompt}\n\nReply directly with helpful natural text (not JSON).`,
         });
         if (res.content?.trim()) {
@@ -487,7 +822,7 @@ export class TelegramBotController {
 
     return {
       replyText:
-        '⚠️ এই মুহূর্তে Gemini বা OpenRouter API কী অ্যাক্টিভ নেই বা রেট লিমিটে আছে। Vercel Environment Variables চেক করে আবার চেষ্টা করুন, অথবা `/status` দিয়ে অবস্থা দেখুন।',
+        '⚠️ এই মুহূর্তে Gemini বা OpenRouter API কী ব্যস্ত/সীমায় আছে। তবে `/status` দিয়ে সব সেটিংস দেখতে ও সাথে সাথে পরিবর্তন করতে পারবেন।',
       provider: 'fallback',
     };
   }
@@ -510,19 +845,19 @@ export class TelegramBotController {
     const senderIdStr = msg.from?.id ? String(msg.from.id) : '';
     const ownerIds = getOwnerIdList();
     const isOwner = ownerIds.length === 0 || (Boolean(senderIdStr) && ownerIds.includes(senderIdStr));
+    const currentCfg = this.getCurrentConfig();
 
     if (!this.store.chats[chatIdStr]) {
       this.store.chats[chatIdStr] = {
         chatId: chatIdStr,
         title: msg.chat.title || msg.chat.first_name || senderName,
-        antilinkEnabled: false,
+        antilinkEnabled: Boolean(currentCfg.telegramAntilinkDefault),
         turns: [],
         updatedAt: new Date().toISOString(),
       };
     }
     const chatState = this.store.chats[chatIdStr];
 
-    // Ensure bot username is known for @mention check in groups
     if (isGroup && !this.cachedBotUsername && getTelegramBotToken()) {
       const me = await this.callTelegramApi<TelegramUser>('getMe').catch(() => null);
       if (me?.ok && me.result?.username) {
@@ -546,7 +881,6 @@ export class TelegramBotController {
       }
     }
 
-    // In groups, only respond to explicit commands, @mentions, or replies to the bot
     if (isGroup) {
       const mentioned =
         this.cachedBotUsername &&
@@ -563,11 +897,28 @@ export class TelegramBotController {
       : rawText;
     const lower = cleanedText.toLowerCase();
 
+    // Instant Confirmation Override Handler (zero latency <200ms)
+    const pending = this.pendingConfirmations.get(chatIdStr);
+    if (isOwner && pending && pending.expiresAt > Date.now() && hasConfirmOverridePhrase(cleanedText)) {
+      const outcome = await this.applyControlUpdate(chatIdStr, pending.patchInput);
+      const confirmMsg = [
+        `✅ *আপনার নির্দেশমতো কার্যকর করা হয়েছে:*`,
+        ...outcome.changedLabels.map((l) => `• ${l}`),
+        '',
+        `⚡ আনুমানিক ইনস্ট্যান্ট রিপ্লাই স্পিড: *${outcome.snapshot.estimatedInstantReplySec}*`,
+        `📊 এখন চালু (ON): ${outcome.snapshot.totalOn}টি | বন্ধ (OFF): ${outcome.snapshot.totalOff}টি`,
+      ].join('\n');
+
+      await this.sendMessage(msg.chat.id, confirmMsg, { replyToMessageId: msg.message_id });
+      void this.persistStore();
+      return { handled: true, action: 'confirmed_control_override' };
+    }
+
     // /myid
     if (/^\/myid(?:\s|$)/i.test(lower)) {
       await this.sendMessage(
         msg.chat.id,
-        `🆔 আপনার Telegram User ID: \`${senderIdStr || 'unknown'}\`\nChat ID: \`${chatIdStr}\`\n\nনিরাপত্তার জন্য Vercel Env-এ \`TELEGRAM_OWNER_ID=${senderIdStr}\` সেট করতে পারেন।`,
+        `🆔 আপনার Telegram User ID: \`${senderIdStr || 'unknown'}\`\nChat ID: \`${chatIdStr}\`\n\nনিরাপত্তার জন্য Netlify Env-এ \`TELEGRAM_OWNER_ID=${senderIdStr}\` সেট করলে এক-ট্যাপে Mini App আনলক হবে।`,
         { replyToMessageId: msg.message_id }
       );
       return { handled: true, action: 'myid' };
@@ -583,13 +934,16 @@ export class TelegramBotController {
             : '';
 
       const helpText = [
-        `🤖 *WaNexus & Telegram AI Studio — ২৪/৭ ফ্রি ক্লাউড অ্যাসিস্ট্যান্ট*`,
+        `🤖 *WaNexus Autonomous AI Studio — ইনস্ট্যান্ট ও ফুল কন্ট্রোল*`,
         '',
-        'আপনি সরাসরি যেকোনো প্রশ্ন করতে পারেন, অথবা নিচের কমান্ডগুলো চালাতে পারেন:',
-        '• `/agent <কাজ>` বা `এজেন্ট ...` — ওয়েব সার্চ, লিড সংগ্রহ ও ইমেইল মিশন',
-        '• `/imagine <প্রম্পট>` বা `ছবি বানাও: ...` — AI দিয়ে ছবি তৈরি',
-        '• `/search <টপিক>` — লাইভ ওয়েব থেকে তথ্য ও কন্টাক্ট খোঁজা',
-        '• `/status` — Gemini কী, OpenRouter, Firestore ও সিস্টেম স্ট্যাটাস',
+        'আপনি স্বাভাবিক বাংলা বা ইংরেজিতে যেকোনো কথা বললেই ১–৫ সেকেন্ডে উত্তর পাবেন, অথবা নিচের কমান্ড/কন্ট্রোল ব্যবহার করতে পারেন:',
+        '• *"কি কি অন আছে আর কি কি অফ আছে?"* — সম্পূর্ণ লাইভ স্ট্যাটাস',
+        '• *"কি অফ করলে আরও দ্রুত উত্তর দেবে?"* — স্পিড পরামর্শ (সেকেন্ড হিসাবসহ)',
+        '• *"অটোরিপ্লাই অন করো / হিউম্যান টাইপিং অফ করো"* — যেকোনো সেটিং পরিবর্তন',
+        '• `/agent <কাজ>` — গভীর ওয়েব রিসার্চ, লিড সংগ্রহ ও ইমেইল মিশন',
+        '• `/imagine <প্রম্পট>` — AI দিয়ে ছবি তৈরি',
+        '• `/search <টপিক>` — লাইভ ওয়েব সার্চ',
+        '• `/status` — সব ON/OFF কন্ট্রোল ও স্পিড রিপোর্ট',
         '• `/myid` — আপনার Telegram Owner ID দেখা',
         isGroup ? '• `/antilink on` | `/antilink off` — গ্রুপ লিংক প্রটেকশন' : '',
       ]
@@ -620,30 +974,44 @@ export class TelegramBotController {
       const mode = lower.includes('on') ? true : lower.includes('off') ? false : !chatState.antilinkEnabled;
       chatState.antilinkEnabled = mode;
       chatState.updatedAt = new Date().toISOString();
-      await this.persistStore();
       await this.sendMessage(
         msg.chat.id,
         `🛡️ এই গ্রুপে Telegram Anti-Link এখন *${mode ? 'ON' : 'OFF'}*।`,
         { replyToMessageId: msg.message_id }
       );
+      void this.persistStore();
       return { handled: true, action: 'antilink_toggle' };
     }
 
-    // /status
+    // /status -> Full ON/OFF Dashboard Controls + Speed Advisor + Infra
     if (/^\/status(?:\s|$)/i.test(lower)) {
       const gStats = geminiStatsSafe(this.adapters);
       const oStats = this.adapters.openRouterReader.getStats();
       const fbDiag = getFirestoreAdminDiagnostics();
       const summary = this.adapters.outreach.getSummary();
+      const snap = getFullControlSnapshot(currentCfg, {
+        telegramChatAntilink: chatState.antilinkEnabled,
+        telegramBotConfigured: Boolean(getTelegramBotToken()),
+        geminiKeysCount: gStats.configuredKeysCount,
+        openRouterKeysCount: oStats.configuredKeysCount,
+      });
+
       await this.sendMessage(
         msg.chat.id,
         [
-          '📡 *24/7 Cloud System Status*',
-          `• Mode: ${isNetlifyRuntime() ? 'Netlify Serverless + 15m Background Worker' : process.env.VERCEL ? 'Vercel Serverless (24/7 Free)' : 'Node Server'}`,
-          `• Gemini Pool: ${gStats.configuredKeysCount} key(s) active`,
-          `• OpenRouter: ${oStats.configuredKeysCount} key(s) (${oStats.primaryModel})`,
-          `• Firestore (${fbDiag.configuredProjectId || '—'}): ${fbDiag.projectMatch === true ? '✅ Matched' : fbDiag.mode}`,
-          `• Lead Vault: ${summary.totalLeads} leads | Image Gen: ✅ Active`,
+          `📡 *WaNexus ফুল কন্ট্রোল ও স্পিড স্ট্যাটাস*`,
+          `⚡ ইনস্ট্যান্ট স্পিড: *${snap.estimatedInstantReplySec}* (অপ্টিমাইজড: ${snap.optimizedReplySec})`,
+          '',
+          `✅ *চালু আছে (${snap.totalOn}টি):*`,
+          ...snap.onList.map((s) => `• ${s}`),
+          '',
+          `⏸️ *বন্ধ আছে (${snap.totalOff}টি):*`,
+          ...snap.offList.map((s) => `• ${s}`),
+          '',
+          `🚀 *দ্রুত করার পরামর্শ:*`,
+          ...snap.speedTipsBn.map((t) => `• ${t}`),
+          '',
+          `🔧 *ইঞ্জিন:* Gemini ${gStats.configuredKeysCount} key | OpenRouter ${oStats.configuredKeysCount} key | Firestore: ${fbDiag.projectMatch === true ? '✅ Matched' : fbDiag.mode} | Leads: ${summary.totalLeads}`,
         ].join('\n'),
         { replyToMessageId: msg.message_id }
       );
@@ -713,9 +1081,9 @@ export class TelegramBotController {
       }
       await this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
       const maxWallClockMs = options?.backgroundMode
-        ? 240_000
+        ? 180_000
         : isNetlifyRuntime()
-          ? 7_200
+          ? 7_000
           : undefined;
       const run = await agent.executeMission({
         goal: agentMatch[1].trim(),
@@ -730,13 +1098,17 @@ export class TelegramBotController {
       return { handled: true, action: 'agent_run' };
     }
 
-    // Standard Conversational AI Reply
-    await this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
+    // Fast Instant AI Chat & Full Autonomous Control Reply
+    void this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
     const aiReply = await this.generateSmartChatReply({
       chatId: chatIdStr,
       senderName,
       text: cleanedText,
+      isOwner,
+      backgroundMode: options?.backgroundMode,
     });
+
+    await this.sendMessage(msg.chat.id, aiReply.replyText, { replyToMessageId: msg.message_id });
 
     chatState.turns.push(
       { role: 'user', text: cleanedText.slice(0, 600), at: new Date().toISOString() },
@@ -746,9 +1118,16 @@ export class TelegramBotController {
       chatState.turns = chatState.turns.slice(-20);
     }
     chatState.updatedAt = new Date().toISOString();
-    await this.persistStore();
 
-    await this.sendMessage(msg.chat.id, aiReply.replyText, { replyToMessageId: msg.message_id });
+    if (options?.backgroundMode) {
+      await this.persistStore();
+    } else {
+      await Promise.race([
+        this.persistStore(),
+        new Promise<void>((resolve) => setTimeout(resolve, 800)),
+      ]);
+    }
+
     this.adapters.pushLog?.('autoreply', `TG:${senderName}`, `Replied via ${aiReply.provider}`, 'success');
     return { handled: true, action: 'chat_reply', provider: aiReply.provider };
   }
@@ -777,11 +1156,27 @@ export function registerTelegramRoutes(
     const origin = host ? `${proto}://${host}` : process.env.URL || process.env.DEPLOY_PRIME_URL || undefined;
     const update = (req.body || {}) as TelegramUpdate;
     const rawMsgText = String(update.message?.text || update.message?.caption || update.edited_message?.text || '').trim();
-    const isInstantCommand = /^\/(?:start|help|myid|status|antilink)(?:\s|$|@)/i.test(rawMsgText);
 
-    // On Netlify, offload AI / Agent / Image / Search updates to the 15-minute Background Function
-    // so Telegram gets an instant 200 OK in <300ms without hitting Netlify's 10s sync limit.
-    if (isNetlifyRuntime() && origin && !isInstantCommand && rawMsgText && getTelegramBotToken()) {
+    // ONLY offload genuinely heavy research, scraping, multi-step agent missions, and image generation
+    // to Netlify's 15-minute background worker! All instant chats, status/advice, and control toggles
+    // execute INLINE in ~1-5 seconds instead of waiting 10-15 minutes in a background queue.
+    const isHeavyTask =
+      /^\/(?:agent|imagine|search)(?:\s|$|@)/i.test(rawMsgText) ||
+      /^(?:এজেন্ট|অটোনোমাস|ছবি\s*বানাও|ছবি\s*আঁকো|খুঁজো|সার্চ|draw|generate\s+image|research|find\s+leads)\b/i.test(
+        rawMsgText
+      ) ||
+      /(?:ওয়েব\s*সার্চ|ওয়েব\s*রিসার্চ|লিড\s*খুঁজ|স্ক্র্যাপ|scrape|find\s+leads|web\s*research)/i.test(
+        rawMsgText
+      );
+
+    const shouldOffloadBackground =
+      isNetlifyRuntime() &&
+      origin &&
+      rawMsgText &&
+      getTelegramBotToken() &&
+      (isHeavyTask || !controller.isInlineInstantEnabled());
+
+    if (shouldOffloadBackground) {
       try {
         const bgPayload = JSON.stringify({
           kind: 'telegram_update',
@@ -796,7 +1191,7 @@ export function registerTelegramRoutes(
             'x-wanexus-bg-sig': bgSig,
           },
           body: bgPayload,
-          signal: AbortSignal.timeout(4_000),
+          signal: AbortSignal.timeout(3_500),
         });
         if (bgResp.ok || bgResp.status === 202) {
           res.json({ ok: true, offloaded: 'netlify_background_15m' });

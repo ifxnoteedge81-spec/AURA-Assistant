@@ -115,6 +115,22 @@ export function getAdminFirestore(): { db: Firestore | null; mode: string } {
   return { db: adminDb, mode: initMode };
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export async function adminSaveDocument(
   collectionName: string,
   docId: string,
@@ -123,12 +139,16 @@ export async function adminSaveDocument(
   const { db } = getAdminFirestore();
   if (!db) return false;
   try {
-    await db.collection(collectionName).doc(docId).set(
-      {
-        ...data,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
+    await withTimeout(
+      db.collection(collectionName).doc(docId).set(
+        {
+          ...data,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      ),
+      2_500,
+      `Firestore save ${collectionName}/${docId}`
     );
     return true;
   } catch (err) {
@@ -141,7 +161,11 @@ export async function adminLoadCollection<T>(collectionName: string): Promise<Ar
   const { db } = getAdminFirestore();
   if (!db) return [];
   try {
-    const snap = await db.collection(collectionName).limit(500).get();
+    const snap = await withTimeout(
+      db.collection(collectionName).limit(500).get(),
+      2_500,
+      `Firestore list ${collectionName}`
+    );
     return snap.docs.map((d) => ({ id: d.id, ...(d.data() as T) }));
   } catch (err) {
     console.warn(`[Firestore Admin] Failed reading ${collectionName}:`, (err as Error).message);
@@ -153,7 +177,11 @@ export async function adminLoadDocument<T>(collectionName: string, docId: string
   const { db } = getAdminFirestore();
   if (!db) return null;
   try {
-    const docSnap = await db.collection(collectionName).doc(docId).get();
+    const docSnap = await withTimeout(
+      db.collection(collectionName).doc(docId).get(),
+      2_000,
+      `Firestore read ${collectionName}/${docId}`
+    );
     if (!docSnap.exists) return null;
     return docSnap.data() as T;
   } catch (err) {

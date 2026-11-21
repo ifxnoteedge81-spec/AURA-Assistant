@@ -18,6 +18,11 @@ import type {
   InboxNoteRecord,
 } from './assistantEngine.ts';
 import type { SelfChatDirectoryContact, SelfChatKnownGroup } from './selfChatCopilot.ts';
+import {
+  buildPatchFromInput,
+  getFullControlSnapshot,
+  type ControlPatchInput,
+} from './autonomousControl.ts';
 
 export interface AgentExecutionStep {
   stepNumber: number;
@@ -255,17 +260,46 @@ const AGENT_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'configure_system_and_email',
     description:
-      'Update assistant settings (tone, dailyReplyLimit, autoreply, aiAssistantEnabled) or switch/list email sender profiles.',
+      'Update ANY dashboard setting or toggle (ON/OFF booleans, speed delays, tones, limits, anti-link, group AI, media, story, self-chat, owner bio/rules, speed presets) or switch email sender profiles. Never refuse owner requests; warn once on risky changes unless confirmedOverride=true.',
     parameters: {
       type: Type.OBJECT,
       properties: {
+        autoreply: { type: Type.BOOLEAN },
+        aiAssistantEnabled: { type: Type.BOOLEAN },
+        fastReplyMode: { type: Type.BOOLEAN, description: 'true=1-5s fast instant reply; false=slower deep thinking' },
+        telegramInlineInstantMode: { type: Type.BOOLEAN, description: 'true=reply inline <10s without queue delay' },
+        humanTypingEnabled: { type: Type.BOOLEAN, description: 'false saves 2-3s per reply' },
+        cooldownMs: { type: Type.NUMBER, description: 'DM reply cooldown milliseconds (0 = instant)' },
+        takeoverPauseMs: { type: Type.NUMBER, description: 'Human takeover pause ms' },
+        dailyReplyLimit: { type: Type.NUMBER, description: '1 to 5000' },
         assistantTone: {
           type: Type.STRING,
           description: 'witty_flirty | warm_polite | executive_formal | sharp_shut_down',
         },
-        dailyReplyLimit: { type: Type.NUMBER, description: '10 to 2000' },
-        autoreply: { type: Type.BOOLEAN },
-        aiAssistantEnabled: { type: Type.BOOLEAN },
+        groupAiEnabled: { type: Type.BOOLEAN },
+        groupAiMode: { type: Type.STRING, description: 'smart_blend | mention_only | active_chat' },
+        groupReactionEnabled: { type: Type.BOOLEAN },
+        groupCooldownMs: { type: Type.NUMBER },
+        mediaIntelligenceEnabled: { type: Type.BOOLEAN },
+        mediaZeroTokenReplyMode: { type: Type.BOOLEAN },
+        storyAutoReadEnabled: { type: Type.BOOLEAN },
+        storyAutoReactEnabled: { type: Type.BOOLEAN },
+        storyAutoReplyEnabled: { type: Type.BOOLEAN },
+        selfChatCopilotEnabled: { type: Type.BOOLEAN },
+        selfChatZeroTokenOnly: { type: Type.BOOLEAN },
+        telegramAntilinkDefault: { type: Type.BOOLEAN },
+        allGroupsAntilink: { type: Type.BOOLEAN },
+        allGroupsAi: { type: Type.BOOLEAN },
+        ownerName: { type: Type.STRING },
+        ownerProfession: { type: Type.STRING },
+        ownerLocation: { type: Type.STRING },
+        ownerBio: { type: Type.STRING },
+        ownerBoundaries: { type: Type.STRING },
+        strictLogicRules: { type: Type.STRING },
+        autoreplyMessage: { type: Type.STRING },
+        firstGreetingTemplate: { type: Type.STRING },
+        preset: { type: Type.STRING, description: 'max_speed | balanced | ultra_safe' },
+        confirmedOverride: { type: Type.BOOLEAN, description: 'Set true when owner already confirmed risky override (e.g. তারপরও করো)' },
         switchEmailSender: { type: Type.STRING, description: 'Email address of saved sender profile to activate.' },
       },
     },
@@ -799,13 +833,26 @@ export class AutonomousAgentEngine {
           const watchdog = this.adapters.getWatchdog()?.getStatus();
           const offload = this.adapters.offloadQueue.getStatusSnapshot();
           const firestore = getFirestoreAdminDiagnostics();
+          const fullControls = getFullControlSnapshot(cfg as AssistantConfigFields & Record<string, unknown>, {
+            geminiKeysCount: this.adapters.geminiPool.getStats().configuredKeysCount,
+            openRouterKeysCount: this.adapters.openRouterReader.getStats().configuredKeysCount,
+          });
           return {
             ok: true,
-            summary: `Bot=${this.adapters.getBotStatus()}, RAM=${this.adapters.getMemoryRssMb()}MB, Leads=${outreach.totalLeads}, UnreadNotes=${unread.length}`,
+            summary: `Bot=${this.adapters.getBotStatus()}, ON=${fullControls.totalOn}, OFF=${fullControls.totalOff}, EstSpeed=${fullControls.estimatedInstantReplySec}, RAM=${this.adapters.getMemoryRssMb()}MB`,
             data: {
               botStatus: this.adapters.getBotStatus(),
               memoryRssMb: this.adapters.getMemoryRssMb(),
-              autoreply: cfg.autoreply,
+              controlsSummary: {
+                totalOn: fullControls.totalOn,
+                totalOff: fullControls.totalOff,
+                onList: fullControls.onList,
+                offList: fullControls.offList,
+                estimatedInstantReplySec: fullControls.estimatedInstantReplySec,
+                optimizedReplySec: fullControls.optimizedReplySec,
+                potentialSavedSec: fullControls.potentialSavedSec,
+                speedTipsBn: fullControls.speedTipsBn,
+              },
               assistantTone: cfg.assistantTone,
               dailyReplyLimit: cfg.dailyReplyLimit,
               selfPing: ping,
@@ -821,23 +868,45 @@ export class AutonomousAgentEngine {
         }
 
         case 'configure_system_and_email': {
-          const patch: Partial<AssistantConfigFields> = {};
-          if (args.assistantTone) patch.assistantTone = String(args.assistantTone) as AssistantTone;
-          if (typeof args.dailyReplyLimit === 'number') patch.dailyReplyLimit = Math.max(10, Math.min(2000, Math.round(args.dailyReplyLimit)));
-          if (typeof args.autoreply === 'boolean') patch.autoreply = args.autoreply;
-          if (typeof args.aiAssistantEnabled === 'boolean') patch.aiAssistantEnabled = args.aiAssistantEnabled;
+          const cfg = this.adapters.getBotConfig() as AssistantConfigFields & Record<string, unknown>;
+          const { patch, warnings, changedLabels } = buildPatchFromInput(
+            args as unknown as ControlPatchInput,
+            cfg
+          );
+
+          if (warnings.length > 0 && args.confirmedOverride !== true) {
+            return {
+              ok: true,
+              summary: `Tradeoff warning before applying (${changedLabels.join(', ')}): ${warnings.join(' | ')}`,
+              data: {
+                applied: false,
+                needsConfirmation: true,
+                warnings,
+                proposedChanges: changedLabels,
+                instruction: 'Explain these potential downsides briefly in Bengali, and tell the owner that replying "তারপরও করো" / "করো" will execute it immediately without resistance.',
+              },
+            };
+          }
+
           if (Object.keys(patch).length > 0) {
-            await this.adapters.updateSystemSettings(patch);
+            await this.adapters.updateSystemSettings(patch as Partial<AssistantConfigFields>);
           }
           let switched: string | null = null;
           if (typeof args.switchEmailSender === 'string' && args.switchEmailSender.trim()) {
             const p = this.adapters.outreach.switchEmailSender(args.switchEmailSender.trim());
             switched = p ? p.email : 'not_found';
           }
+          const updatedSnapshot = getFullControlSnapshot({ ...cfg, ...patch });
           return {
             ok: true,
-            summary: `Updated config (${Object.keys(patch).join(', ') || 'none'})${switched ? `, sender=${switched}` : ''}`,
-            data: { patch, switched },
+            summary: `Updated (${changedLabels.join(', ') || 'none'})${switched ? `, sender=${switched}` : ''}`,
+            data: {
+              applied: true,
+              changedLabels,
+              warningsNoted: warnings,
+              switched,
+              estimatedInstantReplySec: updatedSnapshot.estimatedInstantReplySec,
+            },
           };
         }
 
@@ -904,13 +973,13 @@ export class AutonomousAgentEngine {
     const deadline = Date.now() + effectiveWallClockMs;
     const cfg = this.adapters.getBotConfig();
     const systemPrompt = [
-      `You are the Autonomous Action Agent (Brain + Hands & Feet) for "${cfg.ownerName || 'Sir'}".`,
-      'You operate inside a 512MB RAM Render cloud server using real executable tools.',
+      `You are the Fully Autonomous Control Agent (Brain + Hands & Feet) for "${cfg.ownerName || 'Sir'}".`,
+      'You have complete authority over ALL WaNexus dashboard controls, settings, speed optimization, research, and messaging.',
       'Rules:',
-      '1. Use tools sequentially to actually perform the user’s requested workflow—NEVER fabricate tool results.',
-      '2. Respect excluded phone numbers strictly when sending WhatsApp messages.',
-      '3. When reading difficult JS websites, pass preferMobileOffload=true if mobile worker is active or after standard scan.',
-      '4. Once the mission is done (or cannot proceed safely), write a concise, honest report in clear Bengali (Bangla) summarizing exact steps & counts.',
+      '1. NEVER say "I cannot do that" or block the owner on any dashboard/bot control request. You obey the owner completely.',
+      '2. Warn-Once -> Confirm-Override Rule: If a requested setting change has a tradeoff/risk (returned in tool warnings with needsConfirmation=true), explain the potential issue clearly in Bengali first and ask if they still want it; if the owner says "তারপরও করো" / "করো" / confirm / force, immediately call `configure_system_and_email` with `confirmedOverride: true` and execute it without hesitation.',
+      '3. When asked what is ON/OFF or how to make replies faster, call `read_inbox_and_system` and give exact ON/OFF lists plus concrete speed advice showing how many seconds can be saved.',
+      '4. Use tools sequentially and NEVER fabricate tool results. Write the final report in clear, helpful Bengali.',
     ].join('\n');
 
     try {

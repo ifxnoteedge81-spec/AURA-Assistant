@@ -499,6 +499,34 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               )}
             </div>
 
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+              <label className="flex items-center justify-between gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50 cursor-pointer">
+                <div>
+                  <div className="font-medium text-slate-800">Instant Inline Reply (&lt;10s)</div>
+                  <div className="text-[11px] text-slate-500">Skip background queue for chat</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={config.telegramInlineInstantMode !== false}
+                  onChange={(e) => void onUpdateConfig({ telegramInlineInstantMode: e.target.checked })}
+                  className="h-4 w-4 accent-emerald-600"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50 cursor-pointer">
+                <div>
+                  <div className="font-medium text-slate-800">Fast Reply Mode (1–5s)</div>
+                  <div className="text-[11px] text-slate-500">Low thinking latency</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={config.fastReplyMode !== false}
+                  onChange={(e) => void onUpdateConfig({ fastReplyMode: e.target.checked })}
+                  className="h-4 w-4 accent-emerald-600"
+                />
+              </label>
+            </div>
+
             <button
               type="button"
               onClick={() => void handleSetupTelegramWebhook()}

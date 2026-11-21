@@ -94,6 +94,8 @@ export interface AssistantConfigFields {
   ownerBoundaries: string;
   strictLogicRules?: string;
   assistantTone: AssistantTone;
+  cooldownMs?: number;
+  takeoverPauseMs?: number;
   humanTypingEnabled?: boolean;
   dailyReplyLimit?: number;
   antilinkGroups?: Record<string, boolean>;
@@ -114,6 +116,9 @@ export interface AssistantConfigFields {
   selfChatCopilotEnabled?: boolean;
   selfChatZeroTokenOnly?: boolean;
   contactPolicies?: ContactPolicyEntry[];
+  fastReplyMode?: boolean;
+  telegramInlineInstantMode?: boolean;
+  telegramAntilinkDefault?: boolean;
   configUpdatedAt?: string;
 }
 

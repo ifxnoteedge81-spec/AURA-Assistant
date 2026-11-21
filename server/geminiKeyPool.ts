@@ -21,6 +21,7 @@ export interface KeyRotationEvent {
 
 export interface RotationOptions {
   maxTotalMs?: number;
+  perAttemptMs?: number;
   channel?: string;
 }
 
@@ -179,7 +180,24 @@ export class GeminiKeyPool {
       const keySlot = idx + 1;
 
       try {
-        const value = await task(this.clients[idx], keySlot);
+        const remainingMs = Math.max(1_500, deadline - Date.now());
+        const attemptBudgetMs = Math.min(options?.perAttemptMs ?? 12_000, remainingMs);
+        const value = await new Promise<T>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`Gemini Key #${keySlot} timed out after ${attemptBudgetMs}ms`)),
+            attemptBudgetMs
+          );
+          task(this.clients[idx], keySlot).then(
+            (res) => {
+              clearTimeout(timer);
+              resolve(res);
+            },
+            (err) => {
+              clearTimeout(timer);
+              reject(err);
+            }
+          );
+        });
         // Keep activeIndex pinned on the healthy key that succeeded and clear its cooldown on this channel
         this.activeIndex = idx;
         cooldownUntil[idx] = 0;
