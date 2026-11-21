@@ -28,15 +28,22 @@ export function LockScreen({ onUnlocked }: LockScreenProps) {
         fetch('/api/auth/challenge'),
       ]);
       if (statusRes.ok) {
-        const sData = await statusRes.json();
+        const sData = await statusRes.json().catch(() => ({}));
         if (sData.ownerEmail) setOwnerEmailHint(sData.ownerEmail);
         setPinConfigured(Boolean(sData.pinConfigured));
       }
       if (challengeRes.ok) {
-        const cData = await challengeRes.json();
-        setChallengeQuestion(cData.question || '');
-        setChallengeToken(cData.challengeToken || '');
-        setChallengeAnswer('');
+        const cData = await challengeRes.json().catch(() => ({}));
+        if (cData.question && cData.challengeToken) {
+          setChallengeQuestion(cData.question);
+          setChallengeToken(cData.challengeToken);
+          setChallengeAnswer('');
+          setError(null);
+        } else {
+          setError('Security challenge response was invalid. Tap Refresh to retry.');
+        }
+      } else {
+        setError(`Security server returned HTTP ${challengeRes.status}. Tap Refresh to retry.`);
       }
     } catch {
       setError('Could not connect to security verification server.');
@@ -51,13 +58,18 @@ export function LockScreen({ onUnlocked }: LockScreenProps) {
     try {
       const res = await fetch('/api/auth/challenge');
       if (res.ok) {
-        const data = await res.json();
-        setChallengeQuestion(data.question || '');
-        setChallengeToken(data.challengeToken || '');
-        setChallengeAnswer('');
+        const data = await res.json().catch(() => ({}));
+        if (data.question && data.challengeToken) {
+          setChallengeQuestion(data.question);
+          setChallengeToken(data.challengeToken);
+          setChallengeAnswer('');
+          setError(null);
+          return;
+        }
       }
+      setError(`Verification refresh failed (HTTP ${res.status}).`);
     } catch {
-      // ignore
+      setError('Could not connect to security verification server.');
     }
   }
 

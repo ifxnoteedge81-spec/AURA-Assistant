@@ -2,8 +2,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
-import { getAuth } from 'firebase-admin/auth';
-import { getApps } from 'firebase-admin/app';
 
 const IS_SERVERLESS = Boolean(
   process.env.VERCEL ||
@@ -314,18 +312,20 @@ export async function verifyGoogleFirebaseIdToken(
     throw new Error('Missing Google Firebase ID token.');
   }
 
-  // 1. Prefer Firebase Admin Auth when initialized
-  if (getApps().length > 0) {
-    try {
+  // 1. Prefer Firebase Admin Auth when initialized (loaded dynamically so jwks-rsa/jose never breaks startup)
+  try {
+    const { getApps } = await import('firebase-admin/app');
+    if (getApps().length > 0) {
+      const { getAuth } = await import('firebase-admin/auth');
       const decoded = await getAuth(getApps()[0]).verifyIdToken(idToken);
       const email = (decoded.email || '').toLowerCase();
       return {
         email,
         emailVerified: Boolean(decoded.email_verified),
       };
-    } catch {
-      // fall back to Identity Toolkit lookup if Admin credentials are partial
     }
+  } catch {
+    // fall back to Identity Toolkit REST lookup below
   }
 
   // 2. Fallback: Verify token directly against Google Identity Toolkit REST API
