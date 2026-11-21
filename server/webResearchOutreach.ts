@@ -200,7 +200,13 @@ export interface WebOutreachHostAdapters {
   }) => void;
 }
 
-const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+const RUNTIME_DIR = IS_SERVERLESS ? '/tmp' : '.';
 const OUTREACH_FILE = path.resolve(RUNTIME_DIR, 'bot-outreach.json');
 const OUTREACH_SENDERS_FILE = path.resolve(RUNTIME_DIR, 'bot-outreach-senders.json');
 const MAX_LEADS = 300;

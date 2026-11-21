@@ -185,17 +185,21 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <div className="text-xs font-medium text-slate-500">Runtime Environment</div>
           <div className="text-base font-semibold text-slate-900 flex items-center gap-2">
             <Settings className="w-4 h-4 text-emerald-600" />
-            {envStatus?.runtime.isVercel
-              ? 'Vercel 24/7 Serverless'
-              : envStatus?.runtime.isTermux
-                ? 'Android Termux'
-                : envStatus?.runtime.platform || 'Node.js'}{' '}
+            {envStatus?.runtime.isNetlify
+              ? 'Netlify 24/7 + 15m Background'
+              : envStatus?.runtime.isVercel
+                ? 'Vercel 24/7 Serverless'
+                : envStatus?.runtime.isTermux
+                  ? 'Android Termux'
+                  : envStatus?.runtime.platform || 'Node.js'}{' '}
             · {envStatus?.runtime.nodeVersion || 'v22'}
           </div>
           <div className="text-xs text-slate-600">
-            {envStatus?.runtime.isVercel
-              ? 'HTTPS Edge Webhook · Always Ready'
-              : `Port ${envStatus?.runtime.port || 3000} · RAM ${envStatus?.runtime.memoryMb ?? '—'} MB`}
+            {envStatus?.runtime.isNetlify
+              ? 'HTTPS Webhook + 15m Background Worker'
+              : envStatus?.runtime.isVercel
+                ? 'HTTPS Edge Webhook · Always Ready'
+                : `Port ${envStatus?.runtime.port || 3000} · RAM ${envStatus?.runtime.memoryMb ?? '—'} MB`}
           </div>
         </div>
 
@@ -456,7 +460,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <div className="flex items-center gap-2">
                 <Send className="w-4 h-4 text-emerald-600" />
                 <h2 className="text-base font-semibold text-slate-900">
-                  Telegram 24/7 Bot &amp; Mini App (Vercel)
+                  Telegram 24/7 Bot &amp; Mini App (Netlify / Cloud)
                 </h2>
               </div>
               <span
@@ -475,8 +479,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             </div>
 
             <p className="text-xs text-slate-600 leading-relaxed">
-              Vercel-এ <span className="font-mono">TELEGRAM_BOT_TOKEN</span> সেট করার পর নিচের বাটনে চাপলেই
-              টেলিগ্রাম Webhook, কমান্ড মেনু (/agent, /imagine, /search) ও Telegram Mini App অটোমেটিক চালু হয়ে যাবে।
+              Netlify Environment Variables-এ <span className="font-mono">TELEGRAM_BOT_TOKEN</span> সেট করার পর নিচের বাটনে চাপলেই
+              টেলিগ্রাম Webhook, কমান্ড মেনু (/agent, /imagine, /search) ও ১৫-মিনিট ব্যাকগ্রাউন্ড সাপোর্টসহ Mini App চালু হয়ে যাবে।
             </p>
 
             <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 text-xs text-slate-700 space-y-1">

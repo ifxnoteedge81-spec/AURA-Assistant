@@ -44,8 +44,18 @@ export interface TelegramBotAdapters {
   ) => void;
 }
 
-const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+const RUNTIME_DIR = IS_SERVERLESS ? '/tmp' : '.';
 const TG_MEM_FILE = path.resolve(RUNTIME_DIR, 'bot-telegram-memories.json');
+
+export function isNetlifyRuntime(): boolean {
+  return Boolean(process.env.NETLIFY || process.env.URL || process.env.DEPLOY_PRIME_URL);
+}
 
 interface TelegramMessageEntity {
   type?: string;
@@ -78,7 +88,7 @@ interface TelegramMessage {
   reply_to_message?: TelegramMessage;
 }
 
-interface TelegramUpdate {
+export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
@@ -96,6 +106,23 @@ export function getTelegramWebhookSecret(): string {
   const tok = getTelegramBotToken();
   if (!tok) return '';
   return crypto.createHmac('sha256', tok).update('wanexus-tg-webhook').digest('hex').slice(0, 32);
+}
+
+export function createInternalBgSignature(rawBody: string): string {
+  const key =
+    getTelegramWebhookSecret() ||
+    process.env.DASHBOARD_AUTH_SECRET?.trim() ||
+    process.env.GEMINI_API_KEY?.trim() ||
+    'wanexus-bg-worker';
+  return crypto.createHmac('sha256', key).update(rawBody).digest('hex');
+}
+
+export function verifyInternalBgSignature(rawBody: string, sig: string): boolean {
+  if (!sig) return false;
+  const expected = createInternalBgSignature(rawBody);
+  const a = Buffer.from(sig, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 function getOwnerIdList(): string[] {
@@ -250,7 +277,7 @@ export class TelegramBotController {
   public async setupWebhookAndMenu(baseUrl: string) {
     const cleanBase = baseUrl.replace(/\/+$/, '');
     if (!cleanBase.startsWith('https://')) {
-      throw new Error('Telegram requires a public HTTPS URL (e.g. your Vercel deployment https://xxx.vercel.app).');
+      throw new Error('Telegram requires a public HTTPS URL (e.g. your Netlify site https://xxx.netlify.app).');
     }
     const webhookUrl = `${cleanBase}/api/telegram/webhook`;
     const secretToken = getTelegramWebhookSecret();
@@ -465,7 +492,11 @@ export class TelegramBotController {
     };
   }
 
-  public async handleWebhookUpdate(update: TelegramUpdate, publicOrigin?: string) {
+  public async handleWebhookUpdate(
+    update: TelegramUpdate,
+    publicOrigin?: string,
+    options?: { backgroundMode?: boolean }
+  ) {
     await this.ensureHydrated();
     const msg = update.message || update.edited_message;
     if (!msg || msg.from?.is_bot) return { handled: false };
@@ -608,7 +639,7 @@ export class TelegramBotController {
         msg.chat.id,
         [
           '📡 *24/7 Cloud System Status*',
-          `• Mode: ${process.env.VERCEL ? 'Vercel Serverless (24/7 Free)' : 'Node Server'}`,
+          `• Mode: ${isNetlifyRuntime() ? 'Netlify Serverless + 15m Background Worker' : process.env.VERCEL ? 'Vercel Serverless (24/7 Free)' : 'Node Server'}`,
           `• Gemini Pool: ${gStats.configuredKeysCount} key(s) active`,
           `• OpenRouter: ${oStats.configuredKeysCount} key(s) (${oStats.primaryModel})`,
           `• Firestore (${fbDiag.configuredProjectId || '—'}): ${fbDiag.projectMatch === true ? '✅ Matched' : fbDiag.mode}`,
@@ -681,7 +712,16 @@ export class TelegramBotController {
         return { handled: true, action: 'agent_unavailable' };
       }
       await this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
-      const run = await agent.executeMission({ goal: agentMatch[1].trim(), source: 'self_chat' });
+      const maxWallClockMs = options?.backgroundMode
+        ? 240_000
+        : isNetlifyRuntime()
+          ? 7_200
+          : undefined;
+      const run = await agent.executeMission({
+        goal: agentMatch[1].trim(),
+        source: 'self_chat',
+        maxWallClockMs,
+      });
       await this.sendMessage(
         msg.chat.id,
         `${run.finalReport}\n\n_(${run.providerUsed.toUpperCase()} · ${run.steps.length} ধাপ · ${run.tokensUsed} টোকেন)_`,
@@ -733,11 +773,42 @@ export function registerTelegramRoutes(
     }
 
     const host = req.headers['x-forwarded-host'] || req.headers.host || '';
-    const proto = req.headers['x-forwarded-proto'] || 'https';
-    const origin = host ? `${proto}://${host}` : undefined;
+    const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+    const origin = host ? `${proto}://${host}` : process.env.URL || process.env.DEPLOY_PRIME_URL || undefined;
+    const update = (req.body || {}) as TelegramUpdate;
+    const rawMsgText = String(update.message?.text || update.message?.caption || update.edited_message?.text || '').trim();
+    const isInstantCommand = /^\/(?:start|help|myid|status|antilink)(?:\s|$|@)/i.test(rawMsgText);
+
+    // On Netlify, offload AI / Agent / Image / Search updates to the 15-minute Background Function
+    // so Telegram gets an instant 200 OK in <300ms without hitting Netlify's 10s sync limit.
+    if (isNetlifyRuntime() && origin && !isInstantCommand && rawMsgText && getTelegramBotToken()) {
+      try {
+        const bgPayload = JSON.stringify({
+          kind: 'telegram_update',
+          update,
+          origin,
+        });
+        const bgSig = createInternalBgSignature(bgPayload);
+        const bgResp = await fetch(`${origin.replace(/\/+$/, '')}/.netlify/functions/telegram-worker-background`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-wanexus-bg-sig': bgSig,
+          },
+          body: bgPayload,
+          signal: AbortSignal.timeout(4_000),
+        });
+        if (bgResp.ok || bgResp.status === 202) {
+          res.json({ ok: true, offloaded: 'netlify_background_15m' });
+          return;
+        }
+      } catch {
+        // fall through to inline execution below
+      }
+    }
 
     try {
-      const outcome = await controller.handleWebhookUpdate((req.body || {}) as TelegramUpdate, origin);
+      const outcome = await controller.handleWebhookUpdate(update, origin, { backgroundMode: false });
       res.json({ ok: true, ...outcome });
     } catch (err) {
       console.error('[Telegram Webhook] Error:', (err as Error).message);

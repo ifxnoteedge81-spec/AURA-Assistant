@@ -34,11 +34,23 @@ import {
 } from '../server/authSecurity.ts';
 import {
   TelegramBotController,
+  createInternalBgSignature,
   getTelegramBotToken,
+  isNetlifyRuntime,
   registerTelegramRoutes,
 } from '../server/telegramBot.ts';
 
 const app = express();
+
+// Normalize Netlify Function rewrite paths (/.netlify/functions/api/...) to Express routes (/api/... or /health)
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/.netlify/functions/api')) {
+    const rest = req.url.slice('/.netlify/functions/api'.length) || '/';
+    req.url = rest.startsWith('/health') ? rest : `/api${rest.startsWith('/') ? rest : `/${rest}`}`;
+  }
+  next();
+});
+
 app.use(express.json({ limit: '4mb' }));
 
 const geminiPool = new GeminiKeyPool();
@@ -296,7 +308,48 @@ const autonomousAgentEngine = new AutonomousAgentEngine({
   pushLog,
 });
 
-registerAutonomousAgentRoutes(app, autonomousAgentEngine, () => null);
+registerAutonomousAgentRoutes(app, autonomousAgentEngine, () => null, {
+  syncWallClockMs: isNetlifyRuntime() ? 7_200 : undefined,
+  dispatchBackgroundMission: isNetlifyRuntime()
+    ? async (req, goal) => {
+        const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+        const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+        const origin = host ? `${proto}://${host}` : process.env.URL || process.env.DEPLOY_PRIME_URL || '';
+        if (!origin.startsWith('http')) return null;
+
+        const preassignedRunId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const bgPayload = JSON.stringify({
+          kind: 'agent_run',
+          goal,
+          preassignedRunId,
+          origin,
+        });
+        const bgResp = await fetch(`${origin.replace(/\/+$/, '')}/.netlify/functions/telegram-worker-background`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-wanexus-bg-sig': createInternalBgSignature(bgPayload),
+          },
+          body: bgPayload,
+          signal: AbortSignal.timeout(3_500),
+        });
+        if (!bgResp.ok && bgResp.status !== 202) return null;
+
+        return {
+          id: preassignedRunId,
+          source: 'dashboard',
+          goal: goal.slice(0, 1200),
+          status: 'running',
+          providerUsed: 'hybrid',
+          modelUsed: 'netlify-15m-background',
+          tokensUsed: 0,
+          steps: [],
+          finalReport: '⏳ Netlify ১৫-মিনিট ব্যাকগ্রাউন্ড ইঞ্জিনে মিশন চলছে... কয়েক সেকেন্ডের মধ্যে রিপোর্ট আপডেট হবে।',
+          startedAt: new Date().toISOString(),
+        };
+      }
+    : undefined,
+});
 
 const telegramBotController = new TelegramBotController({
   geminiPool,
@@ -335,9 +388,10 @@ app.get('/api/system/env-status', (_req, res) => {
 
   res.json({
     runtime: {
-      platform: 'vercel_serverless',
+      platform: isNetlifyRuntime() ? 'netlify_serverless' : 'vercel_serverless',
       isTermux: false,
-      isVercel: true,
+      isVercel: Boolean(process.env.VERCEL),
+      isNetlify: isNetlifyRuntime(),
       nodeVersion: process.version,
       port: 443,
       nodeEnv: process.env.NODE_ENV || 'production',
@@ -355,7 +409,7 @@ app.get('/api/system/env-status', (_req, res) => {
         key: 'TELEGRAM_BOT_TOKEN',
         category: 'Telegram 24/7',
         configured: Boolean(getTelegramBotToken()),
-        detail: Boolean(getTelegramBotToken()) ? 'Bot token ready' : 'Add @BotFather token in Vercel Env',
+        detail: Boolean(getTelegramBotToken()) ? 'Bot token ready' : 'Add @BotFather token in Netlify Env',
       },
       {
         key: 'GEMINI_API_KEY_1..5',
@@ -438,7 +492,7 @@ app.get('/health', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     status: 'ok',
-    mode: 'vercel_serverless',
+    mode: isNetlifyRuntime() ? 'netlify_serverless_15m_bg' : 'vercel_serverless',
     telegramBotConfigured: Boolean(getTelegramBotToken()),
     geminiKeyPool: geminiPool.getStats(),
     openRouter: openRouterReader.getStats(),
@@ -448,7 +502,8 @@ app.get('/health', (_req, res) => {
 });
 
 app.all('/api/*', (_req, res) => {
-  res.status(404).json({ error: 'Endpoint unavailable in Vercel serverless mode.' });
+  res.status(404).json({ error: 'Endpoint unavailable in serverless mode.' });
 });
 
+export { app, autonomousAgentEngine, telegramBotController };
 export default app;

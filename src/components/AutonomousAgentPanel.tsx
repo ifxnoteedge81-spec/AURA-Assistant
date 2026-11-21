@@ -123,6 +123,10 @@ export const AutonomousAgentPanel: React.FC<AutonomousAgentPanelProps> = ({
       const data = await res.json();
       if (!res.ok) {
         setNotice(data.error || 'Agent mission failed.');
+      } else if (data.queuedBackground) {
+        if (!customGoal) setGoalInput('');
+        setNotice('Mission started on Netlify 15-min Background Worker — live results will update automatically.');
+        await loadState();
       } else if (data.run?.status === 'failed') {
         setNotice(data.run?.error || data.run?.finalReport || 'Agent mission failed.');
         await loadState();

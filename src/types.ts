@@ -649,6 +649,7 @@ export interface SystemEnvStatusResponse {
     platform: string;
     isTermux: boolean;
     isVercel?: boolean;
+    isNetlify?: boolean;
     nodeVersion: string;
     port: number;
     nodeEnv: string;

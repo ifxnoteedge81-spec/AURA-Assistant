@@ -106,7 +106,13 @@ export interface AutonomousAgentAdapters {
   ) => void;
 }
 
-const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+const RUNTIME_DIR = IS_SERVERLESS ? '/tmp' : '.';
 const RUNS_FILE = path.resolve(RUNTIME_DIR, 'bot-agent-runs.json');
 const SCHEDULES_FILE = path.resolve(RUNTIME_DIR, 'bot-agent-schedules.json');
 const MAX_RUNS = 30;
@@ -340,6 +346,22 @@ export class AutonomousAgentEngine {
     });
   }
 
+  public async saveRunsAsync(): Promise<void> {
+    this.runs = this.runs.slice(0, MAX_RUNS);
+    try {
+      fs.writeFileSync(
+        RUNS_FILE,
+        JSON.stringify({ runs: this.runs, updatedAt: new Date().toISOString() }, null, 2),
+        'utf8'
+      );
+    } catch {
+      // ignore
+    }
+    await adminSaveDocument('bot_agent_runs', 'primary', {
+      runs: this.runs.slice(0, 15),
+    }).catch(() => false);
+  }
+
   private saveSchedules() {
     this.schedules = this.schedules.slice(0, MAX_SCHEDULES);
     try {
@@ -356,14 +378,21 @@ export class AutonomousAgentEngine {
     });
   }
 
-  private async hydrateFromCloud() {
+  public async hydrateFromCloud(forceRefresh = false) {
     try {
       const cloudRuns = await adminLoadDocument<{ runs?: AgentRunRecord[] }>('bot_agent_runs', 'primary');
-      if (Array.isArray(cloudRuns?.runs) && cloudRuns.runs.length > 0 && this.runs.length === 0) {
-        this.runs = cloudRuns.runs.slice(0, MAX_RUNS);
+      if (Array.isArray(cloudRuns?.runs) && cloudRuns.runs.length > 0 && (forceRefresh || this.runs.length === 0)) {
+        const localActive = this.runs.filter((r) => r.status === 'running');
+        const merged = [...cloudRuns.runs];
+        for (const active of localActive) {
+          if (!merged.some((r) => r.id === active.id)) {
+            merged.unshift(active);
+          }
+        }
+        this.runs = merged.slice(0, MAX_RUNS);
       }
       const cloudSched = await adminLoadDocument<{ schedules?: AgentScheduleItem[] }>('bot_agent_schedules', 'primary');
-      if (Array.isArray(cloudSched?.schedules) && cloudSched.schedules.length > 0 && this.schedules.length === 0) {
+      if (Array.isArray(cloudSched?.schedules) && cloudSched.schedules.length > 0 && (forceRefresh || this.schedules.length === 0)) {
         this.schedules = cloudSched.schedules.slice(0, MAX_SCHEDULES);
       }
     } catch {
@@ -850,10 +879,13 @@ export class AutonomousAgentEngine {
   public async executeMission(params: {
     goal: string;
     source: 'self_chat' | 'dashboard' | 'schedule';
+    maxWallClockMs?: number;
+    preassignedRunId?: string;
   }): Promise<AgentRunRecord> {
+    await this.hydrateFromCloud(false);
     const cleanGoal = params.goal.trim().slice(0, 1200);
     const run: AgentRunRecord = {
-      id: `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: params.preassignedRunId || `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       source: params.source,
       goal: cleanGoal,
       status: 'running',
@@ -864,11 +896,12 @@ export class AutonomousAgentEngine {
       finalReport: '',
       startedAt: new Date().toISOString(),
     };
-    this.runs.unshift(run);
+    this.runs = [run, ...this.runs.filter((r) => r.id !== run.id)].slice(0, MAX_RUNS);
     this.activeRunId = run.id;
-    this.saveRuns();
+    await this.saveRunsAsync();
 
-    const deadline = Date.now() + AGENT_WALL_CLOCK_MS;
+    const effectiveWallClockMs = Math.max(4_000, params.maxWallClockMs ?? AGENT_WALL_CLOCK_MS);
+    const deadline = Date.now() + effectiveWallClockMs;
     const cfg = this.adapters.getBotConfig();
     const systemPrompt = [
       `You are the Autonomous Action Agent (Brain + Hands & Feet) for "${cfg.ownerName || 'Sir'}".`,
@@ -1143,6 +1176,7 @@ export class AutonomousAgentEngine {
       if (this.activeRunId === run.id) {
         this.activeRunId = null;
       }
+      await this.saveRunsAsync();
       this.adapters.pushLog(
         'system',
         `Autonomous Agent (${run.providerUsed})`,
@@ -1156,9 +1190,16 @@ export class AutonomousAgentEngine {
 export function registerAutonomousAgentRoutes(
   app: Express,
   agent: AutonomousAgentEngine,
-  getWatchdog: () => SelfHealingWatchdog | null
+  getWatchdog: () => SelfHealingWatchdog | null,
+  options?: {
+    dispatchBackgroundMission?: (req: Request, goal: string) => Promise<AgentRunRecord | null>;
+    syncWallClockMs?: number;
+  }
 ) {
-  app.get('/api/agent/state', (_req: Request, res: Response) => {
+  app.get('/api/agent/state', async (_req: Request, res: Response) => {
+    if (IS_SERVERLESS) {
+      await agent.hydrateFromCloud(true);
+    }
     const wd = getWatchdog();
     res.json({
       ...agent.getSnapshot(),
@@ -1172,7 +1213,18 @@ export function registerAutonomousAgentRoutes(
       res.status(400).json({ error: 'Please provide a valid mission goal.' });
       return;
     }
-    const run = await agent.executeMission({ goal, source: 'dashboard' });
+    if (options?.dispatchBackgroundMission) {
+      const queuedRun = await options.dispatchBackgroundMission(req, goal).catch(() => null);
+      if (queuedRun) {
+        res.json({ ok: true, queuedBackground: true, run: queuedRun });
+        return;
+      }
+    }
+    const run = await agent.executeMission({
+      goal,
+      source: 'dashboard',
+      maxWallClockMs: options?.syncWallClockMs,
+    });
     res.json({ ok: run.status === 'completed', run });
   });
 

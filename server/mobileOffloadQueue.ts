@@ -27,7 +27,13 @@ export interface MobileOffloadJob {
   completedAt?: string;
 }
 
-const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+const RUNTIME_DIR = IS_SERVERLESS ? '/tmp' : '.';
 const OFFLOAD_FILE = path.resolve(RUNTIME_DIR, 'bot-offload-queue.json');
 const MAX_STORED_JOBS = 30;
 const WORKER_ACTIVE_TTL_MS = 45_000;

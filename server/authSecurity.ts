@@ -5,7 +5,13 @@ import type { NextFunction, Request, Response } from 'express';
 import { getAuth } from 'firebase-admin/auth';
 import { getApps } from 'firebase-admin/app';
 
-const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+const RUNTIME_DIR = IS_SERVERLESS ? '/tmp' : '.';
 const SECURITY_FILE = path.resolve(RUNTIME_DIR, 'bot-security.json');
 const CONFIG_JSON_PATH = path.resolve('./firebase-applet-config.json');
 
@@ -70,8 +76,8 @@ function getSigningSecret(): string {
     process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() ||
     process.env.GEMINI_API_KEY?.trim() ||
     process.env.GEMINI_API_KEY_1?.trim();
-  if (process.env.VERCEL && seed) {
-    return crypto.createHmac('sha256', seed).update('wanexus-vercel-auth-secret').digest('hex');
+  if (IS_SERVERLESS && seed) {
+    return crypto.createHmac('sha256', seed).update('wanexus-serverless-auth-secret').digest('hex');
   }
   return securityState.secretKey;
 }
