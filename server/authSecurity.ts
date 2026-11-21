@@ -5,7 +5,8 @@ import type { NextFunction, Request, Response } from 'express';
 import { getAuth } from 'firebase-admin/auth';
 import { getApps } from 'firebase-admin/app';
 
-const SECURITY_FILE = path.resolve('./bot-security.json');
+const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const SECURITY_FILE = path.resolve(RUNTIME_DIR, 'bot-security.json');
 const CONFIG_JSON_PATH = path.resolve('./firebase-applet-config.json');
 
 export const OWNER_EMAIL = (process.env.OWNER_EMAIL || 'ifxnoteedge81@gmail.com').trim().toLowerCase();
@@ -62,7 +63,17 @@ function persistSecurityState() {
 }
 
 function getSigningSecret(): string {
-  return process.env.DASHBOARD_AUTH_SECRET?.trim() || securityState.secretKey;
+  const explicit = process.env.DASHBOARD_AUTH_SECRET?.trim();
+  if (explicit) return explicit;
+  const seed =
+    process.env.TELEGRAM_BOT_TOKEN?.trim() ||
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() ||
+    process.env.GEMINI_API_KEY?.trim() ||
+    process.env.GEMINI_API_KEY_1?.trim();
+  if (process.env.VERCEL && seed) {
+    return crypto.createHmac('sha256', seed).update('wanexus-vercel-auth-secret').digest('hex');
+  }
+  return securityState.secretKey;
 }
 
 function loadFirebaseWebApiKey(): string {

@@ -7,12 +7,13 @@ import {
   Lock,
   RefreshCw,
   Save,
+  Send,
   Settings,
   Terminal,
   AlertTriangle,
 } from 'lucide-react';
 import { authFetch } from '../lib/api';
-import type { BotConfig, SystemEnvStatusResponse } from '../types';
+import type { BotConfig, SystemEnvStatusResponse, TelegramBotStatusSnapshot } from '../types';
 
 interface SettingsPanelProps {
   config: BotConfig;
@@ -46,6 +47,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [pinErr, setPinErr] = useState<string | null>(null);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
 
+  const [tgStatus, setTgStatus] = useState<TelegramBotStatusSnapshot | null>(null);
+  const [tgBusy, setTgBusy] = useState(false);
+  const [tgMsg, setTgMsg] = useState<string | null>(null);
+  const [tgErr, setTgErr] = useState<string | null>(null);
+
   useEffect(() => {
     setOwnerName(config.ownerName);
     setOwnerProfession(config.ownerProfession);
@@ -58,9 +64,15 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const loadEnvStatus = useCallback(async () => {
     setLoadingEnv(true);
     try {
-      const res = await authFetch('/api/system/env-status');
-      if (res.ok) {
-        setEnvStatus((await res.json()) as SystemEnvStatusResponse);
+      const [envRes, tgRes] = await Promise.all([
+        authFetch('/api/system/env-status'),
+        authFetch('/api/telegram/status'),
+      ]);
+      if (envRes.ok) {
+        setEnvStatus((await envRes.json()) as SystemEnvStatusResponse);
+      }
+      if (tgRes.ok) {
+        setTgStatus((await tgRes.json()) as TelegramBotStatusSnapshot);
       }
     } catch {
       // ignore transient poll failure
@@ -72,6 +84,32 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   useEffect(() => {
     void loadEnvStatus();
   }, [loadEnvStatus]);
+
+  async function handleSetupTelegramWebhook() {
+    setTgBusy(true);
+    setTgMsg(null);
+    setTgErr(null);
+    try {
+      const res = await authFetch('/api/telegram/setup-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl: window.location.origin }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setTgErr(data.error || 'Could not activate Telegram Webhook.');
+      } else {
+        setTgStatus(data.status || null);
+        setTgMsg(
+          `Telegram Webhook ও Mini App চালু হয়েছে! (${data.status?.botUsername ? `@${data.status.botUsername}` : 'Bot Active'})`
+        );
+      }
+    } catch (err) {
+      setTgErr((err as Error).message || 'Telegram setup failed.');
+    } finally {
+      setTgBusy(false);
+    }
+  }
 
   async function handleSaveRuntimeSettings(e: React.FormEvent) {
     e.preventDefault();
@@ -147,11 +185,17 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <div className="text-xs font-medium text-slate-500">Runtime Environment</div>
           <div className="text-base font-semibold text-slate-900 flex items-center gap-2">
             <Settings className="w-4 h-4 text-emerald-600" />
-            {envStatus?.runtime.isTermux ? 'Android Termux' : envStatus?.runtime.platform || 'Node.js'} ·{' '}
-            {envStatus?.runtime.nodeVersion || 'v22'}
+            {envStatus?.runtime.isVercel
+              ? 'Vercel 24/7 Serverless'
+              : envStatus?.runtime.isTermux
+                ? 'Android Termux'
+                : envStatus?.runtime.platform || 'Node.js'}{' '}
+            · {envStatus?.runtime.nodeVersion || 'v22'}
           </div>
           <div className="text-xs text-slate-600">
-            Port {envStatus?.runtime.port || 3000} · RAM {envStatus?.runtime.memoryMb ?? '—'} MB
+            {envStatus?.runtime.isVercel
+              ? 'HTTPS Edge Webhook · Always Ready'
+              : `Port ${envStatus?.runtime.port || 3000} · RAM ${envStatus?.runtime.memoryMb ?? '—'} MB`}
           </div>
         </div>
 
@@ -404,6 +448,65 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Telegram 24/7 Bot & Vercel Webhook Activation Card */}
+          <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Send className="w-4 h-4 text-emerald-600" />
+                <h2 className="text-base font-semibold text-slate-900">
+                  Telegram 24/7 Bot &amp; Mini App (Vercel)
+                </h2>
+              </div>
+              <span
+                className={`text-xs font-semibold px-2 py-0.5 rounded border ${
+                  tgStatus?.configured
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-amber-50 text-amber-700 border-amber-200'
+                }`}
+              >
+                {tgStatus?.configured
+                  ? tgStatus.botUsername
+                    ? `@${tgStatus.botUsername}`
+                    : 'Token Active'
+                  : 'Token Not Set'}
+              </span>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Vercel-এ <span className="font-mono">TELEGRAM_BOT_TOKEN</span> সেট করার পর নিচের বাটনে চাপলেই
+              টেলিগ্রাম Webhook, কমান্ড মেনু (/agent, /imagine, /search) ও Telegram Mini App অটোমেটিক চালু হয়ে যাবে।
+            </p>
+
+            <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 text-xs text-slate-700 space-y-1">
+              <div>
+                Webhook URL:{' '}
+                <span className="font-mono text-slate-900 break-all">
+                  {tgStatus?.webhookUrl || `${window.location.origin}/api/telegram/webhook`}
+                </span>
+              </div>
+              <div>
+                Tracked Chats: <span className="font-semibold">{tgStatus?.trackedChatsCount ?? 0}</span> ·
+                Image Gen: <span className="font-semibold text-emerald-700">Ready</span>
+              </div>
+              {tgStatus?.lastWebhookError && (
+                <div className="text-amber-700">Last Notice: {tgStatus.lastWebhookError}</div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => void handleSetupTelegramWebhook()}
+              disabled={tgBusy || !tgStatus?.configured}
+              className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Send className="w-3.5 h-3.5" />
+              {tgBusy ? 'Activating Webhook...' : 'Activate Telegram Webhook & Mini App'}
+            </button>
+
+            {tgErr && <div className="text-xs text-red-600">{tgErr}</div>}
+            {tgMsg && <div className="text-xs text-emerald-700">{tgMsg}</div>}
           </div>
 
           {/* Termux One-by-One Env Setup Wizard Guide */}

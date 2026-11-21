@@ -779,10 +779,13 @@ export async function runZeroTokenSelfChatCopilot(
     }
   }
 
-  // 5b. Explicit Autonomous Agent Trigger ("এজেন্ট ...", "অটোনোমাস ...", "agent ...")
-  const explicitAgentTrigger = /^(?:এজেন্ট|অটোনোমাস|agent|autonomous|নিজে থেকেই|মিশন|mission)(?:\s|$|[:\-—])/iu.test(lower);
+  // 5b. Explicit Autonomous Agent Trigger ("এজেন্ট ...", "এজেন্ট, ...", "অটোনোমাসভাবে ...", "agent ...")
+  const explicitAgentTrigger = /^(?:অটো\s*এজেন্ট|এজেন্ট(?:\s*দিয়ে)?|অটোনোমাস(?:ভাবে|\s*মোডে?)?|agent|autonomous(?:ly)?|নিজে\s*থেকেই?|মিশন|mission)(?:\s|$|[:\-—,])+/iu.test(lower);
   if (explicitAgentTrigger && ctx.runAutonomousMission) {
-    const cleanedGoal = rawText.replace(/^(?:এজেন্ট|অটোনোমাস|agent|autonomous|নিজে থেকেই|মিশন|mission)\s*[:\-—]?\s*/iu, '').trim() || rawText;
+    const cleanedGoal =
+      rawText
+        .replace(/^(?:অটো\s*এজেন্ট|এজেন্ট(?:\s*দিয়ে)?|অটোনোমাস(?:ভাবে|\s*মোডে?)?|agent|autonomous(?:ly)?|নিজে\s*থেকেই?|মিশন|mission)\s*[:\-—,]?\s*/iu, '')
+        .trim() || rawText;
     const agentRes = await ctx.runAutonomousMission(cleanedGoal);
     return {
       replyText: `${agentRes.finalReport}\n\n_(${agentRes.providerUsed.toUpperCase()} · ${agentRes.stepsCount} ধাপ · ${agentRes.tokensUsed} টোকেন)_`,
@@ -1572,9 +1575,9 @@ export async function runZeroTokenSelfChatCopilot(
 
   // 15. Autonomous Multi-Step Action Agent ("Hands & Feet") — implicit multi-step hint catch-all
   const multiStepActionHint =
-    (/(খুঁজে|রিসার্চ|সার্চ|স্ক্যান|পড়ে|ভেরিফাই|চেক করে)/iu.test(lower) &&
-      /(পাঠাও|পাঠিয়ে দাও|মেইল করো|মেসেজ দাও|রিপোর্ট দাও|শিডিউল|জানাও)/iu.test(lower)) ||
-    /(?:প্রতিদিন|প্রতি ঘন্টা|প্রতি ঘণ্টা|শিডিউল|schedule|follow[\s\-]*up|ফলোআপ)/iu.test(lower);
+    (/(খুঁজে|রিসার্চ|সার্চ|স্ক্যান|পড়ে|ভেরিফাই|চেক করে|কালেক্ট|বের করে)/iu.test(lower) &&
+      /(পাঠাও|পাঠিয়ে দাও|মেইল করো|মেসেজ দাও|রিপোর্ট দাও|শিডিউল|জানাও|সেভ করো|বের করো|দাও)/iu.test(lower)) ||
+    /(?:প্রতিদিন|প্রতি ঘন্টা|প্রতি ঘণ্টা|শিডিউল|schedule|follow[\s\-]*up|ফলোআপ|অটো\s*মোডে|অটোনোমাস)/iu.test(lower);
 
   if (ctx.runAutonomousMission && multiStepActionHint) {
     const cleanedGoal = rawText.trim();

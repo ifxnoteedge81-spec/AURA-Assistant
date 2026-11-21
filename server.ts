@@ -140,6 +140,11 @@ import {
   verifyPreAuthToken,
 } from './server/authSecurity.ts';
 import { ClientBotManager, type ClientBotPatchInput } from './server/clientBotManager.ts';
+import {
+  TelegramBotController,
+  getTelegramBotToken,
+  registerTelegramRoutes,
+} from './server/telegramBot.ts';
 
 const PORT = Number(process.env.PORT || (process.env.SPACE_ID || process.env.SPACE_HOST ? 7860 : 3000));
 const PREFIX = '.';
@@ -3068,12 +3073,14 @@ async function handleLiveMessage(sock: WASocket, msg: WAMessage) {
   const selfBotLidDigits = extractDigits((sock.user as { lid?: string } | undefined)?.lid);
   const selfPairingDigits = extractDigits(currentPairingPhone);
   const selfRemoteDigits = extractDigits(remoteJid);
+  const selfRemoteAltDigits = extractDigits((msg.key as { remoteJidAlt?: string }).remoteJidAlt);
+  const matchesSelfDigits = (candidate: string) =>
+    Boolean(candidate) &&
+    ((Boolean(selfBotDigits) && candidate === selfBotDigits) ||
+      (Boolean(selfBotLidDigits) && candidate === selfBotLidDigits) ||
+      (Boolean(selfPairingDigits) && candidate === selfPairingDigits));
   const isSelfChatTarget =
-    !isGroup &&
-    Boolean(selfRemoteDigits) &&
-    ((Boolean(selfBotDigits) && selfRemoteDigits === selfBotDigits) ||
-      (Boolean(selfBotLidDigits) && selfRemoteDigits === selfBotLidDigits) ||
-      (Boolean(selfPairingDigits) && selfRemoteDigits === selfPairingDigits));
+    !isGroup && (matchesSelfDigits(selfRemoteDigits) || matchesSelfDigits(selfRemoteAltDigits));
 
   // Self-Chat ("Message Yourself") direct Owner Copilot + Zero-Token Video Diagnostics
   if (isSelfChatTarget && msg.key.fromMe) {
@@ -4847,7 +4854,11 @@ async function bootstrap() {
 
   // Protect ALL other /api/* routes behind authenticated owner session token
   app.use('/api', (req, res, next) => {
-    if (req.path.startsWith('/auth/') || req.path.startsWith('/client-portal/')) {
+    if (
+      req.path.startsWith('/auth/') ||
+      req.path.startsWith('/client-portal/') ||
+      req.path === '/telegram/webhook'
+    ) {
       next();
       return;
     }
@@ -5041,6 +5052,17 @@ async function bootstrap() {
 
   registerAutonomousAgentRoutes(app, autonomousAgentEngine, () => selfHealingWatchdog);
 
+  const telegramBotController = new TelegramBotController({
+    geminiPool,
+    openRouterReader,
+    tokenTelemetry,
+    outreach: outreachController,
+    getAutonomousAgent: () => autonomousAgentEngine,
+    getOwnerName: () => botConfig.ownerName || 'Sir',
+    pushLog,
+  });
+  registerTelegramRoutes(app, telegramBotController, requireOwnerAuth);
+
   // Owner Multi-Number Client Bot Management Endpoints (Unlimited Zero-AI Client Slots)
   app.get('/api/client-bots', (_req, res) => {
     res.json({
@@ -5207,6 +5229,7 @@ async function bootstrap() {
         isTermux: Boolean(
           process.env.TERMUX_VERSION || (process.env.PREFIX || '').includes('com.termux')
         ),
+        isVercel: Boolean(process.env.VERCEL),
         nodeVersion: process.version,
         port: PORT,
         nodeEnv: process.env.NODE_ENV || 'development',
@@ -5214,11 +5237,18 @@ async function bootstrap() {
         uptimeSec: Math.round(process.uptime()),
         selfPingEnabled: process.env.ENABLE_SELF_PING !== 'false',
         ownerEmail: OWNER_EMAIL,
+        telegramBotConfigured: Boolean(getTelegramBotToken()),
       },
       geminiKeysCount: geminiStats.configuredKeysCount,
       openRouterKeysCount: openRouterStats.configuredKeysCount,
       firestore: getFirestoreAdminDiagnostics(),
       envItems: [
+        {
+          key: 'TELEGRAM_BOT_TOKEN',
+          category: 'Telegram 24/7',
+          configured: Boolean(getTelegramBotToken()),
+          detail: Boolean(getTelegramBotToken()) ? 'Bot token active' : 'Optional (@BotFather token)',
+        },
         {
           key: 'GEMINI_API_KEY_1..5',
           category: 'AI Brain',
@@ -5276,6 +5306,12 @@ async function bootstrap() {
           category: 'Email API',
           configured: isSet('BREVO_API_KEY'),
           detail: isSet('BREVO_API_KEY') ? 'Configured' : 'Optional',
+        },
+        {
+          key: 'HF_TOKEN',
+          category: 'Image Gen',
+          configured: isSet('HF_TOKEN'),
+          detail: isSet('HF_TOKEN') ? 'FLUX.1-schnell active' : 'Optional (Pollinations fallback active)',
         },
         {
           key: 'ENABLE_SELF_PING',

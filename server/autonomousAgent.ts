@@ -106,8 +106,9 @@ export interface AutonomousAgentAdapters {
   ) => void;
 }
 
-const RUNS_FILE = path.resolve('./bot-agent-runs.json');
-const SCHEDULES_FILE = path.resolve('./bot-agent-schedules.json');
+const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const RUNS_FILE = path.resolve(RUNTIME_DIR, 'bot-agent-runs.json');
+const SCHEDULES_FILE = path.resolve(RUNTIME_DIR, 'bot-agent-schedules.json');
 const MAX_RUNS = 30;
 const MAX_SCHEDULES = 20;
 const MAX_AGENT_STEPS = 8;
@@ -880,104 +881,208 @@ export class AutonomousAgentEngine {
     ].join('\n');
 
     try {
-      // Strategy A: 5-Key Gemini Pool Native Function Calling
+      // Strategy A: 5-Key Gemini Pool Native Function Calling (gemini-4-hydrogen -> gemini-3.1-flash-lite)
+      let strategyAFailureReason = '';
       if (this.adapters.geminiPool.hasKeys()) {
-        try {
-          const contents: Content[] = [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: `Owner Mission Goal:\n${cleanGoal}\n\nCurrent Bot Status: ${this.adapters.getBotStatus()}, RAM: ${this.adapters.getMemoryRssMb()}MB, Active Mobile Workers: ${this.adapters.offloadQueue.getActiveWorkers().length}`,
+        const geminiModels: Array<{ model: string; channel: string; useLowThinking: boolean }> = [
+          { model: 'gemini-4-hydrogen', channel: 'primary', useLowThinking: true },
+          { model: 'gemini-3.1-flash-lite', channel: 'lite', useLowThinking: false },
+        ];
+
+        for (const modelSpec of geminiModels) {
+          try {
+            const contents: Content[] = [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text: `Owner Mission Goal:\n${cleanGoal}\n\nCurrent Bot Status: ${this.adapters.getBotStatus()}, RAM: ${this.adapters.getMemoryRssMb()}MB, Active Mobile Workers: ${this.adapters.offloadQueue.getActiveWorkers().length}`,
+                  },
+                ],
+              },
+            ];
+
+            for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
+              if (Date.now() > deadline) {
+                run.finalReport = '⏱️ মিশনের সময়সীমা (55s) শেষ হয়েছে—এখন পর্যন্ত সম্পন্ন ধাপগুলোর রিপোর্ট উপরে সংরক্ষিত আছে।';
+                break;
+              }
+
+              const execResult = await this.adapters.geminiPool.executeWithRotation(
+                async (client) => {
+                  return client.models.generateContent({
+                    model: modelSpec.model,
+                    contents,
+                    config: {
+                      systemInstruction: systemPrompt,
+                      ...(modelSpec.useLowThinking
+                        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                        : {}),
+                      tools: [{ functionDeclarations: AGENT_FUNCTION_DECLARATIONS }],
+                    },
+                  });
                 },
-              ],
-            },
-          ];
+                undefined,
+                { maxTotalMs: 20_000, channel: modelSpec.channel }
+              );
 
-          for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
-            if (Date.now() > deadline) {
-              run.finalReport = '⏱️ মিশনের সময়সীমা (55s) শেষ হয়েছে—এখন পর্যন্ত সম্পন্ন ধাপগুলোর রিপোর্ট উপরে সংরক্ষিত আছে।';
-              break;
-            }
+              const response = execResult.value;
+              const usageTotal = Number(response.usageMetadata?.totalTokenCount || 0);
+              const usagePrompt = Number(response.usageMetadata?.promptTokenCount || 0);
+              const usageCompletion = Number(response.usageMetadata?.candidatesTokenCount || 0);
+              run.tokensUsed += usageTotal;
+              run.providerUsed = 'gemini';
+              run.modelUsed = modelSpec.model;
 
-            const execResult = await this.adapters.geminiPool.executeWithRotation(
-              async (client) => {
-                return client.models.generateContent({
-                  model: 'gemini-4-hydrogen',
-                  contents,
-                  config: {
-                    systemInstruction: systemPrompt,
-                    thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
-                    tools: [{ functionDeclarations: AGENT_FUNCTION_DECLARATIONS }],
+              if (usageTotal > 0) {
+                this.adapters.tokenTelemetry.recordUsage({
+                  provider: 'gemini',
+                  model: modelSpec.model,
+                  category: 'command',
+                  promptTokens: usagePrompt,
+                  completionTokens: usageCompletion,
+                  totalTokens: usageTotal,
+                  keySlot: execResult.keySlot,
+                });
+              }
+
+              const candidateContent = response.candidates?.[0]?.content;
+              if (candidateContent) {
+                contents.push(candidateContent);
+              }
+
+              const calls = response.functionCalls || [];
+              if (calls.length === 0) {
+                run.finalReport = (response.text || '').trim() || '✅ মিশন সম্পন্ন হয়েছে।';
+                run.status = 'completed';
+                run.completedAt = new Date().toISOString();
+                this.saveRuns();
+                return run;
+              }
+
+              const responseParts = [];
+              for (const call of calls) {
+                const argsObj = (call.args || {}) as Record<string, unknown>;
+                const toolRes = await this.executeToolCall(call.name || '', argsObj);
+                run.steps.push({
+                  stepNumber: run.steps.length + 1,
+                  toolName: call.name || 'unknown',
+                  argsPreview: JSON.stringify(argsObj).slice(0, 160),
+                  outcome: toolRes.ok ? 'ok' : 'error',
+                  resultSummary: toolRes.summary,
+                  timestamp: new Date().toISOString(),
+                });
+                responseParts.push({
+                  functionResponse: {
+                    id: call.id,
+                    name: call.name || '',
+                    response: toolRes.data,
                   },
                 });
-              },
-              undefined,
-              { maxTotalMs: 14_000, channel: 'primary' }
+              }
+              contents.push({ role: 'user', parts: responseParts });
+              this.saveRuns();
+            }
+
+            if (!run.finalReport) {
+              run.finalReport =
+                run.steps.length > 0
+                  ? `✅ *অটোনোমাস এজেন্ট ${run.steps.length}টি ধাপ সম্পন্ন করেছে:*\n` +
+                    run.steps.map((s) => `${s.stepNumber}. [${s.toolName}] ${s.resultSummary}`).join('\n')
+                  : '✅ মিশন সম্পন্ন হয়েছে।';
+            }
+            run.status = 'completed';
+            run.completedAt = new Date().toISOString();
+            this.saveRuns();
+            return run;
+          } catch (geminiErr) {
+            strategyAFailureReason = (geminiErr as Error).message.slice(0, 140);
+            this.adapters.pushLog(
+              'gemini',
+              'Autonomous Agent',
+              `[${modelSpec.model}] failed -> falling back: ${strategyAFailureReason}`,
+              'info'
             );
+          }
+        }
+      }
 
-            const response = execResult.value;
-            const usageTotal = Number(response.usageMetadata?.totalTokenCount || 0);
-            const usagePrompt = Number(response.usageMetadata?.promptTokenCount || 0);
-            const usageCompletion = Number(response.usageMetadata?.candidatesTokenCount || 0);
-            run.tokensUsed += usageTotal;
-            run.providerUsed = 'gemini';
-            run.modelUsed = 'gemini-4-hydrogen';
+      // Strategy B: OpenRouter Dynamic Free Pool ReAct Loop
+      let strategyBFailureReason = '';
+      if (this.adapters.openRouterReader.hasKeys()) {
+        try {
+          const toolCatalog = AGENT_FUNCTION_DECLARATIONS.map(
+            (f) => `- ${f.name}: ${f.description} | args=${JSON.stringify((f.parameters as { properties?: unknown })?.properties || {})}`
+          ).join('\n');
+          const reactSystem = [
+            systemPrompt,
+            '',
+            'Available Tools:',
+            toolCatalog,
+            '',
+            'Respond ONLY with strict JSON:',
+            'To invoke a tool: {"thought":"short plan","tool":"tool_name","args":{...}}',
+            'To finish and reply to owner: {"thought":"done","finalAnswer":"Complete Bangla report"}',
+          ].join('\n');
 
-            if (usageTotal > 0) {
-              this.adapters.tokenTelemetry.recordUsage({
-                provider: 'gemini',
-                model: 'gemini-4-hydrogen',
-                category: 'command',
-                promptTokens: usagePrompt,
-                completionTokens: usageCompletion,
-                totalTokens: usageTotal,
-                keySlot: execResult.keySlot,
-              });
-            }
+          const history: string[] = [`Owner Goal: ${cleanGoal}`];
+          for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
+            if (Date.now() > deadline) break;
+            const planRes = await this.adapters.openRouterReader.generateAgentStepPlan({
+              systemPrompt: reactSystem,
+              transcript: history.join('\n\n'),
+            });
+            run.providerUsed = 'openrouter';
+            run.modelUsed = planRes.modelUsed;
+            run.tokensUsed += planRes.usage?.totalTokens || 0;
 
-            const candidateContent = response.candidates?.[0]?.content;
-            if (candidateContent) {
-              contents.push(candidateContent);
-            }
-
-            const calls = response.functionCalls || [];
-            if (calls.length === 0) {
-              run.finalReport = (response.text || '').trim() || '✅ মিশন সম্পন্ন হয়েছে।';
+            const cleanedJson = planRes.content.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+            let parsed: { thought?: string; tool?: string; args?: Record<string, unknown>; finalAnswer?: string } = {};
+            try {
+              const firstBrace = cleanedJson.indexOf('{');
+              const lastBrace = cleanedJson.lastIndexOf('}');
+              parsed = JSON.parse(
+                firstBrace >= 0 && lastBrace > firstBrace ? cleanedJson.slice(firstBrace, lastBrace + 1) : cleanedJson
+              );
+            } catch {
+              run.finalReport = planRes.content;
               run.status = 'completed';
               run.completedAt = new Date().toISOString();
               this.saveRuns();
               return run;
             }
 
-            const responseParts = [];
-            for (const call of calls) {
-              const argsObj = (call.args || {}) as Record<string, unknown>;
-              const toolRes = await this.executeToolCall(call.name || '', argsObj);
+            if (parsed.finalAnswer) {
+              run.finalReport = parsed.finalAnswer;
+              run.status = 'completed';
+              run.completedAt = new Date().toISOString();
+              this.saveRuns();
+              return run;
+            }
+
+            if (parsed.tool) {
+              const toolRes = await this.executeToolCall(parsed.tool, parsed.args || {});
               run.steps.push({
                 stepNumber: run.steps.length + 1,
-                toolName: call.name || 'unknown',
-                argsPreview: JSON.stringify(argsObj).slice(0, 160),
+                toolName: parsed.tool,
+                argsPreview: JSON.stringify(parsed.args || {}).slice(0, 160),
                 outcome: toolRes.ok ? 'ok' : 'error',
                 resultSummary: toolRes.summary,
                 timestamp: new Date().toISOString(),
               });
-              responseParts.push({
-                functionResponse: {
-                  id: call.id,
-                  name: call.name || '',
-                  response: toolRes.data,
-                },
-              });
+              history.push(
+                `Step ${step} Executed ${parsed.tool}: outcome=${toolRes.ok ? 'ok' : 'error'} | summary=${toolRes.summary} | data=${JSON.stringify(toolRes.data).slice(0, 1500)}`
+              );
+              this.saveRuns();
+            } else {
+              break;
             }
-            contents.push({ role: 'user', parts: responseParts });
-            this.saveRuns();
           }
 
           if (!run.finalReport) {
             run.finalReport =
               run.steps.length > 0
-                ? `✅ *অটোনোমাস এজেন্ট ${run.steps.length}টি ধাপ সম্পন্ন করেছে:*\n` +
+                ? `✅ *OpenRouter এজেন্ট (${run.modelUsed}) ${run.steps.length}টি ধাপ সম্পন্ন করেছে:*\n` +
                   run.steps.map((s) => `${s.stepNumber}. [${s.toolName}] ${s.resultSummary}`).join('\n')
                 : '✅ মিশন সম্পন্ন হয়েছে।';
           }
@@ -985,97 +1090,25 @@ export class AutonomousAgentEngine {
           run.completedAt = new Date().toISOString();
           this.saveRuns();
           return run;
-        } catch (geminiErr) {
+        } catch (openRouterErr) {
+          strategyBFailureReason = (openRouterErr as Error).message.slice(0, 140);
           this.adapters.pushLog(
-            'gemini',
+            'system',
             'Autonomous Agent',
-            `Gemini pool rotated to OpenRouter fallback: ${(geminiErr as Error).message.slice(0, 120)}`,
-            'info'
+            `OpenRouter ReAct failed -> degrading to deterministic report: ${strategyBFailureReason}`,
+            'error'
           );
-        }
-      }
-
-      // Strategy B: OpenRouter Dynamic Free Pool ReAct Loop
-      if (this.adapters.openRouterReader.hasKeys()) {
-        const toolCatalog = AGENT_FUNCTION_DECLARATIONS.map(
-          (f) => `- ${f.name}: ${f.description} | args=${JSON.stringify((f.parameters as { properties?: unknown })?.properties || {})}`
-        ).join('\n');
-        const reactSystem = [
-          systemPrompt,
-          '',
-          'Available Tools:',
-          toolCatalog,
-          '',
-          'Respond ONLY with strict JSON:',
-          'To invoke a tool: {"thought":"short plan","tool":"tool_name","args":{...}}',
-          'To finish and reply to owner: {"thought":"done","finalAnswer":"Complete Bangla report"}',
-        ].join('\n');
-
-        const history: string[] = [`Owner Goal: ${cleanGoal}`];
-        for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
-          if (Date.now() > deadline) break;
-          const planRes = await this.adapters.openRouterReader.generateAgentStepPlan({
-            systemPrompt: reactSystem,
-            transcript: history.join('\n\n'),
-          });
-          run.providerUsed = 'openrouter';
-          run.modelUsed = planRes.modelUsed;
-          run.tokensUsed += planRes.usage?.totalTokens || 0;
-
-          const cleanedJson = planRes.content.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
-          let parsed: { thought?: string; tool?: string; args?: Record<string, unknown>; finalAnswer?: string } = {};
-          try {
-            const firstBrace = cleanedJson.indexOf('{');
-            const lastBrace = cleanedJson.lastIndexOf('}');
-            parsed = JSON.parse(
-              firstBrace >= 0 && lastBrace > firstBrace ? cleanedJson.slice(firstBrace, lastBrace + 1) : cleanedJson
-            );
-          } catch {
-            run.finalReport = planRes.content;
+          if (run.steps.length > 0) {
+            run.finalReport =
+              `⚠️ *আংশিক সম্পন্ন (${run.steps.length}টি ধাপ):*\n` +
+              run.steps.map((s) => `${s.stepNumber}. [${s.toolName}] ${s.resultSummary}`).join('\n') +
+              `\n\nকারণ: ${strategyBFailureReason}`;
             run.status = 'completed';
             run.completedAt = new Date().toISOString();
             this.saveRuns();
             return run;
           }
-
-          if (parsed.finalAnswer) {
-            run.finalReport = parsed.finalAnswer;
-            run.status = 'completed';
-            run.completedAt = new Date().toISOString();
-            this.saveRuns();
-            return run;
-          }
-
-          if (parsed.tool) {
-            const toolRes = await this.executeToolCall(parsed.tool, parsed.args || {});
-            run.steps.push({
-              stepNumber: run.steps.length + 1,
-              toolName: parsed.tool,
-              argsPreview: JSON.stringify(parsed.args || {}).slice(0, 160),
-              outcome: toolRes.ok ? 'ok' : 'error',
-              resultSummary: toolRes.summary,
-              timestamp: new Date().toISOString(),
-            });
-            history.push(
-              `Step ${step} Executed ${parsed.tool}: outcome=${toolRes.ok ? 'ok' : 'error'} | summary=${toolRes.summary} | data=${JSON.stringify(toolRes.data).slice(0, 1500)}`
-            );
-            this.saveRuns();
-          } else {
-            break;
-          }
         }
-
-        if (!run.finalReport) {
-          run.finalReport =
-            run.steps.length > 0
-              ? `✅ *OpenRouter এজেন্ট (${run.modelUsed}) ${run.steps.length}টি ধাপ সম্পন্ন করেছে:*\n` +
-                run.steps.map((s) => `${s.stepNumber}. [${s.toolName}] ${s.resultSummary}`).join('\n')
-              : '✅ মিশন সম্পন্ন হয়েছে।';
-        }
-        run.status = 'completed';
-        run.completedAt = new Date().toISOString();
-        this.saveRuns();
-        return run;
       }
 
       // Strategy C: Zero-Token Deterministic Fallback Report
@@ -1090,9 +1123,11 @@ export class AutonomousAgentEngine {
         resultSummary: diagRes.summary,
         timestamp: new Date().toISOString(),
       });
-      run.finalReport =
-        '⚠️ এই মুহূর্তে কোনো Gemini বা OpenRouter API কী অ্যাক্টিভ পাওয়া যায়নি—তাই অটোনোমাস AI ব্রেইন এর বদলে ০-টোকেন সিস্টেম রিপোর্ট দেওয়া হলো।\n' +
-        `স্ট্যাটাস: ${diagRes.summary}`;
+      const reasonHint = strategyAFailureReason || strategyBFailureReason;
+      run.finalReport = reasonHint
+        ? `⚠️ Gemini/OpenRouter ব্রেইন এই মুহূর্তে রেসপন্স দেয়নি (${reasonHint})—তাই ০-টোকেন ডায়াগনস্টিক রিপোর্ট দেওয়া হলো।\nস্ট্যাটাস: ${diagRes.summary}`
+        : '⚠️ এই মুহূর্তে কোনো Gemini বা OpenRouter API কী অ্যাক্টিভ পাওয়া যায়নি—তাই অটোনোমাস AI ব্রেইন এর বদলে ০-টোকেন সিস্টেম রিপোর্ট দেওয়া হলো।\n' +
+          `স্ট্যাটাস: ${diagRes.summary}`;
       run.status = 'completed';
       run.completedAt = new Date().toISOString();
       this.saveRuns();

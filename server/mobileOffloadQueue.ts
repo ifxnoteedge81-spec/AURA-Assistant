@@ -27,7 +27,8 @@ export interface MobileOffloadJob {
   completedAt?: string;
 }
 
-const OFFLOAD_FILE = path.resolve('./bot-offload-queue.json');
+const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const OFFLOAD_FILE = path.resolve(RUNTIME_DIR, 'bot-offload-queue.json');
 const MAX_STORED_JOBS = 30;
 const WORKER_ACTIVE_TTL_MS = 45_000;
 

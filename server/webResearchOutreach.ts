@@ -200,8 +200,9 @@ export interface WebOutreachHostAdapters {
   }) => void;
 }
 
-const OUTREACH_FILE = path.resolve('./bot-outreach.json');
-const OUTREACH_SENDERS_FILE = path.resolve('./bot-outreach-senders.json');
+const RUNTIME_DIR = process.env.VERCEL ? '/tmp' : '.';
+const OUTREACH_FILE = path.resolve(RUNTIME_DIR, 'bot-outreach.json');
+const OUTREACH_SENDERS_FILE = path.resolve(RUNTIME_DIR, 'bot-outreach-senders.json');
 const MAX_LEADS = 300;
 const MAX_RESEARCH_HISTORY = 40;
 const MAX_DISPATCH_LOGS = 150;

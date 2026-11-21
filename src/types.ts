@@ -631,10 +631,24 @@ export interface MobileOffloadStatusSnapshot {
   }>;
 }
 
+export interface TelegramBotStatusSnapshot {
+  configured: boolean;
+  botUsername: string | null;
+  botName: string | null;
+  ownerIdsCount: number;
+  webhookUrl: string | null;
+  pendingUpdates: number;
+  lastWebhookError: string | null;
+  lastSetupAt: string | null;
+  trackedChatsCount: number;
+  imageGenerationReady: boolean;
+}
+
 export interface SystemEnvStatusResponse {
   runtime: {
     platform: string;
     isTermux: boolean;
+    isVercel?: boolean;
     nodeVersion: string;
     port: number;
     nodeEnv: string;
@@ -642,6 +656,7 @@ export interface SystemEnvStatusResponse {
     uptimeSec: number;
     selfPingEnabled: boolean;
     ownerEmail: string;
+    telegramBotConfigured?: boolean;
   };
   geminiKeysCount: number;
   openRouterKeysCount: number;
