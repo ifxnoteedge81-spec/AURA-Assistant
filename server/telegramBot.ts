@@ -8,6 +8,7 @@ import type { OpenRouterReader } from './openRouterReader.ts';
 import type { TokenTelemetryTracker } from './tokenTelemetry.ts';
 import type { WebOutreachController } from './webResearchOutreach.ts';
 import type { AutonomousAgentEngine } from './autonomousAgent.ts';
+import type { ChromeBrowserAgent } from './chromeBrowserAgent.ts';
 import type { AssistantConfigFields } from './assistantEngine.ts';
 import {
   buildPatchFromInput,
@@ -41,6 +42,7 @@ export interface TelegramBotAdapters {
   tokenTelemetry: TokenTelemetryTracker;
   outreach: WebOutreachController;
   getAutonomousAgent: () => AutonomousAgentEngine | null;
+  getChromeAgent?: () => ChromeBrowserAgent | null;
   getOwnerName: () => string;
   getBotConfig?: () => AssistantConfigFields & Record<string, unknown>;
   updateBotConfig?: (patch: Partial<AssistantConfigFields> & Record<string, unknown>) => Promise<void>;
@@ -241,6 +243,20 @@ const TELEGRAM_CONTROL_TOOLS: FunctionDeclaration[] = [
       required: ['goal'],
     },
   },
+  {
+    name: 'chrome_browser_task',
+    description:
+      'Use Google Chrome Hands & Feet to open a website, sign up / create an account, log into an account, fill forms, or resume a waiting OTP/CAPTCHA task.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        goal: { type: Type.STRING, description: 'Browser automation goal in Bangla or English.' },
+        startUrl: { type: Type.STRING, description: 'Optional https URL to open in Chrome.' },
+        humanReply: { type: Type.STRING, description: 'Optional OTP code or confirmation for paused Chrome task.' },
+      },
+      required: ['goal'],
+    },
+  },
 ];
 
 export class TelegramBotController {
@@ -326,7 +342,7 @@ export class TelegramBotController {
     return data;
   }
 
-  private async sendMessage(
+  public async sendMessage(
     chatId: number | string,
     text: string,
     options?: { replyToMessageId?: number; replyMarkup?: Record<string, unknown> }
@@ -496,7 +512,7 @@ export class TelegramBotController {
     };
   }
 
-  private async sendPhotoBuffer(
+  public async sendPhotoBuffer(
     chatId: number | string,
     buffer: Buffer,
     caption: string,
@@ -673,6 +689,29 @@ export class TelegramBotController {
         ok: run.status === 'completed',
         report: run.finalReport,
         stepsCount: run.steps.length,
+      };
+    }
+
+    if (toolName === 'chrome_browser_task') {
+      const chrome = this.adapters.getChromeAgent?.();
+      if (!chrome) {
+        return { ok: false, error: 'Chrome Hands & Feet engine is not initialized.' };
+      }
+      const waiting = chrome.getWaitingTask();
+      const task = await chrome.executeBrowserTask({
+        goal: String(args.goal || ''),
+        startUrl: typeof args.startUrl === 'string' && args.startUrl.trim() ? args.startUrl.trim() : undefined,
+        source: 'telegram',
+        resumeTaskId: waiting && args.humanReply ? waiting.id : undefined,
+        humanReply: typeof args.humanReply === 'string' && args.humanReply.trim() ? args.humanReply.trim() : undefined,
+        maxWallClockMs: isNetlifyRuntime() ? 18_000 : 60_000,
+      });
+      return {
+        ok: task.status === 'completed' || task.status === 'waiting_human_input',
+        status: task.status,
+        currentUrl: task.currentUrl,
+        summary: task.finalSummary,
+        stepsCount: task.steps.length,
       };
     }
 
@@ -941,6 +980,7 @@ export class TelegramBotController {
         '• *"কি অফ করলে আরও দ্রুত উত্তর দেবে?"* — স্পিড পরামর্শ (সেকেন্ড হিসাবসহ)',
         '• *"অটোরিপ্লাই অন করো / হিউম্যান টাইপিং অফ করো"* — যেকোনো সেটিং পরিবর্তন',
         '• `/agent <কাজ>` — গভীর ওয়েব রিসার্চ, লিড সংগ্রহ ও ইমেইল মিশন',
+        '• `/chrome <কাজ>` — Chrome হাত-পা দিয়ে যেকোনো একাউন্ট খোলা, লগইন ও ফর্ম পূরণ',
         '• `/imagine <প্রম্পট>` — AI দিয়ে ছবি তৈরি',
         '• `/search <টপিক>` — লাইভ ওয়েব সার্চ',
         '• `/status` — সব ON/OFF কন্ট্রোল ও স্পিড রিপোর্ট',
@@ -1061,6 +1101,63 @@ export class TelegramBotController {
       return { handled: true, action: 'search' };
     }
 
+    // Auto-resume paused Chrome OTP/CAPTCHA waiting task when Owner replies directly in Telegram
+    const chromeAgent = this.adapters.getChromeAgent?.();
+    const waitingChromeTask = isOwner && chromeAgent ? chromeAgent.getWaitingTask() : null;
+    if (
+      waitingChromeTask &&
+      !cleanedText.startsWith('/') &&
+      (cleanedText.length <= 40 || /^\d{4,8}$/.test(cleanedText) || /(?:otp|code|হয়েছে|done|continue|resume|কোড)/i.test(cleanedText))
+    ) {
+      await this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
+      const resumed = await chromeAgent!.executeBrowserTask({
+        goal: waitingChromeTask.goal,
+        source: 'telegram',
+        resumeTaskId: waitingChromeTask.id,
+        humanReply: cleanedText,
+        maxWallClockMs: options?.backgroundMode ? 180_000 : isNetlifyRuntime() ? 22_000 : 90_000,
+      });
+      await this.sendMessage(
+        msg.chat.id,
+        `🖐️ *Chrome Hands & Feet (${resumed.status}):*\n${resumed.finalSummary}\n\n🔗 ${resumed.currentUrl || 'N/A'}\n_(${resumed.steps.length} ধাপ সম্পন্ন)_`,
+        { replyToMessageId: msg.message_id }
+      );
+      return { handled: true, action: 'chrome_resumed' };
+    }
+
+    // /chrome <goal> or direct Chrome account/login command
+    const chromeMatch = cleanedText.match(
+      /^(?:\/(?:chrome|browser)|ক্রোমে\s*গিয়ে|ক্রমে\s*গিয়ে|chrome\s*হাত\s*পা)\s*[:\-—,]?\s*(.+)$/iu
+    );
+    if (chromeMatch?.[1]) {
+      if (!isOwner) {
+        await this.sendMessage(msg.chat.id, '⛔ Chrome অটোমেশন শুধু অনুমোদিত ওনার চালাতে পারবেন।', {
+          replyToMessageId: msg.message_id,
+        });
+        return { handled: true, action: 'chrome_denied' };
+      }
+      if (!chromeAgent) {
+        await this.sendMessage(msg.chat.id, '⚠️ Chrome Hands & Feet ইঞ্জিন প্রস্তুত নয়।', {
+          replyToMessageId: msg.message_id,
+        });
+        return { handled: true, action: 'chrome_unavailable' };
+      }
+      await this.callTelegramApi('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
+      const urlInPrompt = chromeMatch[1].match(/https?:\/\/[^\s]+/i)?.[0];
+      const task = await chromeAgent.executeBrowserTask({
+        goal: chromeMatch[1].trim(),
+        startUrl: urlInPrompt,
+        source: 'telegram',
+        maxWallClockMs: options?.backgroundMode ? 240_000 : isNetlifyRuntime() ? 20_000 : 110_000,
+      });
+      await this.sendMessage(
+        msg.chat.id,
+        `🌐 *Chrome Hands & Feet (${task.backendUsed}):*\n${task.finalSummary}\n\n🔗 ${task.currentUrl || 'N/A'}\n_(${task.steps.length} ধাপ)_`,
+        { replyToMessageId: msg.message_id }
+      );
+      return { handled: true, action: 'chrome_run' };
+    }
+
     // /agent <goal> or Bengali agent command
     const agentMatch = cleanedText.match(
       /^(?:\/agent|এজেন্ট(?:\s*দিয়ে)?|অটোনোমাস(?:ভাবে)?|agent|mission)\s*[:\-—,]?\s*(.+)$/iu
@@ -1161,11 +1258,11 @@ export function registerTelegramRoutes(
     // to Netlify's 15-minute background worker! All instant chats, status/advice, and control toggles
     // execute INLINE in ~1-5 seconds instead of waiting 10-15 minutes in a background queue.
     const isHeavyTask =
-      /^\/(?:agent|imagine|search)(?:\s|$|@)/i.test(rawMsgText) ||
-      /^(?:এজেন্ট|অটোনোমাস|ছবি\s*বানাও|ছবি\s*আঁকো|খুঁজো|সার্চ|draw|generate\s+image|research|find\s+leads)\b/i.test(
+      /^\/(?:agent|imagine|search|chrome|browser)(?:\s|$|@)/i.test(rawMsgText) ||
+      /^(?:এজেন্ট|অটোনোমাস|ছবি\s*বানাও|ছবি\s*আঁকো|খুঁজো|সার্চ|ক্রোমে|ক্রমে|draw|generate\s+image|research|find\s+leads)\b/i.test(
         rawMsgText
       ) ||
-      /(?:ওয়েব\s*সার্চ|ওয়েব\s*রিসার্চ|লিড\s*খুঁজ|স্ক্র্যাপ|scrape|find\s+leads|web\s*research)/i.test(
+      /(?:ওয়েব\s*সার্চ|ওয়েব\s*রিসার্চ|লিড\s*খুঁজ|স্ক্র্যাপ|scrape|find\s+leads|web\s*research|একাউন্ট\s*(?:খোল|খুলে|তৈরি)|অ্যাকাউন্ট\s*(?:খোল|খুলে|তৈরি))/i.test(
         rawMsgText
       );
 

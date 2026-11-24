@@ -1,6 +1,7 @@
 import { Component, useCallback, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
 import {
   BookOpen,
+  Chrome,
   Cloud,
   Code2,
   Cpu,
@@ -19,6 +20,7 @@ import {
 import type { User } from 'firebase/auth';
 import { AssistantBrainPanel } from './components/AssistantBrainPanel';
 import { AutonomousAgentPanel } from './components/AutonomousAgentPanel';
+import { ChromeHandsPanel } from './components/ChromeHandsPanel';
 import { ClientBotsPanel } from './components/ClientBotsPanel';
 import { ClientPortalView } from './components/ClientPortalView';
 import { CommandSimulator } from './components/CommandSimulator';
@@ -65,6 +67,7 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: typeof LayoutDashboard }
   { id: 'overview', label: 'Pairing & Status', icon: LayoutDashboard },
   { id: 'assistant', label: 'AI Brain & Dictionary', icon: BookOpen },
   { id: 'agent', label: 'Autonomous Agent & PWA', icon: Cpu },
+  { id: 'chrome', label: 'Chrome Hands & Feet', icon: Chrome },
   { id: 'inbox', label: 'Notes & Chat Memory', icon: Inbox },
   { id: 'simulator', label: 'Command Simulator', icon: MessageSquare },
   { id: 'rules', label: 'Anti-Link & Auto-Reply', icon: Shield },
@@ -624,6 +627,8 @@ export default function App() {
               onToggleMobileOffload={handleToggleMobileOffload}
             />
           )}
+
+          {section === 'chrome' && <ChromeHandsPanel />}
 
           {section === 'inbox' && <InboxMemoryPanel />}
 

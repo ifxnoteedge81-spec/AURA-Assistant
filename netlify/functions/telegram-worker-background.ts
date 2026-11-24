@@ -1,4 +1,4 @@
-import { autonomousAgentEngine, telegramBotController } from '../../api/index.ts';
+import { autonomousAgentEngine, chromeBrowserAgent, telegramBotController } from '../../api/index.ts';
 import { verifyInternalBgSignature, type TelegramUpdate } from '../../server/telegramBot.ts';
 
 interface NetlifyBgEvent {
@@ -8,11 +8,15 @@ interface NetlifyBgEvent {
 }
 
 interface BackgroundWorkerPayload {
-  kind?: 'telegram_update' | 'agent_run';
+  kind?: 'telegram_update' | 'agent_run' | 'chrome_run';
   update?: TelegramUpdate;
   origin?: string;
   goal?: string;
+  startUrl?: string;
   preassignedRunId?: string;
+  preassignedTaskId?: string;
+  resumeTaskId?: string;
+  humanReply?: string;
 }
 
 export async function handler(event: NetlifyBgEvent) {
@@ -57,6 +61,23 @@ export async function handler(event: NetlifyBgEvent) {
       return {
         statusCode: 200,
         body: JSON.stringify({ ok: run.status === 'completed', runId: run.id }),
+      };
+    }
+
+    if (payload.kind === 'chrome_run' && (payload.goal || payload.resumeTaskId)) {
+      const task = await chromeBrowserAgent.executeBrowserTask({
+        goal: payload.goal || 'resume',
+        startUrl: payload.startUrl,
+        source: 'dashboard',
+        maxSteps: 16,
+        maxWallClockMs: 300_000,
+        preassignedTaskId: payload.preassignedTaskId,
+        resumeTaskId: payload.resumeTaskId,
+        humanReply: payload.humanReply,
+      });
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ ok: task.status !== 'failed', taskId: task.id, status: task.status }),
       };
     }
 

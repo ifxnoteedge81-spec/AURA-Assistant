@@ -147,6 +147,10 @@ import {
   getTelegramBotToken,
   registerTelegramRoutes,
 } from './server/telegramBot.ts';
+import {
+  ChromeBrowserAgent,
+  registerChromeRoutes,
+} from './server/chromeBrowserAgent.ts';
 
 const PORT = Number(process.env.PORT || (process.env.SPACE_ID || process.env.SPACE_HOST ? 7860 : 3000));
 const PREFIX = '.';
@@ -4961,7 +4965,9 @@ async function bootstrap() {
     if (
       req.path.startsWith('/auth/') ||
       req.path.startsWith('/client-portal/') ||
-      req.path === '/telegram/webhook'
+      req.path === '/telegram/webhook' ||
+      req.path === '/chrome/companion/poll' ||
+      req.path === '/chrome/companion/report'
     ) {
       next();
       return;
@@ -4996,6 +5002,27 @@ async function bootstrap() {
     });
   });
 
+  let telegramBotRef: TelegramBotController | null = null;
+  const chromeBrowserAgent = new ChromeBrowserAgent({
+    geminiPool,
+    openRouterReader,
+    tokenTelemetry,
+    getOwnerName: () => botConfig.ownerName || 'Sir',
+    notifyTelegramScreenshot: async (caption, jpegBase64) => {
+      const ownerIds = getTelegramOwnerIds();
+      const bot = telegramBotRef;
+      if (!bot || ownerIds.length === 0 || !getTelegramBotToken()) return;
+      if (jpegBase64) {
+        await bot
+          .sendPhotoBuffer(ownerIds[0], Buffer.from(jpegBase64, 'base64'), caption)
+          .catch(() => bot.sendMessage(ownerIds[0], caption));
+      } else {
+        await bot.sendMessage(ownerIds[0], caption);
+      }
+    },
+    pushLog,
+  });
+
   // Autonomous Action Agent Engine ("Brain + Hands & Feet") & 5-Min Self-Healing Watchdog
   autonomousAgentEngine = new AutonomousAgentEngine({
     geminiPool,
@@ -5004,6 +5031,7 @@ async function bootstrap() {
     outreach: outreachController,
     offloadQueue: mobileOffloadQueue,
     getWatchdog: () => selfHealingWatchdog,
+    getChromeAgent: () => chromeBrowserAgent,
     getBotConfig: () => botConfig,
     getBotStatus: () => botStatus,
     getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
@@ -5162,6 +5190,7 @@ async function bootstrap() {
     tokenTelemetry,
     outreach: outreachController,
     getAutonomousAgent: () => autonomousAgentEngine,
+    getChromeAgent: () => chromeBrowserAgent,
     getOwnerName: () => botConfig.ownerName || 'Sir',
     getBotConfig: () => botConfig as unknown as Record<string, unknown> & typeof botConfig,
     updateBotConfig: async (patch) => {
@@ -5175,7 +5204,9 @@ async function bootstrap() {
     getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
     pushLog,
   });
+  telegramBotRef = telegramBotController;
   registerTelegramRoutes(app, telegramBotController, requireOwnerAuth);
+  registerChromeRoutes(app, chromeBrowserAgent, requireOwnerAuth);
 
   // Owner Multi-Number Client Bot Management Endpoints (Unlimited Zero-AI Client Slots)
   app.get('/api/client-bots', (_req, res) => {
@@ -5386,6 +5417,12 @@ async function bootstrap() {
           category: 'Web Search',
           configured: isSet('SERPER_API_KEY'),
           detail: isSet('SERPER_API_KEY') ? 'Configured' : 'Optional',
+        },
+        {
+          key: 'CHROME_WS_ENDPOINT',
+          category: 'Chrome Hands',
+          configured: isSet('CHROME_WS_ENDPOINT') || chromeBrowserAgent.getActiveBackendMode() !== 'unconfigured',
+          detail: `Mode: ${chromeBrowserAgent.getActiveBackendMode()}`,
         },
         {
           key: 'FIREBASE_SERVICE_ACCOUNT_JSON',

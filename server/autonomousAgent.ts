@@ -18,6 +18,7 @@ import type {
   InboxNoteRecord,
 } from './assistantEngine.ts';
 import type { SelfChatDirectoryContact, SelfChatKnownGroup } from './selfChatCopilot.ts';
+import type { ChromeBrowserAgent } from './chromeBrowserAgent.ts';
 import {
   buildPatchFromInput,
   getFullControlSnapshot,
@@ -68,6 +69,7 @@ export interface AutonomousAgentAdapters {
   outreach: WebOutreachController;
   offloadQueue: MobileOffloadQueueManager;
   getWatchdog: () => SelfHealingWatchdog | null;
+  getChromeAgent?: () => ChromeBrowserAgent | null;
   getBotConfig: () => AssistantConfigFields;
   getBotStatus: () => string;
   getMemoryRssMb: () => number;
@@ -321,6 +323,42 @@ const AGENT_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'run_self_heal_now',
     description: 'Run the 5-minute Self-Healing Watchdog immediately to free RAM, check WhatsApp socket, and repair stuck queues.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {},
+    },
+  },
+  {
+    name: 'chrome_browser_task',
+    description:
+      'Use real Google Chrome Hands & Feet (DOM + Vision + Encrypted Vault) to open any website, create a new account / signup, log in to an account, fill forms, click buttons, or resume an OTP/CAPTCHA prompt.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        goal: {
+          type: Type.STRING,
+          description: 'Full step-by-step instruction (e.g., "Open GitHub signup or log into saved account")',
+        },
+        startUrl: {
+          type: Type.STRING,
+          description: 'Optional starting https:// URL to open in Chrome.',
+        },
+        resumeTaskId: {
+          type: Type.STRING,
+          description: 'Optional ID of a paused waiting_human_input Chrome task.',
+        },
+        humanReply: {
+          type: Type.STRING,
+          description: 'Optional OTP/2FA code or confirmation text from the owner to resume Chrome.',
+        },
+      },
+      required: ['goal'],
+    },
+  },
+  {
+    name: 'chrome_vault_inspect',
+    description:
+      'Check Chrome browser connection status (Local Chrome / Remote CDP / Companion PC Bridge), current open URL, saved masked login labels, and owner signup identity availability (never exposes plaintext passwords).',
     parameters: {
       type: Type.OBJECT,
       properties: {},
@@ -930,6 +968,55 @@ export class AutonomousAgentEngine {
             ok: ev.ok,
             summary: `Heal complete (${ev.rssBeforeMb}->${ev.rssAfterMb}MB): ${ev.actionsTaken.join(', ')}`,
             data: ev as unknown as Record<string, unknown>,
+          };
+        }
+
+        case 'chrome_vault_inspect': {
+          const chrome = this.adapters.getChromeAgent?.();
+          if (!chrome) return { ok: false, summary: 'Chrome Hands & Feet engine not initialized.', data: {} };
+          const snap = await chrome.getStatusSnapshot();
+          return {
+            ok: true,
+            summary: `Chrome backend=${snap.backendMode}, savedAccounts=${snap.accounts.length}, activeUrl=${snap.currentUrl || 'none'}`,
+            data: {
+              backendMode: snap.backendMode,
+              companionOnline: snap.companionOnline,
+              currentUrl: snap.currentUrl,
+              savedAccounts: snap.accounts.map((a) => ({
+                id: a.id,
+                label: a.label,
+                domain: a.domain,
+                username: a.username,
+              })),
+              identityConfigured: Boolean(snap.identity.defaultEmail || snap.identity.fullName),
+              waitingTask: snap.activeTask?.status === 'waiting_human_input' ? snap.activeTask : null,
+            },
+          };
+        }
+
+        case 'chrome_browser_task': {
+          const chrome = this.adapters.getChromeAgent?.();
+          if (!chrome) return { ok: false, summary: 'Chrome Hands & Feet engine not initialized.', data: {} };
+          const task = await chrome.executeBrowserTask({
+            goal: String(args.goal || '').trim(),
+            startUrl: typeof args.startUrl === 'string' && args.startUrl.trim() ? args.startUrl.trim() : undefined,
+            source: 'agent',
+            resumeTaskId: typeof args.resumeTaskId === 'string' && args.resumeTaskId.trim() ? args.resumeTaskId.trim() : undefined,
+            humanReply: typeof args.humanReply === 'string' && args.humanReply.trim() ? args.humanReply.trim() : undefined,
+            maxWallClockMs: 50_000,
+          });
+          return {
+            ok: task.status === 'completed' || task.status === 'waiting_human_input',
+            summary: `${task.status}: ${task.finalSummary}`,
+            data: {
+              taskId: task.id,
+              status: task.status,
+              currentUrl: task.currentUrl,
+              pauseKind: task.pauseKind,
+              pauseReasonBn: task.pauseReasonBn,
+              stepsCount: task.steps.length,
+              finalSummary: task.finalSummary,
+            },
           };
         }
 

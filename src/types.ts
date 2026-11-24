@@ -6,6 +6,7 @@ export type NavSection =
   | 'rules'
   | 'outreach'
   | 'agent'
+  | 'chrome'
   | 'clients'
   | 'security'
   | 'settings'
@@ -673,3 +674,80 @@ export interface SystemEnvStatusResponse {
   }>;
 }
 
+export interface ChromeStepRecord {
+  stepNumber: number;
+  action: string;
+  targetDescription: string;
+  reasonBn: string;
+  outcome: 'ok' | 'paused' | 'error';
+  urlAfter: string;
+  timestamp: string;
+}
+
+export interface ChromeTaskRecord {
+  id: string;
+  source: 'dashboard' | 'telegram' | 'agent';
+  goal: string;
+  startUrl?: string;
+  status: 'running' | 'waiting_human_input' | 'completed' | 'failed' | 'stopped';
+  pauseReasonBn?: string;
+  pauseKind?: 'otp' | 'captcha' | '2fa' | 'manual_confirm';
+  currentUrl: string;
+  currentTitle: string;
+  backendUsed: 'remote_cdp' | 'local_chrome' | 'companion_bridge' | 'unconfigured';
+  steps: ChromeStepRecord[];
+  finalSummary: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface ChromeSavedAccount {
+  id: string;
+  label: string;
+  domain: string;
+  loginUrl: string;
+  username: string;
+  hasPassword: boolean;
+  passwordPreview: string;
+  totpHint?: string;
+  notes?: string;
+  autoUseInTasks: boolean;
+  updatedAt: string;
+}
+
+export interface ChromeSignupIdentity {
+  fullName: string;
+  defaultEmail: string;
+  defaultPhone: string;
+  usernamePrefix: string;
+  country: string;
+  dateOfBirth: string;
+  hasDefaultPassword: boolean;
+}
+
+export interface ChromeStatusSnapshot {
+  backendMode: 'remote_cdp' | 'local_chrome' | 'companion_bridge' | 'unconfigured';
+  remoteCdpConfigured: boolean;
+  remoteCdpMasked: string;
+  localChromePath: string | null;
+  companionOnline: boolean;
+  companionWorker: {
+    workerId: string;
+    deviceLabel: string;
+    lastHeartbeatAt: number;
+    currentUrl: string;
+    currentTitle: string;
+  } | null;
+  headless: boolean;
+  isServerless: boolean;
+  currentUrl: string;
+  currentTitle: string;
+  screenshotDataUrl: string;
+  lastScreenshotAt: string;
+  elementsCount: number;
+  tasks: ChromeTaskRecord[];
+  activeTask: ChromeTaskRecord | null;
+  accounts: ChromeSavedAccount[];
+  identity: ChromeSignupIdentity;
+}

@@ -48,6 +48,10 @@ import {
   isNetlifyRuntime,
   registerTelegramRoutes,
 } from '../server/telegramBot.ts';
+import {
+  ChromeBrowserAgent,
+  registerChromeRoutes,
+} from '../server/chromeBrowserAgent.ts';
 
 const app = express();
 
@@ -329,9 +333,14 @@ app.post('/api/auth/telegram-webapp', (req, res) => {
   }
 });
 
-// Protect authenticated /api/* routes (exempt /api/auth/* & public Telegram Webhook)
+// Protect authenticated /api/* routes (exempt /api/auth/*, Telegram Webhook, and token-authenticated Companion Chrome Bridge)
 app.use('/api', (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path === '/telegram/webhook') {
+  if (
+    req.path.startsWith('/auth/') ||
+    req.path === '/telegram/webhook' ||
+    req.path === '/chrome/companion/poll' ||
+    req.path === '/chrome/companion/report'
+  ) {
     next();
     return;
   }
@@ -362,6 +371,28 @@ registerMobileOffloadRoutes(app, mobileOffloadQueue, ({ url, emails, phones, tit
   });
 });
 
+let telegramBotRef: TelegramBotController | null = null;
+
+const chromeBrowserAgent = new ChromeBrowserAgent({
+  geminiPool,
+  openRouterReader,
+  tokenTelemetry,
+  getOwnerName: () => botConfig.ownerName || 'Sir',
+  notifyTelegramScreenshot: async (caption, jpegBase64) => {
+    const ownerIds = getTelegramOwnerIds();
+    const bot = telegramBotRef;
+    if (!bot || ownerIds.length === 0 || !getTelegramBotToken()) return;
+    if (jpegBase64) {
+      await bot
+        .sendPhotoBuffer(ownerIds[0], Buffer.from(jpegBase64, 'base64'), caption)
+        .catch(() => bot.sendMessage(ownerIds[0], caption));
+    } else {
+      await bot.sendMessage(ownerIds[0], caption);
+    }
+  },
+  pushLog,
+});
+
 const autonomousAgentEngine = new AutonomousAgentEngine({
   geminiPool,
   openRouterReader,
@@ -369,6 +400,7 @@ const autonomousAgentEngine = new AutonomousAgentEngine({
   outreach: outreachController,
   offloadQueue: mobileOffloadQueue,
   getWatchdog: () => null,
+  getChromeAgent: () => chromeBrowserAgent,
   getBotConfig: () => botConfig,
   getBotStatus: () => 'serverless_telegram_mode',
   getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
@@ -454,6 +486,7 @@ const telegramBotController = new TelegramBotController({
   tokenTelemetry,
   outreach: outreachController,
   getAutonomousAgent: () => autonomousAgentEngine,
+  getChromeAgent: () => chromeBrowserAgent,
   getOwnerName: () => botConfig.ownerName || 'Sir',
   getBotConfig: () => botConfig,
   updateBotConfig: async (patch) => {
@@ -463,8 +496,36 @@ const telegramBotController = new TelegramBotController({
   getMemoryRssMb: () => Math.round(process.memoryUsage().rss / (1024 * 1024)),
   pushLog,
 });
+telegramBotRef = telegramBotController;
 
 registerTelegramRoutes(app, telegramBotController, requireOwnerAuth);
+
+registerChromeRoutes(app, chromeBrowserAgent, requireOwnerAuth, {
+  dispatchBackgroundChromeRun: isNetlifyRuntime()
+    ? async (req, payload) => {
+        const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+        const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+        const origin = host ? `${proto}://${host}` : process.env.URL || process.env.DEPLOY_PRIME_URL || '';
+        if (!origin.startsWith('http')) return false;
+
+        const bgPayload = JSON.stringify({
+          kind: 'chrome_run',
+          ...payload,
+          origin,
+        });
+        const bgResp = await fetch(`${origin.replace(/\/+$/, '')}/.netlify/functions/telegram-worker-background`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-wanexus-bg-sig': createInternalBgSignature(bgPayload),
+          },
+          body: bgPayload,
+          signal: AbortSignal.timeout(3_500),
+        });
+        return bgResp.ok || bgResp.status === 202;
+      }
+    : undefined,
+});
 
 app.post('/api/security/pin', (req, res) => {
   try {
@@ -543,6 +604,12 @@ app.get('/api/system/env-status', (_req, res) => {
         category: 'Image Gen',
         configured: isSet('HF_TOKEN'),
         detail: isSet('HF_TOKEN') ? 'FLUX.1-schnell active' : 'Optional (Pollinations free fallback active)',
+      },
+      {
+        key: 'CHROME_WS_ENDPOINT',
+        category: 'Chrome Hands',
+        configured: isSet('CHROME_WS_ENDPOINT') || chromeBrowserAgent.getActiveBackendMode() !== 'unconfigured',
+        detail: `Mode: ${chromeBrowserAgent.getActiveBackendMode()}`,
       },
     ],
   });
@@ -877,5 +944,5 @@ app.all('/api/*', (_req, res) => {
   res.status(404).json({ error: 'Endpoint unavailable in serverless mode.' });
 });
 
-export { app, autonomousAgentEngine, telegramBotController };
+export { app, autonomousAgentEngine, telegramBotController, chromeBrowserAgent };
 export default app;
